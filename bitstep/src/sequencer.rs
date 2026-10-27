@@ -745,12 +745,15 @@ pub enum SeqEvent {
         velocity: f32,
         /// Mapped by [`pan_to_f32`].
         pan: f32,
-        /// Semitones, `-24..=24`; 0 means no pitch change. Sent as a per-note
+        /// Semitones, `-12..=12`; 0 means no pitch change. Sent as a per-note
         /// tuning expression, so the key (the Drum Machine pad) stays put.
         pitch: i8,
         /// The lane's volume in dB; 0 means as played. Sent as a per-note
         /// volume expression.
         volume_db: i8,
+        /// Whether the lane is a sample pad ([`Lane::sample_pad`]), which
+        /// adds the gap to [`Lane::SAMPLE_ROOT`] to the tuning sent.
+        sample_pad: bool,
         voice_id: i32,
     },
     NoteOff {
@@ -783,49 +786,50 @@ impl SeqEvent {
             pan: pan_to_f32(pan),
             pitch: 0,
             volume_db: 0,
+            sample_pad: false,
             voice_id,
         }
     }
 
     /// The same note-on with a pitch offset in semitones (clamped to the
     /// step's range). A note-off is returned unchanged: it has no pitch.
-    pub const fn with_pitch(self, semitones: i8) -> SeqEvent {
-        match self {
-            SeqEvent::NoteOn {
-                beat, lane_pos, key, channel, velocity, pan, volume_db, voice_id, ..
-            } => SeqEvent::NoteOn {
-                beat,
-                lane_pos,
-                key,
-                channel,
-                velocity,
-                pan,
-                pitch: crate::model::clamp_i8(semitones, Step::PITCH_MIN, Step::PITCH_MAX),
-                volume_db,
-                voice_id,
-            },
-            off @ SeqEvent::NoteOff { .. } => off,
+    pub const fn with_pitch(mut self, semitones: i8) -> SeqEvent {
+        if let SeqEvent::NoteOn { pitch, .. } = &mut self {
+            *pitch = crate::model::clamp_i8(semitones, Step::PITCH_MIN, Step::PITCH_MAX);
         }
+        self
     }
 
     /// The same note-on with the lane's volume in dB (clamped to the lane's
     /// range). A note-off is returned unchanged.
-    pub const fn with_volume(self, db: i8) -> SeqEvent {
+    pub const fn with_volume(mut self, db: i8) -> SeqEvent {
+        if let SeqEvent::NoteOn { volume_db, .. } = &mut self {
+            *volume_db = crate::model::clamp_i8(db, Lane::VOLUME_MIN, Lane::VOLUME_MAX);
+        }
+        self
+    }
+
+    /// The same note-on, marked as played on a sample pad or not. A note-off
+    /// is returned unchanged.
+    pub const fn with_sample_pad(mut self, on: bool) -> SeqEvent {
+        if let SeqEvent::NoteOn { sample_pad, .. } = &mut self {
+            *sample_pad = on;
+        }
+        self
+    }
+
+    /// The per-note tuning a note-on is sent with, in semitones: the step's
+    /// pitch, plus, on a sample pad, the gap from the key up (or down) to
+    /// [`Lane::SAMPLE_ROOT`] — a keytracked sample with that root then
+    /// plays at its own pitch on any pad. 0 for a note-off, and for a note
+    /// that needs no retuning.
+    pub const fn tuning(self) -> i32 {
         match self {
-            SeqEvent::NoteOn {
-                beat, lane_pos, key, channel, velocity, pan, pitch, voice_id, ..
-            } => SeqEvent::NoteOn {
-                beat,
-                lane_pos,
-                key,
-                channel,
-                velocity,
-                pan,
-                pitch,
-                volume_db: crate::model::clamp_i8(db, Lane::VOLUME_MIN, Lane::VOLUME_MAX),
-                voice_id,
-            },
-            off @ SeqEvent::NoteOff { .. } => off,
+            SeqEvent::NoteOn { key, pitch, sample_pad, .. } => {
+                let root = if sample_pad { Lane::SAMPLE_ROOT as i32 - key as i32 } else { 0 };
+                pitch as i32 + root
+            }
+            SeqEvent::NoteOff { .. } => 0,
         }
     }
 
@@ -1131,6 +1135,8 @@ pub struct StepHit {
     pub channel: u8,
     /// The lane's volume in dB, read with its key and channel.
     pub volume_db: i8,
+    /// Whether the lane is a sample pad, read likewise.
+    pub sample_pad: bool,
     /// The packed step as read, so velocity/pan/ratchet/probability travel
     /// together with the hit instead of being unpacked twice.
     pub step: Step,
@@ -1141,6 +1147,7 @@ impl StepHit {
     pub const fn note_on(self, voice_id: i32) -> SeqEvent {
         SeqEvent::from_step(self.beat, self.lane_pos, self.key, self.channel, self.step, voice_id)
             .with_volume(self.volume_db)
+            .with_sample_pad(self.sample_pad)
     }
 
     /// The matching note-off, at the end of the gate.
@@ -1350,6 +1357,7 @@ pub fn scan_lane(
     let key = lane.key();
     let channel = lane.channel();
     let volume_db = lane.volume_db();
+    let sample_pad = lane.is_sample_pad();
     let mut hits = 0;
 
     for k in first..=last {
@@ -1397,6 +1405,7 @@ pub fn scan_lane(
                 key,
                 channel,
                 volume_db,
+                sample_pad,
                 step,
             });
             hits += 1;
@@ -2541,12 +2550,13 @@ mod tests {
             key: 42,
             channel: 0,
             volume_db: -6,
+            sample_pad: true,
             step: Step::default_on().with_pitch(2),
         };
-        let SeqEvent::NoteOn { volume_db, pitch, .. } = hit.note_on(1 << 20) else {
+        let SeqEvent::NoteOn { volume_db, pitch, sample_pad, .. } = hit.note_on(1 << 20) else {
             panic!("not a note-on");
         };
-        assert_eq!((volume_db, pitch), (-6, 2));
+        assert_eq!((volume_db, pitch, sample_pad), (-6, 2, true));
 
         let plain = SeqEvent::note_on(0.0, 0, 42, 0, 100, Step::PAN_CENTRE, 1 << 20);
         let SeqEvent::NoteOn { volume_db, .. } = plain.with_volume(i8::MAX) else {
@@ -2568,6 +2578,28 @@ mod tests {
     }
 
     #[test]
+    fn a_sample_pad_retunes_its_key_to_the_sample_root() {
+        let on = |key: u8, pitch: i8| {
+            SeqEvent::note_on(0.0, 0, key, 0, 100, Step::PAN_CENTRE, 1 << 20).with_pitch(pitch)
+        };
+        // An ordinary lane sends the step's pitch alone.
+        assert_eq!(on(36, 0).tuning(), 0);
+        assert_eq!(on(36, -5).tuning(), -5);
+        // A sample pad on C1 (36) is lifted the two octaves to C3, plus the
+        // step's pitch; one on C3 itself needs nothing.
+        assert_eq!(on(36, 0).with_sample_pad(true).tuning(), 24);
+        assert_eq!(on(36, -5).with_sample_pad(true).tuning(), 19);
+        assert_eq!(on(60, 0).with_sample_pad(true).tuning(), 0);
+        assert_eq!(on(72, 3).with_sample_pad(true).tuning(), -9);
+        // The extremes stay well inside the ±120 a tuning expression takes.
+        assert_eq!(on(0, 12).with_sample_pad(true).tuning(), 72);
+        assert_eq!(on(127, -12).with_sample_pad(true).tuning(), -79);
+        let off = SeqEvent::note_off(0.5, 36, 0, 1 << 20);
+        assert_eq!(off.with_sample_pad(true), off, "a note-off is unchanged");
+        assert_eq!(off.tuning(), 0);
+    }
+
+    #[test]
     fn events_carry_mapped_step_values() {
         let step = Step::pack(true, 100, Step::PAN_CENTRE, 4, 100);
         let on = SeqEvent::from_step(1.25, 3, 64, 9, step, (1 << 20) + 7);
@@ -2583,6 +2615,7 @@ mod tests {
                 pan: 0.0,
                 pitch: 0,
                 volume_db: 0,
+                sample_pad: false,
                 voice_id: (1 << 20) + 7,
             }
         );
@@ -3123,6 +3156,7 @@ mod tests {
                 pan: 1.0,
                 pitch: 0,
                 volume_db: 0,
+                sample_pad: false,
                 voice_id,
             }
         );

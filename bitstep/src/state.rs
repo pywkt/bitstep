@@ -59,6 +59,9 @@ pub struct LaneSnapshot {
     /// The lane's volume in dB; 0 (and so every save from before it
     /// existed) means as played.
     pub volume_db: i8,
+    /// Whether the lane is a sample pad; off in every save from before it
+    /// existed.
+    pub sample_pad: bool,
 }
 
 /// One pattern bank: one [`LaneDataSnapshot`] per lane, index-aligned with
@@ -98,7 +101,7 @@ pub struct StepSnapshot {
     pub pan: u8,
     pub ratchet: u8,
     pub probability: u8,
-    /// Semitones, `-24..=24`. Clamped on load.
+    /// Semitones, `-12..=12`. Clamped on load.
     pub pitch: i8,
 }
 
@@ -166,6 +169,7 @@ impl LaneSnapshot {
             mute: lane.is_muted(),
             solo: lane.is_soloed(),
             volume_db: lane.volume_db(),
+            sample_pad: lane.is_sample_pad(),
         }
     }
 
@@ -176,6 +180,7 @@ impl LaneSnapshot {
         lane.set_mute(self.mute);
         lane.set_solo(self.solo);
         lane.set_volume_db(self.volume_db);
+        lane.set_sample_pad(self.sample_pad);
         lane
     }
 }
@@ -316,13 +321,15 @@ pub fn default_data() -> SeqData {
         .iter()
         .enumerate()
         .map(|(index, &(name, key))| {
-            Lane::new(
+            let lane = Lane::new(
                 FIRST_LANE_ID + index as u32,
                 name,
                 LANE_PALETTE[index % LANE_PALETTE.len()],
                 key,
                 DEFAULT_CHANNEL,
-            )
+            );
+            lane.set_sample_pad(Lane::SAMPLE_PAD_DEFAULT);
+            lane
         })
         .collect();
     // `from_lanes` gives every lane an empty `LaneData` in all 8 patterns.
@@ -575,6 +582,7 @@ mod tests {
                 mute: true,
                 solo: true,
                 volume_db: i8::MAX,
+                sample_pad: true,
             }],
             patterns: Vec::new(),
         };
@@ -606,6 +614,7 @@ mod tests {
                     mute: false,
                     solo: false,
                     volume_db: 0,
+                    sample_pad: false,
                 })
                 .collect(),
             patterns: (0..patterns)
@@ -779,7 +788,7 @@ mod tests {
     fn step_pitch_round_trips_including_on_a_never_edited_step() {
         for step in [
             Step::default_on().with_pitch(12),
-            Step::pack(false, 40, 3, 2, 70).with_pitch(-24),
+            Step::pack(false, 40, 3, 2, 70).with_pitch(-12),
             Step::OFF.with_pitch(5),
             Step::OFF,
         ] {
@@ -819,6 +828,19 @@ mod tests {
         )
         .expect("an old lane parses");
         assert_eq!(old.volume_db, 0);
+        assert!(!old.sample_pad, "an old lane is not a sample pad");
+    }
+
+    #[test]
+    fn a_sample_pad_lane_round_trips() {
+        let data = default_data();
+        assert!(data.lanes.iter().all(Lane::is_sample_pad), "a fresh instance's lanes start on");
+        data.lanes[1].set_sample_pad(false);
+        let json = serde_json::to_string(&SeqSnapshot::from_data(&data)).expect("saves");
+        let back: SeqSnapshot = serde_json::from_str(&json).expect("loads");
+        let back = back.into_data();
+        assert!(!back.lanes[1].is_sample_pad(), "turned off and saved, it loads off");
+        assert!(back.lanes[0].is_sample_pad());
     }
 
     // ---- fresh-instance defaults ----

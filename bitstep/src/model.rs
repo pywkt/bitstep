@@ -23,7 +23,7 @@ use crate::state::SeqSnapshot;
 /// bits 8–14    pan         0..=126, 63 = centre
 /// bits 15–17   ratchet     stored n-1 → effective 1..=8
 /// bits 18–24   probability 0..=100 (%)
-/// bits 25–30   pitch       -24..=24 semitones, 6-bit two's complement
+/// bits 25–30   pitch       -12..=12 semitones, 6-bit two's complement
 /// bit  31      reserved    (future: gate, micro-timing, accent)
 /// ```
 ///
@@ -57,8 +57,8 @@ impl Step {
     pub const PROBABILITY_MAX: u8 = 100;
     /// Pitch offset in semitones, sent as a per-note tuning expression — the
     /// note number (and so the Drum Machine pad) never changes.
-    pub const PITCH_MIN: i8 = -24;
-    pub const PITCH_MAX: i8 = 24;
+    pub const PITCH_MIN: i8 = -12;
+    pub const PITCH_MAX: i8 = 12;
 
     const ON_SHIFT: u32 = 0;
     const VELOCITY_SHIFT: u32 = 1;
@@ -141,7 +141,7 @@ impl Step {
         clamp_u8(raw, 0, Self::PROBABILITY_MAX)
     }
 
-    /// Pitch offset in semitones, `-24..=24`; 0 for a step that has none.
+    /// Pitch offset in semitones, `-12..=12`; 0 for a step that has none.
     pub const fn pitch(self) -> i8 {
         let raw = ((self.0 & Self::PITCH_MASK) >> Self::PITCH_SHIFT) as u8;
         // Sign-extend the 6-bit field: shift it to the top of a byte and back.
@@ -215,7 +215,7 @@ impl Step {
         Step((self.0 & !Self::PROBABILITY_MASK) | (probability << Self::PROBABILITY_SHIFT))
     }
 
-    /// `pitch` in semitones, clamped to `-24..=24`.
+    /// `pitch` in semitones, clamped to `-12..=12`.
     pub const fn with_pitch(self, pitch: i8) -> Step {
         let stored = (clamp_i8(pitch, Self::PITCH_MIN, Self::PITCH_MAX) as u8 as u32) & 0x3F;
         Step((self.0 & !Self::PITCH_MASK) | (stored << Self::PITCH_SHIFT))
@@ -323,6 +323,11 @@ pub struct Lane {
     /// The lane's volume in whole dB, `VOLUME_MIN..=VOLUME_MAX`, 0 = as
     /// played. Sent with every note as a per-note volume expression.
     pub volume: AtomicI8,
+    /// Whether the lane plays a keytracked sample whose root key is
+    /// [`Lane::SAMPLE_ROOT`]: every note is then retuned by the gap between
+    /// the lane's key and that root, so the sample sounds at its own pitch
+    /// (plus the step's pitch) without setting a root key on the pad.
+    pub sample_pad: AtomicBool,
 }
 
 impl Lane {
@@ -331,6 +336,13 @@ impl Lane {
     pub const VOLUME_MIN: i8 = -36;
     /// +12 dB: the CLAP volume expression's ceiling (a gain of 4).
     pub const VOLUME_MAX: i8 = 12;
+    /// The root key a sample pad is tuned against: C3 as Bitwig names it,
+    /// the root a sampler assumes when a file names none.
+    pub const SAMPLE_ROOT: u8 = 60;
+    /// Whether a lane the user creates (a fresh instance's lanes, `+ Lane`)
+    /// starts as a sample pad: bitstep is mostly used with drum samples.
+    /// [`Lane::new`] itself starts off, so a saved lane loads as it was saved.
+    pub const SAMPLE_PAD_DEFAULT: bool = true;
 
     /// A lane with no steps anywhere — the caller pairs it with one
     /// [`LaneData`] per pattern (see [`SeqData::from_lanes`]).
@@ -347,6 +359,7 @@ impl Lane {
             mute: AtomicBool::new(false),
             solo: AtomicBool::new(false),
             volume: AtomicI8::new(0),
+            sample_pad: AtomicBool::new(false),
         }
     }
 
@@ -376,6 +389,14 @@ impl Lane {
 
     pub fn set_volume_db(&self, db: i8) {
         self.volume.store(db.clamp(Self::VOLUME_MIN, Self::VOLUME_MAX), Relaxed);
+    }
+
+    pub fn is_sample_pad(&self) -> bool {
+        self.sample_pad.load(Relaxed)
+    }
+
+    pub fn set_sample_pad(&self, on: bool) {
+        self.sample_pad.store(on, Relaxed);
     }
 
     pub fn is_muted(&self) -> bool {
@@ -409,6 +430,7 @@ impl Clone for Lane {
             mute: AtomicBool::new(self.mute.load(Relaxed)),
             solo: AtomicBool::new(self.solo.load(Relaxed)),
             volume: AtomicI8::new(self.volume.load(Relaxed)),
+            sample_pad: AtomicBool::new(self.sample_pad.load(Relaxed)),
         }
     }
 }
@@ -808,6 +830,10 @@ impl SeqModel {
         self.with_lane(lane_id, |lane| lane.set_volume_db(db))
     }
 
+    pub fn set_sample_pad(&self, lane_id: u32, on: bool) -> bool {
+        self.with_lane(lane_id, |lane| lane.set_sample_pad(on))
+    }
+
     pub fn set_solo(&self, lane_id: u32, solo: bool) -> bool {
         self.with_lane(lane_id, |lane| lane.set_solo(solo))
     }
@@ -816,6 +842,7 @@ impl SeqModel {
 
     /// Appends a lane with an empty [`LaneData`] in all 8 patterns and returns
     /// its fresh id, or `None` if the instance already holds [`MAX_LANES`].
+    /// The new lane is a sample pad if [`Lane::SAMPLE_PAD_DEFAULT`] says so.
     pub fn add_lane(
         &self,
         name: impl Into<String>,
@@ -829,7 +856,9 @@ impl SeqModel {
                 return None;
             }
             let id = self.take_lane_id();
-            data.lanes.push(Lane::new(id, name, colour, key, channel));
+            let lane = Lane::new(id, name, colour, key, channel);
+            lane.set_sample_pad(Lane::SAMPLE_PAD_DEFAULT);
+            data.lanes.push(lane);
             for pattern in &mut data.patterns {
                 pattern.push(LaneData::empty());
             }
@@ -1045,9 +1074,22 @@ impl SeqModel {
         // NaN clamps to NaN, which casts to 0 — a NaN density clears the lane.
         const DRAWS: f64 = (u32::MAX as u64 + 1) as f64;
         let threshold = (f64::from(density.clamp(0.0, 1.0)) * DRAWS) as u64;
+        self.fill_lane(pattern, lane_id, |_| u64::from(rng.next_u32()) < threshold)
+    }
+
+    /// Sets every visible step of one lane on or off by `on(index)`, asked
+    /// once per step in order. Like [`SeqModel::randomise_lane`], only the on
+    /// bit changes: the values a step carries survive, and a never-edited
+    /// step that comes on gets the defaults ([`Step::turned_on`]).
+    pub fn fill_lane(
+        &self,
+        pattern: usize,
+        lane_id: u32,
+        mut on: impl FnMut(usize) -> bool,
+    ) -> bool {
         self.with_lane_data(pattern, lane_id, |lane_data| {
             for index in 0..lane_data.length() as usize {
-                let on = u64::from(rng.next_u32()) < threshold;
+                let on = on(index);
                 lane_data.update_step(index, |step| {
                     if on { step.turned_on() } else { step.with_on(false) }
                 });
@@ -1743,6 +1785,10 @@ mod tests {
         lane.set_volume_db(5);
         assert_eq!(lane.clone().volume_db(), 5, "a clone keeps it");
 
+        assert!(!lane.is_sample_pad(), "a bare lane is not a sample pad");
+        lane.set_sample_pad(true);
+        assert!(lane.clone().is_sample_pad(), "a clone keeps it");
+
         lane.key.store(u8::MAX, Relaxed);
         lane.channel.store(u8::MAX, Relaxed);
         assert_eq!((lane.key(), lane.channel()), (127, 15));
@@ -2057,6 +2103,7 @@ mod tests {
         assert_eq!((lane.id, lane.name.as_str(), lane.colour), (id, "Kick", 0x112233));
         assert_eq!((lane.key(), lane.channel()), (36, 2));
         assert!(!lane.is_muted() && !lane.is_soloed());
+        assert_eq!(lane.is_sample_pad(), Lane::SAMPLE_PAD_DEFAULT);
         for pattern in 0..NUM_PATTERNS {
             let lane_data = data.lane_data(pattern, 0).expect("lane data");
             assert_eq!(lane_data.capacity(), CAPACITY_CHUNK);
@@ -2352,7 +2399,7 @@ mod tests {
         assert_eq!(base.with_pitch(100).pitch(), Step::PITCH_MAX, "clamped");
         assert_eq!(base.with_pitch(-100).pitch(), Step::PITCH_MIN, "clamped");
         assert_eq!(Step::OFF.pitch(), 0, "all-zero bits are no pitch");
-        // Raw bits outside ±24 (e.g. from a future build) read clamped.
+        // Raw bits outside ±12 (e.g. from a future build) read clamped.
         assert_eq!(Step(31 << 25).pitch(), Step::PITCH_MAX);
     }
 
@@ -2470,6 +2517,36 @@ mod tests {
         assert_ne!(a, pattern_of(999));
         let lit = a.iter().filter(|on| **on).count();
         assert!((4..=28).contains(&lit), "half density lit {lit} of 32");
+    }
+
+    #[test]
+    fn fill_lane_sets_visible_steps_and_keeps_their_values() {
+        let (model, id) = bulk_model();
+        let before = lane_steps(&model, 0);
+
+        let mut asked = Vec::new();
+        assert!(model.fill_lane(0, id, |index| {
+            asked.push(index);
+            index % 4 == 0
+        }));
+        assert_eq!(asked, (0..8).collect::<Vec<usize>>(), "once per visible step, in order");
+
+        let after = lane_steps(&model, 0);
+        for index in 0..8 {
+            assert_eq!(after[index].is_on(), index % 4 == 0, "step {index}");
+            assert_eq!(after[index].with_on(false), before[index].with_on(false), "step {index}");
+        }
+        // Hidden steps past the length are left alone.
+        assert_eq!(after[8..], before[8..]);
+        // Another pattern is untouched, and an unknown lane is refused.
+        assert_eq!(lane_steps(&model, 1)[..8], bulk_model_steps(1)[..8]);
+        assert!(!model.fill_lane(0, id + 1, |_| true));
+    }
+
+    /// [`bulk_model`]'s steps for `pattern`, from a fresh copy.
+    fn bulk_model_steps(pattern: usize) -> Vec<Step> {
+        let (model, _) = bulk_model();
+        lane_steps(&model, pattern)
     }
 
     #[test]

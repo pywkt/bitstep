@@ -428,6 +428,7 @@ mod tests {
             key,
             channel,
             volume_db: 0,
+            sample_pad: false,
             step: Step::default_on(),
         }
     }

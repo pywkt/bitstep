@@ -217,7 +217,7 @@ fn note_events(timed: TimedEvent) -> ([PluginNoteEvent<Bitstep>; MAX_EVENTS_PER_
     let key = Key::Number(event.key());
 
     match event {
-        SeqEvent::NoteOn { velocity, pan, pitch, volume_db, .. } => {
+        SeqEvent::NoteOn { velocity, pan, volume_db, .. } => {
             let note = NoteEvent::NoteOn { timing, voice_id, channel, key, velocity };
             let mut events = [note; MAX_EVENTS_PER_NOTE];
             let mut count = 1;
@@ -231,10 +231,13 @@ fn note_events(timed: TimedEvent) -> ([PluginNoteEvent<Bitstep>; MAX_EVENTS_PER_
             // stored, still saved, and still there if it is turned back on.
             #[cfg(not(feature = "pan-expression"))]
             let _ = pan;
-            // Only a pitched step sends tuning: a fresh voice starts untuned,
-            // so a zero would be one more event saying nothing.
-            if pitch != 0 {
-                let tuning = f32::from(pitch);
+            // Only a pitched step (or a sample pad off its root) sends
+            // tuning: a fresh voice starts untuned, so a zero would be one
+            // more event saying nothing.
+            let tuning = event.tuning();
+            if tuning != 0 {
+                // At most ±127, so the conversion is exact.
+                let tuning = tuning as f32;
                 events[count] = NoteEvent::PolyTuning { timing, voice_id, channel, key, tuning };
                 count += 1;
             }
@@ -735,6 +738,24 @@ mod tests {
         // Note, pan, tuning and volume all fit.
         let (_, count) = note_events(TimedEvent::new(0, plain.with_volume(3).with_pitch(1)));
         assert_eq!(count, if cfg!(feature = "pan-expression") { 4 } else { 3 });
+    }
+
+    /// A sample pad's note is retuned to the sample root on top of its
+    /// pitch, and one sitting on the root sends no tuning.
+    #[test]
+    fn a_sample_pad_note_on_is_retuned_to_the_root() {
+        let tuning_of = |event: SeqEvent| {
+            let (events, count) = note_events(TimedEvent::new(0, event));
+            events[..count].iter().find_map(|event| match *event {
+                NoteEvent::PolyTuning { tuning, .. } => Some(tuning),
+                _ => None,
+            })
+        };
+        let kick = SeqEvent::note_on(0.0, 0, 36, 0, 100, Step::PAN_CENTRE, 1 << 20);
+        assert_eq!(tuning_of(kick.with_sample_pad(true)), Some(24.0));
+        assert_eq!(tuning_of(kick.with_sample_pad(true).with_pitch(-3)), Some(21.0));
+        let on_root = SeqEvent::note_on(0.0, 0, 60, 0, 100, Step::PAN_CENTRE, 1 << 20);
+        assert_eq!(tuning_of(on_root.with_sample_pad(true)), None);
     }
 
     /// An unpitched note sends no tuning at all.

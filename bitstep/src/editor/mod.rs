@@ -40,7 +40,7 @@ use crate::sequencer::{Prng, Rate, lane_is_audible};
 use crate::state;
 
 use grid_math::{
-    CellMetrics, DragAxis, EditorLayout, EndHandleDrag, GridHit, GridView, HeaderFields,
+    CellMetrics, DragAxis, EditorLayout, EndHandleDrag, Fill, GridHit, GridView, HeaderFields,
     LaneReorder, LengthEdit, LevelDraw, PaintDrag, ParamKind, PitchDraw, VelocityDrag, Zone,
 };
 use keys::KeyForwarder;
@@ -1348,7 +1348,8 @@ impl BitstepEditor {
                 let icon = if dragging { CursorIcon::Grabbing } else { CursorIcon::Grab };
                 ui.ctx().set_cursor_icon(icon);
             }
-            lane_menu(&handle, model, rename, confirm, rng, lane, pattern);
+            let target = MenuLane { lane, pattern, step_beats: lane_data.rate().rate_beats() };
+            lane_menu(&handle, model, rename, confirm, rng, target);
 
             // The grip's dots, painted rather than a glyph — see
             // [`grid_math::grip_dots`]. Brightened under the pointer, which is
@@ -2137,8 +2138,18 @@ fn reorder_lane(
     true
 }
 
-/// One lane's context menu: rename, colour, channel, duplicate, delete, and
-/// the four bulk edits.
+/// The lane a context menu is for, and what it needs to know about it.
+#[derive(Clone, Copy)]
+struct MenuLane<'a> {
+    lane: &'a Lane,
+    /// The pattern on screen, which the bulk edits and fills apply to.
+    pattern: usize,
+    /// The lane's step length in beats in that pattern, for the fills.
+    step_beats: f64,
+}
+
+/// One lane's context menu: rename, colour, channel, duplicate, delete, the
+/// four bulk edits and the fills.
 ///
 /// Everything here is a `SeqModel` call and nothing is buffered but the text
 /// being typed, so the grid behind the menu shows each item's effect as it is
@@ -2161,9 +2172,9 @@ fn lane_menu(
     rename: &mut Option<LaneRename>,
     confirm: &mut Option<LaneConfirm>,
     rng: &mut Prng,
-    lane: &Lane,
-    pattern: usize,
+    target: MenuLane<'_>,
 ) {
+    let MenuLane { lane, pattern, step_beats } = target;
     // `CloseOnClickOutside`, not the context-menu default `CloseOnClick`:
     // the default closes the menu on *any* click, inside it too, which would
     // close it as soon as the rename field is clicked and disarm `delete` /
@@ -2239,6 +2250,17 @@ fn lane_menu(
             );
         });
 
+        // Retunes the lane for a keytracked sample left at its default root,
+        // so the pad needs no root key of its own.
+        let mut sample_pad = lane.is_sample_pad();
+        let toggle = ui.checkbox(&mut sample_pad, "Sample pad").on_hover_text(
+            "For a sample with keytrack on and its root key at C3: plays it at its own pitch \
+             on this lane's note, so the pad needs no root key. Leave off for synth drums.",
+        );
+        if toggle.changed() {
+            model.set_sample_pad(lane.id, sample_pad);
+        }
+
         ui.separator();
 
         // The shape edits. `duplicate_lane` hands back the new lane's id for
@@ -2287,6 +2309,26 @@ fn lane_menu(
                 *confirm = None;
                 model.nudge_lane(pattern, lane.id, 1);
                 ui.close();
+            }
+        });
+
+        ui.separator();
+
+        // Preset rhythms. Like randomise, each replaces the lane's on/off
+        // pattern on screen in one click, keeping the steps' values. A fill
+        // that does not line up with this lane's rate is greyed out.
+        ui.label("Fill");
+        ui.horizontal_wrapped(|ui| {
+            for fill in Fill::ALL {
+                let button = ui
+                    .add_enabled(fill.fits(step_beats), Button::new(fill.label()))
+                    .on_hover_text(fill.hint())
+                    .on_disabled_hover_text("Doesn't line up with this lane's rate");
+                if button.clicked() {
+                    *confirm = None;
+                    model.fill_lane(pattern, lane.id, |index| fill.hits(index, step_beats));
+                    ui.close();
+                }
             }
         });
     });
@@ -2999,12 +3041,12 @@ mod tests {
         assert_eq!(step(2).velocity(), 100);
         assert_eq!(step(1).velocity(), 127, "only the clicked step");
 
-        // Pitch, as its button would select. The bottom of the panel is -24.
+        // Pitch, as its button would select. The bottom of the panel is -12.
         app.param = ParamKind::Pitch;
         let bottom = plot.max.y - 1.0;
         drag_between(&mut app, &ctx, egui::pos2(column(3), bottom), egui::pos2(column(5), bottom));
         let pitches: Vec<i8> = (3..=5).map(|i| step(i).pitch()).collect();
-        assert_eq!(pitches, [-24; 3]);
+        assert_eq!(pitches, [-12; 3]);
         assert!(!step(5).is_on());
 
         // Another lane's steps were not touched.

@@ -733,6 +733,25 @@ mod tests {
         assert_eq!(next.iter().flat_map(|b| volume(b)).collect::<Vec<_>>(), [-9]);
     }
 
+    #[test]
+    fn a_sample_pad_lane_retunes_its_notes() {
+        let data = four_on_the_floor();
+        let mut engine = Engine::new();
+        let tunings = |blocks: Vec<Vec<TimedEvent>>| -> Vec<i32> {
+            blocks
+                .iter()
+                .flatten()
+                .filter(|timed| timed.event.is_note_on())
+                .map(|timed| timed.event.tuning())
+                .collect()
+        };
+        let key = i32::from(data.lanes[0].key());
+        assert_eq!(tunings(run_blocks(&mut engine, &data, 0.0, QUARTER_BEAT, 4)), [0]);
+        data.lanes[0].set_sample_pad(true);
+        let expected = i32::from(Lane::SAMPLE_ROOT) - key;
+        assert_eq!(tunings(run_blocks(&mut engine, &data, 1.0, QUARTER_BEAT, 4)), [expected]);
+    }
+
     /// The baseline: four downbeats and their gates, each firing exactly once
     /// however the blocks fall, with every offset inside the buffer it was
     /// generated for.

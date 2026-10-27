@@ -79,7 +79,7 @@ Right-click an on step to open its settings:
 - **Pan:** from L100 through C (centre) to R100. You can also type `C`, `L50`
   or `R50`. Pan is sent to the instrument as a per-note pan, so it only does
   something if the instrument listens to per-note pan.
-- **Pitch:** −24 to +24 semitones. See [Pitch](#pitch).
+- **Pitch:** −12 to +12 semitones. See [Pitch](#pitch).
 - **Ratchet:** 1–8. Plays the step as that many quick repeats inside its
   length, for rolls and flams.
 - **Chance:** 0–100%. How likely the step is to play each time it comes
@@ -97,7 +97,7 @@ Each note sounds for half of its step, or half of each repeat when ratcheted.
 
 ## Pitch
 
-Each step can be pitched up or down by up to 24 semitones (two octaves). The
+Each step can be pitched up or down by up to 12 semitones (one octave). The
 step still plays its lane's note, so it still triggers the same Drum Machine
 pad; the pitch is sent alongside it as a per-note pitch change, and the pad's
 instrument retunes that one hit.
@@ -120,6 +120,28 @@ or draw it in the [parameter panel](#parameter-panel).
 Pitch only changes the sound if the instrument responds to per-note pitch. If
 a pitched step sounds the same as an unpitched one, the instrument on that
 pad is ignoring it.
+
+### Pitching samples
+
+A sample dropped onto a Drum Machine pad plays in a Sampler, which only
+follows pitch when its **keytrack** is on (the small keyboard icon with two
+arrows above the waveform). To pitch a sample:
+
+1. Click the pad to show its Sampler and turn on **keytrack**. Leave its
+   **root key** at C3.
+2. Make sure the lane's **Sample pad** setting is ticked (right-click the
+   lane's name). It's on for every new lane.
+
+With keytrack on, the Sampler plays the pad's low note (C1, say) well below
+the sample's own pitch. **Sample pad** makes up the difference, so unpitched
+steps sound like the original sample and pitched steps move from there.
+Dragging a new sample onto the Sampler's waveform keeps keytrack on.
+
+Pads with keytrack off ignore pitch entirely, and **Sample pad** makes no
+difference to them. Turn **Sample pad** off for lanes playing synth drums
+(such as Bitwig's E-drum kits) or other instruments, or they'll play two
+octaves too high. Projects saved before this setting existed load with it off,
+so they sound as they did.
 
 ## Parameter panel
 
@@ -222,6 +244,9 @@ Right-click a lane's name to open its menu:
 - **Name:** type a new name (up to 64 characters).
 - **Colour:** pick one of ten colours.
 - **channel:** the MIDI channel the lane sends on, 1–16.
+- **Sample pad:** retunes the lane for a keytracked sample with root key C3.
+  On for new lanes; turn it off for synth drums. See
+  [Pitching samples](#pitching-samples).
 - **duplicate:** adds a copy of the lane directly below it, in all 8
   patterns.
 - **delete:** removes the lane from all 8 patterns. Click it twice to
@@ -232,6 +257,21 @@ Right-click a lane's name to open its menu:
 - **randomise:** turns each step on or off at random (50/50) in the current
   pattern. This replaces the lane's current on/off pattern.
 - **nudge −1 / +1:** rotates the lane's steps one place left or right.
+- **Fill:** replaces the lane's on/off pattern in the current pattern with a
+  preset rhythm, keeping each step's settings:
+  - **All:** every step.
+  - **1/8, 1/4, 1/2:** eighth, quarter or half notes. **1/4** is four on the
+    floor.
+  - **1/1:** the first beat of every bar.
+  - **Off-beats:** the eighth notes between the beats, the classic open
+    hi-hat.
+  - **2 & 4:** beats 2 and 4 of every bar, the usual snare or clap.
+
+  Fills are counted in beats from the lane's first step, so they work at any
+  rate: at 1/16, **1/4** turns on every 4th step, and at 1/8 every 2nd. A fill
+  that doesn't line up with the lane's rate, such as **1/8** on a 1/4 lane or
+  anything on a dotted rate except **All**, is greyed out. Bars are counted
+  as 4/4.
 
 ### Adding lanes
 
@@ -319,7 +359,7 @@ window size, follow setting and scroll position are not saved.
 | Steps per lane | 4096 |
 | Patterns | 8 |
 | Ratchet | 8 repeats |
-| Pitch | ±24 semitones |
+| Pitch | ±12 semitones |
 
 ## Things to know
 
