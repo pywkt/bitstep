@@ -1,0 +1,11 @@
+# Cargo build output, including the bundled plugin (target/bundled/bitstep.clap)
+target/
+
+# Logs
+*.log
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
