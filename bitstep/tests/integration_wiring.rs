@@ -438,7 +438,7 @@ fn a_non_trivial_project_round_trips_through_the_persist_field() {
     assert_eq!((project.lanes[0].key, project.lanes[0].channel), (35, 9));
     assert_eq!(project.lanes[0].colour, 0x12_34_56);
     assert!(project.lanes[0].solo && project.lanes[1].mute);
-    assert_eq!(project.patterns.len(), NUM_PATTERNS);
+    assert_eq!(project.patterns.len(), NUM_PATTERNS, "the last pattern has notes");
 
     let kick = &project.patterns[0].lanes[0];
     assert_eq!((kick.length, kick.rate), (12, Rate::Eighth.to_u8()));
@@ -456,7 +456,7 @@ fn a_non_trivial_project_round_trips_through_the_persist_field() {
     assert!(kick.steps.len() > 20, "the lane's full capacity is stored");
     assert!(kick.steps[20].on, "a step hidden past `length` is stored too");
     let clap = project.lanes.len() - 1;
-    assert!(project.patterns[NUM_PATTERNS - 1].lanes[clap].steps[5].on, "bank 8 is saved");
+    assert!(project.patterns[NUM_PATTERNS - 1].lanes[clap].steps[5].on, "the last bank is saved");
 
     // Out of one instance...
     let saving = Bitstep::default();
@@ -664,9 +664,11 @@ fn a_scripted_session_plays_edits_loops_and_stops() {
     );
 
     // The payload a host receives, end to end from the saved step's packed
-    // bits: velocity 100 of 127, hard right, on the lane's own channel.
+    // bits: velocity 100 of 127, hard right, on the lane's own channel, and
+    // retuned to the sample root as a fresh lane is a sample pad.
     let first = burst[0].event;
-    assert_eq!(first, SeqEvent::note_on(0.0, 0, 35, 9, 100, Step::PAN_MAX, first.voice_id()));
+    let expected = SeqEvent::note_on(0.0, 0, 35, 9, 100, Step::PAN_MAX, first.voice_id());
+    assert_eq!(first, expected.with_sample_pad(true));
     assert!(first.voice_id() >= FIRST_VOICE_ID, "generated notes have their own id range");
     // Each ratchet's note-off carries its own note-on's voice id, which is
     // what pairs them in a host when four notes share one key.

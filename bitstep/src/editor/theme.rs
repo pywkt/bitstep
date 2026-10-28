@@ -214,10 +214,10 @@ pub const PANEL_PADDING: f32 = 6.0;
 /// the right edge.
 pub const FOLLOW_WIDTH: f32 = 76.0;
 
-/// The width of one of the top bar's eight pattern buttons. Wide enough for
-/// a single digit and a hair more, so the row of them reads as one strip
-/// rather than eight separate controls.
-pub const PATTERN_WIDTH: f32 = 24.0;
+/// The width of one of the top bar's pattern buttons (and the page arrows
+/// beside them). Wide enough for two digits, so the row of them reads as one
+/// strip rather than separate controls.
+pub const PATTERN_WIDTH: f32 = 26.0;
 
 /// The width of the top bar's `+ lane` button, which sits beside the follow
 /// toggle and is placed from its own rect for the same reason.
@@ -225,6 +225,24 @@ pub const ADD_LANE_WIDTH: f32 = 66.0;
 
 /// Width of each edit-mode button ("Steps", "Pitch") in the top bar.
 pub const MODE_WIDTH: f32 = 52.0;
+
+/// Width of the song mode toggle, right after the edit-mode buttons.
+pub const SONG_WIDTH: f32 = 52.0;
+
+/// Height of the song row under the top bar: a control and its padding, as
+/// the top bar is.
+pub const SONG_BAR_HEIGHT: f32 = TOP_BAR_HEIGHT;
+
+/// One entry's cell in the song row, and the gap between cells. Room for two
+/// digits.
+pub const SONG_CELL_WIDTH: f32 = 24.0;
+pub const SONG_CELL_GAP: f32 = 2.0;
+
+/// Every this many entries a song cell is shaded, so entries can be counted.
+pub const SONG_ENTRY_GROUP: usize = 4;
+
+/// The progress line along the bottom of a playing song entry.
+pub const SONG_PROGRESS_HEIGHT: f32 = 2.0;
 
 /// The width of the top bar's toggle for the parameter panel, placed from
 /// the right like the follow toggle and the `+ Lane` button.

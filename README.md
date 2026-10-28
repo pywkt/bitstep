@@ -8,7 +8,7 @@ and program beats on a grid, like Bitwig's Stepwise, but with:
   New instances start with eight lanes on consecutive pads from C1.
 - **Its own length and rate per lane** (1/1 to 1/64, triplet and dotted), for
   polymeters and polyrhythms.
-- **Per-step settings:** velocity, pan, pitch (±12 semitones), ratchets
+- **Per-step settings:** velocity, pan, pitch (±24 semitones), ratchets
   (up to 8 repeats) and chance.
 - **A parameter panel** to draw a whole lane's velocity, pan, pitch, chance or
   ratchet with the mouse (Shift for straight lines).
@@ -16,7 +16,10 @@ and program beats on a grid, like Bitwig's Stepwise, but with:
 - **A volume per lane** (−36 to +12 dB).
 - **Pitched samples:** a *Sample pad* lane setting, so Drum Machine samples
   follow the pitch without setting a root key on every pad.
-- **8 patterns**, switchable from an automatable *Pattern Select* parameter.
+- **64 patterns**, switchable from an automatable *Pattern Select* parameter.
+- **Song mode:** type the pattern order (`1-2-1-3x2`) and bitstep plays the
+  patterns one after another along Bitwig's timeline, so changing a pattern
+  changes the whole song without re-recording.
 - Edit while the transport runs; everything is saved with your project.
 
 bitstep makes no sound itself, and only plays while Bitwig's transport is

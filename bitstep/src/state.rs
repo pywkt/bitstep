@@ -13,7 +13,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{FIRST_LANE_ID, Lane, LaneData, MAX_LANES, NUM_PATTERNS, SeqData, Step};
+use crate::model::{
+    FIRST_LANE_ID, Lane, LaneData, MAX_LANES, NUM_PATTERNS, SeqData, Song, Step,
+};
 use crate::sequencer::Rate;
 
 /// The format version written by this build.
@@ -37,9 +39,29 @@ pub const CURRENT_VERSION: u32 = 1;
 pub struct SeqSnapshot {
     pub version: u32,
     pub lanes: Vec<LaneSnapshot>,
-    /// [`NUM_PATTERNS`] entries as written by [`SeqSnapshot::from_data`], and
-    /// padded or truncated to that many by [`SeqSnapshot::into_data`].
+    /// Up to [`NUM_PATTERNS`] entries: [`SeqSnapshot::from_data`] leaves out
+    /// the trailing patterns nobody has touched, and
+    /// [`SeqSnapshot::into_data`] pads or truncates to that many.
     pub patterns: Vec<PatternSnapshot>,
+    /// Song mode; off and empty in every save from before it existed.
+    pub song: SongSnapshot,
+}
+
+/// Song mode as saved: the switches and the order as typed.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(default)]
+pub struct SongSnapshot {
+    pub on: bool,
+    /// Starts again after the last entry. Saves from before the choice
+    /// existed stopped there, but load looped: it is what a song should do.
+    pub looped: bool,
+    pub text: String,
+}
+
+impl Default for SongSnapshot {
+    fn default() -> SongSnapshot {
+        SongSnapshot { on: false, looped: true, text: String::new() }
+    }
 }
 
 /// One lane's identity and live settings. Its steps live in the patterns.
@@ -93,16 +115,31 @@ pub struct LaneDataSnapshot {
 ///
 /// `pitch` arrived after the first saved projects. `#[serde(default)]` loads
 /// a step saved without it as pitch 0, so older projects open unchanged.
+///
+/// Fields at their zero default are left out of the saved form: with 64
+/// patterns most steps are untouched, and they store as `{}`. Loading fills a
+/// missing field with the same zero, so nothing changes on the way back.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(default)]
 pub struct StepSnapshot {
+    #[serde(skip_serializing_if = "is_zero")]
     pub on: bool,
+    #[serde(skip_serializing_if = "is_zero")]
     pub velocity: u8,
+    #[serde(skip_serializing_if = "is_zero")]
     pub pan: u8,
+    #[serde(skip_serializing_if = "is_zero")]
     pub ratchet: u8,
+    #[serde(skip_serializing_if = "is_zero")]
     pub probability: u8,
-    /// Semitones, `-12..=12`. Clamped on load.
+    /// Semitones, `-24..=24`. Clamped on load.
+    #[serde(skip_serializing_if = "is_zero")]
     pub pitch: i8,
+}
+
+/// Whether a field holds its type's default, for `skip_serializing_if`.
+fn is_zero<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
 }
 
 impl SeqSnapshot {
@@ -112,14 +149,25 @@ impl SeqSnapshot {
     /// Allocates freely: this runs on the main thread when the host asks for
     /// state, never in `process()`.
     pub fn from_data(data: &SeqData) -> SeqSnapshot {
+        // Patterns past the last one anybody touched load back as exactly
+        // what they are, so they are not written.
+        let used = data
+            .patterns
+            .iter()
+            .rposition(|pattern| !pattern.iter().all(LaneData::is_pristine))
+            .map_or(0, |last| last + 1);
         SeqSnapshot {
             version: CURRENT_VERSION,
             lanes: data.lanes.iter().map(LaneSnapshot::from_lane).collect(),
-            patterns: data
-                .patterns
+            patterns: data.patterns[..used]
                 .iter()
                 .map(|pattern| PatternSnapshot::from_lane_data(pattern))
                 .collect(),
+            song: SongSnapshot {
+                on: data.song.is_on(),
+                looped: data.song.is_looped(),
+                text: data.song.text.clone(),
+            },
         }
     }
 
@@ -145,7 +193,8 @@ impl SeqSnapshot {
             Some(pattern) => pattern.to_lane_data(),
             None => Vec::new(),
         });
-        SeqData::new(lanes, patterns)
+        let song = Song::from_text(self.song.text, self.song.on).with_looped(self.song.looped);
+        SeqData::new(lanes, patterns).with_song(song)
     }
 }
 
@@ -154,7 +203,12 @@ impl Default for SeqSnapshot {
     /// so a stored object with no `version` field is read as current rather
     /// than as a pre-v1 file needing migration.
     fn default() -> SeqSnapshot {
-        SeqSnapshot { version: CURRENT_VERSION, lanes: Vec::new(), patterns: Vec::new() }
+        SeqSnapshot {
+            version: CURRENT_VERSION,
+            lanes: Vec::new(),
+            patterns: Vec::new(),
+            song: SongSnapshot::default(),
+        }
     }
 }
 
@@ -332,7 +386,7 @@ pub fn default_data() -> SeqData {
             lane
         })
         .collect();
-    // `from_lanes` gives every lane an empty `LaneData` in all 8 patterns.
+    // `from_lanes` gives every lane an empty `LaneData` in every pattern.
     SeqData::from_lanes(lanes)
 }
 
@@ -585,6 +639,7 @@ mod tests {
                 sample_pad: true,
             }],
             patterns: Vec::new(),
+            song: Default::default(),
         };
 
         let data = snapshot.into_data();
@@ -628,6 +683,7 @@ mod tests {
                         .collect(),
                 })
                 .collect(),
+            song: SongSnapshot::default(),
         }
     }
 
@@ -788,7 +844,7 @@ mod tests {
     fn step_pitch_round_trips_including_on_a_never_edited_step() {
         for step in [
             Step::default_on().with_pitch(12),
-            Step::pack(false, 40, 3, 2, 70).with_pitch(-12),
+            Step::pack(false, 40, 3, 2, 70).with_pitch(-24),
             Step::OFF.with_pitch(5),
             Step::OFF,
         ] {
@@ -841,6 +897,59 @@ mod tests {
         let back = back.into_data();
         assert!(!back.lanes[1].is_sample_pad(), "turned off and saved, it loads off");
         assert!(back.lanes[0].is_sample_pad());
+    }
+
+    /// Song mode is saved and loaded, and a save from before it existed
+    /// loads with it off and empty.
+    #[test]
+    fn the_song_round_trips() {
+        let data = default_data().with_song(Song::from_text("1-2x3-0".into(), true));
+        let json = serde_json::to_string(&SeqSnapshot::from_data(&data)).expect("saves");
+        let back: SeqSnapshot = serde_json::from_str(&json).expect("loads");
+        let back = back.into_data();
+        assert!(back.song.is_on());
+        assert_eq!(back.song.text, "1-2x3-0");
+        assert_eq!(back.song.entries, [0, 1, 1, 1, Song::REST]);
+        assert!(back.song.is_looped());
+
+        data.song.set_looped(false);
+        let json = serde_json::to_string(&SeqSnapshot::from_data(&data)).expect("saves");
+        let back: SeqSnapshot = serde_json::from_str(&json).expect("loads");
+        assert!(!back.into_data().song.is_looped(), "stopping at the end is kept");
+
+        let old: SeqSnapshot =
+            serde_json::from_str(r#"{"version":1,"lanes":[],"patterns":[]}"#).expect("loads");
+        let old = old.into_data();
+        assert!(!old.song.is_on() && old.song.is_empty());
+        let older = r#"{"version":1,"lanes":[],"patterns":[],"song":{"on":true,"text":"1"}}"#;
+        let older: SeqSnapshot = serde_json::from_str(older).expect("loads");
+        assert!(older.into_data().song.is_looped(), "a song saved before the choice loops");
+    }
+
+    /// Patterns past the last one with anything in them are left out of a
+    /// save and come back exactly as they were; untouched steps save as
+    /// `{}`.
+    #[test]
+    fn untouched_patterns_and_steps_save_small() {
+        let data = default_data();
+        let fresh = SeqSnapshot::from_data(&data);
+        assert!(fresh.patterns.is_empty(), "a fresh instance saves no patterns");
+
+        data.patterns[2][0].set_step(5, Step::default_on());
+        data.patterns[0][1].set_length(12);
+        let snapshot = SeqSnapshot::from_data(&data);
+        assert_eq!(snapshot.patterns.len(), 3, "up to the last pattern with an edit");
+
+        let json = serde_json::to_string(&snapshot).expect("saves");
+        assert!(json.contains("{},{}"), "untouched steps are empty objects");
+        let back: SeqSnapshot = serde_json::from_str(&json).expect("loads");
+        assert_eq!(back, snapshot);
+        let back = back.into_data();
+        assert_eq!(back.patterns.len(), NUM_PATTERNS);
+        assert!(back.patterns[2][0].step(5).is_on());
+        assert_eq!(back.patterns[0][1].length(), 12);
+        assert!(back.patterns[3..].iter().flatten().all(LaneData::is_pristine));
+        assert_eq!(SeqSnapshot::from_data(&back), snapshot, "and saves the same again");
     }
 
     // ---- fresh-instance defaults ----

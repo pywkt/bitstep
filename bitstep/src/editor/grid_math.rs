@@ -913,6 +913,9 @@ pub enum Zone {
 pub struct EditorLayout {
     full: Rect,
     top_bar: Rect,
+    /// The song row under the top bar. Zero-height until
+    /// [`Self::with_song_bar`].
+    song_bar: Rect,
     headers: Rect,
     steps: Rect,
     /// The parameter panel's left end, under the lane headers: what it edits
@@ -943,11 +946,25 @@ impl EditorLayout {
         EditorLayout {
             full: Rect::from_min_max(full.min, pos2(right, bottom)),
             top_bar: Rect::from_min_max(full.min, pos2(right, split_y)),
+            song_bar: Rect::from_min_max(pos2(left, split_y), pos2(right, split_y)),
             headers: Rect::from_min_max(pos2(left, split_y), pos2(split_x, bottom)),
             steps: Rect::from_min_max(pos2(split_x, split_y), pos2(right, bottom)),
             panel_header: Rect::from_min_max(pos2(left, bottom), pos2(split_x, bottom)),
             panel_strip: Rect::from_min_max(pos2(split_x, bottom), pos2(right, bottom)),
         }
+    }
+
+    /// The same split with the song row taking `height` points off the top of
+    /// the lane headers and the step strip, right under the top bar. Call it
+    /// before [`Self::with_panel`], which shares out what is left.
+    pub fn with_song_bar(mut self, height: f32) -> EditorLayout {
+        let top = self.top_bar.max.y;
+        let height = sane(height, 0.0, (self.full.max.y - top).max(0.0));
+        self.song_bar =
+            Rect::from_min_max(pos2(self.full.min.x, top), pos2(self.full.max.x, top + height));
+        self.headers.min.y = top + height;
+        self.steps.min.y = top + height;
+        self
     }
 
     /// The same split with the parameter panel taking `height` points off the
@@ -956,7 +973,7 @@ impl EditorLayout {
     /// Never more than [`PANEL_MAX_SHARE`] of what is below the top bar, so a
     /// short window keeps some grid to select a lane in.
     pub fn with_panel(mut self, height: f32) -> EditorLayout {
-        let below_bar = (self.full.max.y - self.top_bar.max.y).max(0.0);
+        let below_bar = (self.full.max.y - self.song_bar.max.y).max(0.0);
         let height = sane(height, 0.0, below_bar * PANEL_MAX_SHARE);
         let top = self.full.max.y - height;
         let bottom = self.full.max.y;
@@ -981,6 +998,35 @@ impl EditorLayout {
 
     pub fn top_bar(&self) -> Rect {
         self.top_bar
+    }
+
+    /// The song row (empty when song mode is off).
+    pub fn song_bar(&self) -> Rect {
+        self.song_bar
+    }
+
+    /// The song order's text field: the left end of the song row, over the
+    /// lane headers' column.
+    pub fn song_text(&self) -> Rect {
+        let row = self.song_bar_inner();
+        let right = (self.headers.max.x - theme::PANEL_PADDING).clamp(row.min.x, row.max.x);
+        Rect::from_min_max(row.min, pos2(right, row.max.y))
+    }
+
+    /// The song's bar cells: the rest of the song row, over the step strip.
+    pub fn song_strip(&self) -> Rect {
+        let row = self.song_bar_inner();
+        let left = self.steps.min.x.clamp(row.min.x, row.max.x);
+        Rect::from_min_max(pos2(left, row.min.y), row.max)
+    }
+
+    /// The song row inset by its padding, giving way like
+    /// [`Self::bar_inner`] in a row too small to hold it.
+    fn song_bar_inner(&self) -> Rect {
+        let bar = self.song_bar;
+        let pad = sane(theme::PANEL_PADDING, 0.0, bar.width().max(0.0) * 0.5)
+            .min(bar.height().max(0.0) * 0.5);
+        bar.shrink(pad)
     }
 
     /// The lane headers' column — the viewport they scroll vertically in.
@@ -1022,7 +1068,7 @@ impl EditorLayout {
     pub fn zone(&self, pos: Pos2) -> Zone {
         if !self.full.contains(pos) {
             Zone::Outside
-        } else if pos.y < self.top_bar.max.y {
+        } else if pos.y < self.top_bar.max.y.max(self.song_bar.max.y) {
             Zone::TopBar
         } else if self.panel_strip.height() > 0.0 && pos.y >= self.panel_strip.min.y {
             Zone::Panel
@@ -1119,8 +1165,8 @@ impl EditorLayout {
     /// narrow digits still read as eight patterns. Zero when even that does
     /// not fit, which is the signal the caller draws nothing from.
     fn pattern_button_width(&self) -> f32 {
-        let gaps = theme::ITEM_SPACING * (PATTERN_BUTTONS - 1) as f32;
-        let share = (self.bar_rest().width() - gaps).max(0.0) / PATTERN_BUTTONS as f32;
+        let gaps = theme::ITEM_SPACING * (PATTERN_BAR_SLOTS - 1) as f32;
+        let share = (self.bar_rest().width() - gaps).max(0.0) / PATTERN_BAR_SLOTS as f32;
         sane(theme::PATTERN_WIDTH, 0.0, share)
     }
 
@@ -1130,7 +1176,7 @@ impl EditorLayout {
     pub fn pattern_bar(&self) -> Rect {
         let rest = self.bar_rest();
         let width = self.pattern_button_width();
-        let buttons = PATTERN_BUTTONS as f32;
+        let buttons = PATTERN_BAR_SLOTS as f32;
         let gaps = theme::ITEM_SPACING * (buttons - 1.0);
         let total = match width > 0.0 {
             // Clamped to the room it was divided out of: the division is a
@@ -1150,12 +1196,30 @@ impl EditorLayout {
     /// rect, and the caller already skips the ones with no room
     /// (`Rect::is_positive`).
     pub fn pattern_button(&self, index: usize) -> Rect {
+        match index < PATTERN_BUTTONS {
+            true => self.pattern_slot(index + 1),
+            false => self.pattern_slot(PATTERN_BAR_SLOTS),
+        }
+    }
+
+    /// The page arrows either side of the pattern buttons: 0 is the one on
+    /// the left (back a page), 1 the one on the right.
+    pub fn page_button(&self, index: usize) -> Rect {
+        match index {
+            0 => self.pattern_slot(0),
+            1 => self.pattern_slot(PATTERN_BAR_SLOTS - 1),
+            _ => self.pattern_slot(PATTERN_BAR_SLOTS),
+        }
+    }
+
+    /// One slot of the pattern strip, arrows included; empty past the last.
+    fn pattern_slot(&self, slot: usize) -> Rect {
         let rest = self.bar_rest();
         let width = self.pattern_button_width();
-        if width <= 0.0 || index >= PATTERN_BUTTONS {
+        if width <= 0.0 || slot >= PATTERN_BAR_SLOTS {
             return Rect::from_min_max(rest.min, rest.min);
         }
-        let left = rest.min.x + index as f32 * (width + theme::ITEM_SPACING);
+        let left = rest.min.x + slot as f32 * (width + theme::ITEM_SPACING);
         let right = (left + width).min(rest.max.x);
         Rect::from_min_max(pos2(left.min(right), rest.min.y), pos2(right, rest.max.y))
     }
@@ -1173,11 +1237,25 @@ impl EditorLayout {
         Rect::from_min_max(pos2(left, room.min.y), pos2(right, room.max.y))
     }
 
-    /// What is left of [`Self::bar_status`] after the edit-mode buttons —
-    /// where the instance's status line is drawn.
+    /// The song mode toggle: right after the edit-mode buttons. Empty when
+    /// there is no room.
+    pub fn song_button(&self) -> Rect {
+        let room = self.bar_status();
+        let left = room.min.x + MODE_BUTTONS as f32 * (theme::MODE_WIDTH + theme::ITEM_SPACING);
+        let right = (left + theme::SONG_WIDTH).min(room.max.x);
+        if right <= left {
+            return Rect::from_min_max(room.min, room.min);
+        }
+        Rect::from_min_max(pos2(left, room.min.y), pos2(right, room.max.y))
+    }
+
+    /// What is left of [`Self::bar_status`] after the edit-mode buttons and
+    /// the song toggle — where the instance's status line is drawn.
     pub fn status_line(&self) -> Rect {
         let room = self.bar_status();
-        let used = MODE_BUTTONS as f32 * (theme::MODE_WIDTH + theme::ITEM_SPACING);
+        let used = MODE_BUTTONS as f32 * (theme::MODE_WIDTH + theme::ITEM_SPACING)
+            + theme::SONG_WIDTH
+            + theme::ITEM_SPACING;
         let start = (room.min.x + used).min(room.max.x);
         Rect::from_min_max(pos2(start, room.min.y), room.max)
     }
@@ -1203,11 +1281,34 @@ pub const PANEL_MAX_SHARE: f32 = 0.5;
 
 // ---- the pattern bar ----
 
-/// How many buttons the pattern bar has: one per pattern a [`SeqData`][d]
-/// holds, which is also the span of the `patsel` parameter.
-///
-/// [d]: crate::model::SeqData
-pub const PATTERN_BUTTONS: usize = NUM_PATTERNS;
+/// How many pattern buttons the bar shows at once: one page of patterns.
+/// The page arrows either side step through the rest.
+pub const PATTERN_BUTTONS: usize = 8;
+
+/// How many pages the patterns fill.
+pub const PATTERN_PAGES: usize = NUM_PATTERNS.div_ceil(PATTERN_BUTTONS);
+
+/// Slots in the pattern strip: the buttons and a page arrow at each end.
+pub const PATTERN_BAR_SLOTS: usize = PATTERN_BUTTONS + 2;
+
+/// The pattern button `slot` stands for on page `page`, or `None` for a slot
+/// past the last pattern.
+pub fn page_pattern(page: usize, slot: usize) -> Option<usize> {
+    let pattern = page.checked_mul(PATTERN_BUTTONS)?.checked_add(slot)?;
+    (slot < PATTERN_BUTTONS && pattern < NUM_PATTERNS).then_some(pattern)
+}
+
+/// The page that holds `pattern`.
+pub fn pattern_page(pattern: usize) -> usize {
+    (pattern / PATTERN_BUTTONS).min(PATTERN_PAGES - 1)
+}
+
+/// One page on from `page` in `direction` (-1 back, +1 on), wrapping round
+/// at either end.
+pub fn step_page(page: usize, direction: i32) -> usize {
+    let pages = PATTERN_PAGES as i64;
+    (page as i64 + i64::from(direction)).rem_euclid(pages) as usize
+}
 
 /// The `patsel` value button `index` writes.
 ///
@@ -1218,7 +1319,7 @@ pub const PATTERN_BUTTONS: usize = NUM_PATTERNS;
 /// last button, so a caller that counted wrong selects a pattern that exists
 /// rather than one the parameter would clamp for it.
 pub fn pattern_button_value(index: usize) -> i32 {
-    let index = index.min(PATTERN_BUTTONS - 1) as i32;
+    let index = index.min(NUM_PATTERNS - 1) as i32;
     index + i32::from(BlockCtx::PATTERN_SELECT_MIN)
 }
 
@@ -1246,7 +1347,70 @@ pub fn pattern_button_index(value: i32) -> Option<usize> {
 ///
 /// [p]: crate::model::Playhead::pattern
 pub fn pattern_index_button(index: u32) -> Option<usize> {
-    usize::try_from(index).ok().filter(|index| *index < PATTERN_BUTTONS)
+    usize::try_from(index).ok().filter(|index| *index < NUM_PATTERNS)
+}
+
+// ---- the song row ----
+
+/// Bars of margin follow mode keeps between the playing bar and the edge of
+/// the song row.
+pub const SONG_FOLLOW_MARGIN: f32 = 2.0;
+
+/// The distance from one song cell to the next.
+pub fn song_cell_pitch() -> f32 {
+    theme::SONG_CELL_WIDTH + theme::SONG_CELL_GAP
+}
+
+/// How far the song row scrolls at most: its cells, plus one for the end
+/// marker, less the room it has.
+pub fn song_max_scroll(strip_width: f32, bars: usize) -> f32 {
+    let content = (bars + 1) as f32 * song_cell_pitch() - theme::SONG_CELL_GAP;
+    sane(content - strip_width, 0.0, f32::MAX)
+}
+
+/// Cell `index` of the song row (`bars` is the end marker), scrolled by
+/// `scroll`. Not clipped: the caller paints through a clip to the strip.
+pub fn song_cell(strip: Rect, scroll: f32, index: usize) -> Rect {
+    let left = strip.min.x + index as f32 * song_cell_pitch() - scroll;
+    Rect::from_min_max(
+        pos2(left, strip.min.y),
+        pos2(left + theme::SONG_CELL_WIDTH, strip.max.y),
+    )
+}
+
+/// The song cell under `pos`, or `None` off the strip or in a gap.
+pub fn song_cell_at(strip: Rect, scroll: f32, pos: Pos2) -> Option<usize> {
+    if !strip.contains(pos) {
+        return None;
+    }
+    let offset = pos.x - strip.min.x + scroll;
+    let index = index_floor(offset, song_cell_pitch());
+    song_cell(strip, scroll, index).x_range().contains(pos.x).then_some(index)
+}
+
+/// The song cells that are at least partly in view.
+pub fn song_visible(strip_width: f32, scroll: f32, cells: usize) -> Range<usize> {
+    let pitch = song_cell_pitch();
+    let first = index_floor(scroll, pitch).min(cells);
+    let end = index_ceil(scroll + strip_width.max(0.0), pitch).min(cells);
+    first..end.max(first)
+}
+
+/// The scroll that brings bar `bar` into view with [`SONG_FOLLOW_MARGIN`]
+/// bars to spare, or `scroll` itself when the bar is already there.
+pub fn song_follow(scroll: f32, strip_width: f32, bars: usize, bar: usize) -> f32 {
+    let pitch = song_cell_pitch();
+    let margin = SONG_FOLLOW_MARGIN * pitch;
+    let left = bar as f32 * pitch;
+    let right = left + theme::SONG_CELL_WIDTH;
+    let wanted = if left - margin < scroll {
+        left - margin
+    } else if right + margin > scroll + strip_width {
+        right + margin - strip_width
+    } else {
+        scroll
+    };
+    sane(wanted, 0.0, song_max_scroll(strip_width, bars))
 }
 
 // ---- the lane header ----
@@ -1700,7 +1864,7 @@ pub const PITCH_WIDGET_MIN: f64 = Step::PITCH_MIN as f64;
 /// The other end of the pitch slider — see [`PITCH_WIDGET_MIN`].
 pub const PITCH_WIDGET_MAX: f64 = Step::PITCH_MAX as f64;
 
-/// A raw widget value as a pitch offset in semitones, -12..=12.
+/// A raw widget value as a pitch offset in semitones, -24..=24.
 // Not `clamp`: `max` then `min` folds a NaN onto the low end.
 #[allow(clippy::manual_clamp)]
 pub fn widget_pitch(value: f64) -> i8 {
@@ -1740,7 +1904,7 @@ pub fn pitch_label(pitch: i8) -> String {
 // ---- drawing pitch (pitch mode) ----
 
 /// Points of vertical travel per semitone when drawing pitch: the full
-/// ±12 is 48 points either way of the press, about a row and a half.
+/// ±24 is 96 points either way of the press, about three rows.
 pub const PITCH_DRAW_POINTS: f32 = 4.0;
 
 /// The pitch a drag of `dy` points from the press means, from the pitch the
@@ -2727,8 +2891,9 @@ mod tests {
         }
     }
 
-    /// The pattern bar: eight buttons in index order at the left end of the
-    /// top bar, a gap apart, with the status line past their right edge.
+    /// The pattern bar: a page arrow, eight buttons in order and another
+    /// arrow at the left end of the top bar, a gap apart, with the status
+    /// line past their right edge.
     #[test]
     fn the_pattern_bar_fills_the_left_end_of_the_top_bar() {
         let window = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 400.0));
@@ -2737,48 +2902,140 @@ mod tests {
         let rest = layout.bar_rest();
         let strip = layout.pattern_bar();
 
-        assert_eq!(PATTERN_BUTTONS, 8, "one button per pattern");
+        assert_eq!(PATTERN_BUTTONS, 8, "one page of buttons");
         assert_eq!(strip.min, rest.min, "the strip starts where the bar's room does");
         assert_eq!(strip.y_range(), bar.y_range());
 
-        let mut previous = layout.pattern_button(0);
-        assert_eq!(previous.min, rest.min);
-        for index in 0..PATTERN_BUTTONS {
-            let slot = layout.pattern_button(index);
-            assert_eq!(slot.width(), theme::PATTERN_WIDTH, "button {index}");
-            assert_eq!(slot.y_range(), bar.y_range(), "button {index}");
-            assert!(rest.contains_rect(slot), "button {index} is inside the bar's room");
+        let slots: Vec<Rect> = std::iter::once(layout.page_button(0))
+            .chain((0..PATTERN_BUTTONS).map(|index| layout.pattern_button(index)))
+            .chain(std::iter::once(layout.page_button(1)))
+            .collect();
+        assert_eq!(slots.len(), PATTERN_BAR_SLOTS);
+        assert_eq!(slots[0].min, rest.min, "the back arrow comes first");
+        for (index, slot) in slots.iter().enumerate() {
+            assert_eq!(slot.width(), theme::PATTERN_WIDTH, "slot {index}");
+            assert_eq!(slot.y_range(), bar.y_range(), "slot {index}");
+            assert!(rest.contains_rect(*slot), "slot {index} is inside the bar's room");
             if index > 0 {
-                assert_eq!(slot.min.x - previous.max.x, theme::ITEM_SPACING, "one gap apart");
+                let gap = slot.min.x - slots[index - 1].max.x;
+                assert_eq!(gap, theme::ITEM_SPACING, "one gap apart");
             }
-            previous = slot;
         }
-        assert_eq!(previous.max.x, strip.max.x, "the strip ends with its last button");
-        assert!(
-            !layout.pattern_button(PATTERN_BUTTONS).is_positive(),
-            "there is no ninth button to draw"
-        );
+        assert_eq!(slots[PATTERN_BAR_SLOTS - 1].max.x, strip.max.x, "the strip ends with it");
+        assert!(!layout.pattern_button(PATTERN_BUTTONS).is_positive(), "no ninth button");
+        assert!(!layout.page_button(2).is_positive(), "no third arrow");
 
         let status = layout.bar_status();
         assert_eq!(status.min.x - strip.max.x, theme::ITEM_SPACING, "one gap past the buttons");
         assert_eq!(status.max, rest.max);
         assert_eq!(status.y_range(), bar.y_range());
 
-        // A bar with less room than the eight buttons want: all eight are
-        // still there, narrower and still inside it, and the status line is
-        // what gives way.
+        // A bar with less room than the strip wants: every slot is still
+        // there, narrower and still inside it, and the status line is what
+        // gives way.
         let squeezed = Rect::from_min_size(pos2(0.0, 0.0), vec2(336.0, 40.0));
         let narrow = EditorLayout::from_theme(squeezed);
         let room = narrow.bar_rest();
-        assert!(room.width() < theme::PATTERN_WIDTH * PATTERN_BUTTONS as f32, "squeezed");
+        assert!(room.width() < theme::PATTERN_WIDTH * PATTERN_BAR_SLOTS as f32, "squeezed");
         for index in 0..PATTERN_BUTTONS {
             let slot = narrow.pattern_button(index);
             assert!(slot.is_positive(), "button {index} still has room");
             assert!(slot.width() < theme::PATTERN_WIDTH, "button {index} gave way");
             assert!(room.contains_rect(slot), "button {index} is inside the bar's room");
         }
+        for side in 0..2 {
+            assert!(room.contains_rect(narrow.page_button(side)), "arrow {side}");
+        }
         assert!(room.contains_rect(narrow.pattern_bar()));
         assert!(!narrow.bar_status().is_positive(), "nothing is left for the status line");
+    }
+
+    /// Paging: eight patterns a page, the page that holds a pattern, and
+    /// the arrows wrapping round at both ends.
+    #[test]
+    fn pattern_pages_hold_eight_patterns_each() {
+        assert_eq!(PATTERN_PAGES, 8);
+        assert_eq!(page_pattern(0, 0), Some(0));
+        assert_eq!(page_pattern(1, 0), Some(8), "the second page starts at pattern 9");
+        assert_eq!(page_pattern(PATTERN_PAGES - 1, PATTERN_BUTTONS - 1), Some(NUM_PATTERNS - 1));
+        assert_eq!(page_pattern(PATTERN_PAGES, 0), None, "no page past the last");
+        assert_eq!(page_pattern(0, PATTERN_BUTTONS), None, "no slot past the last");
+        assert_eq!(page_pattern(usize::MAX, 1), None);
+        for pattern in 0..NUM_PATTERNS {
+            let page = pattern_page(pattern);
+            assert_eq!(page_pattern(page, pattern % PATTERN_BUTTONS), Some(pattern));
+        }
+        assert_eq!(pattern_page(usize::MAX), PATTERN_PAGES - 1);
+        assert_eq!(step_page(0, 1), 1);
+        assert_eq!(step_page(0, -1), PATTERN_PAGES - 1, "back from the first wraps");
+        assert_eq!(step_page(PATTERN_PAGES - 1, 1), 0, "on from the last wraps");
+    }
+
+    /// The song row's cells: placed a pitch apart from the strip's left
+    /// edge, found again under the pointer, and scrolled no further than the
+    /// last cell (the end marker) needs.
+    #[test]
+    fn song_cells_are_placed_hit_and_followed() {
+        let strip = Rect::from_min_size(pos2(100.0, 10.0), vec2(260.0, 30.0));
+        let pitch = song_cell_pitch();
+        assert_eq!(song_cell(strip, 0.0, 0).min, strip.min);
+        assert_eq!(song_cell(strip, 0.0, 3).min.x, strip.min.x + 3.0 * pitch);
+        assert_eq!(song_cell(strip, pitch, 3).min.x, strip.min.x + 2.0 * pitch, "scrolled");
+
+        let middle = |index: usize, scroll: f32| song_cell(strip, scroll, index).center();
+        assert_eq!(song_cell_at(strip, 0.0, middle(4, 0.0)), Some(4));
+        assert_eq!(song_cell_at(strip, 2.0 * pitch, middle(4, 2.0 * pitch)), Some(4));
+        let gap = pos2(strip.min.x + theme::SONG_CELL_WIDTH + 1.0, strip.center().y);
+        assert_eq!(song_cell_at(strip, 0.0, gap), None, "between two cells");
+        assert_eq!(song_cell_at(strip, 0.0, pos2(0.0, 0.0)), None, "off the strip");
+
+        // Ten cells fit in 260 points, so a 9-bar song (ten cells with the
+        // end marker) does not scroll and a 40-bar one does.
+        assert_eq!(song_max_scroll(strip.width(), 9), 0.0);
+        let max = song_max_scroll(strip.width(), 40);
+        assert_eq!(max, 41.0 * pitch - theme::SONG_CELL_GAP - strip.width());
+        assert_eq!(song_visible(strip.width(), 0.0, 41), 0..10);
+        assert_eq!(song_visible(strip.width(), 0.0, 3), 0..3, "no more than there are");
+
+        // Follow: a bar in view stays put, one past the right edge comes in
+        // with the margin, and the result never passes the ends.
+        assert_eq!(song_follow(0.0, strip.width(), 40, 3), 0.0);
+        let followed = song_follow(0.0, strip.width(), 40, 20);
+        let right = song_cell(strip, followed, 20).max.x;
+        assert!(right <= strip.max.x - SONG_FOLLOW_MARGIN * pitch + 0.01, "{right}");
+        assert_eq!(song_follow(max, strip.width(), 40, 0), 0.0, "back to the start");
+        assert_eq!(song_follow(0.0, strip.width(), 40, 40), max, "the end marker");
+    }
+
+    /// The song row takes its height off the top of the headers and the
+    /// strip, the text field sits over the headers' column and the cells
+    /// over the steps, and the whole row counts as top bar.
+    #[test]
+    fn the_song_row_sits_under_the_top_bar() {
+        let window = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 500.0));
+        let plain = EditorLayout::from_theme(window).with_panel(theme::PARAM_PANEL_HEIGHT);
+        let layout = EditorLayout::from_theme(window)
+            .with_song_bar(theme::SONG_BAR_HEIGHT)
+            .with_panel(theme::PARAM_PANEL_HEIGHT);
+        let row = layout.song_bar();
+
+        assert_eq!(plain.song_bar().height(), 0.0, "no row until asked for");
+        assert_eq!(row.min.y, layout.top_bar().max.y);
+        assert_eq!(row.height(), theme::SONG_BAR_HEIGHT);
+        assert_eq!(layout.steps().min.y, row.max.y);
+        assert_eq!(layout.headers().min.y, row.max.y);
+        assert_eq!(layout.panel().max.y, window.max.y, "the panel stays at the bottom");
+
+        let (text, strip) = (layout.song_text(), layout.song_strip());
+        assert!(row.contains_rect(text) && row.contains_rect(strip));
+        assert!(text.max.x <= layout.headers().max.x);
+        assert_eq!(strip.min.x, layout.steps().min.x);
+        assert_eq!(layout.zone(row.center()), Zone::TopBar);
+        assert_eq!(layout.zone(pos2(strip.center().x, row.max.y + 1.0)), Zone::Steps);
+
+        let song = layout.song_button();
+        assert!(song.min.x > layout.mode_button(1).max.x, "after the mode buttons");
+        assert!(layout.status_line().min.x > song.max.x, "before the status line");
     }
 
     /// Button index ↔ `patsel` value, both ways: the parameter is one-based
@@ -2790,11 +3047,11 @@ mod tests {
         let max = i32::from(BlockCtx::PATTERN_SELECT_MAX);
 
         assert_eq!(pattern_button_value(0), min, "the first button selects the first pattern");
-        assert_eq!(pattern_button_value(PATTERN_BUTTONS - 1), max);
-        assert_eq!(pattern_button_value(PATTERN_BUTTONS), max, "saturates at the last button");
+        assert_eq!(pattern_button_value(NUM_PATTERNS - 1), max);
+        assert_eq!(pattern_button_value(NUM_PATTERNS), max, "saturates at the last pattern");
         assert_eq!(pattern_button_value(usize::MAX), max);
 
-        for index in 0..PATTERN_BUTTONS {
+        for index in 0..NUM_PATTERNS {
             let value = pattern_button_value(index);
             assert!((min..=max).contains(&value), "button {index} writes {value}");
             assert_eq!(pattern_button_index(value), Some(index), "and {value} lights it again");
@@ -2809,12 +3066,12 @@ mod tests {
         }
 
         // The playhead's own numbering: a pattern index, and its sentinel.
-        for index in 0..PATTERN_BUTTONS {
+        for index in 0..NUM_PATTERNS {
             assert_eq!(pattern_index_button(index as u32), Some(index));
         }
         // `Playhead::NONE` is `u32::MAX`, so the sentinel is covered here
         // too — but the editor has already turned it into `None` by then.
-        for index in [PATTERN_BUTTONS as u32, 99, crate::model::Playhead::NONE] {
+        for index in [NUM_PATTERNS as u32, 99, crate::model::Playhead::NONE] {
             assert_eq!(pattern_index_button(index), None, "{index} lights no button");
         }
     }
@@ -4063,7 +4320,7 @@ mod tests {
         assert_eq!(pitch_bar(cell, 0), None);
         let up = pitch_bar(cell, Step::PITCH_MAX).expect("a bar");
         assert_eq!((up.min.y, up.max.y), (0.0, 12.0), "full height above the middle");
-        let down = pitch_bar(cell, -6).expect("a bar");
+        let down = pitch_bar(cell, -12).expect("a bar");
         assert_eq!((down.min.y, down.max.y), (12.0, 18.0), "half of the lower half");
         assert!(pitch_bar(cell, 1).expect("a bar").height() >= 1.5, "±1 still shows");
         assert!(pitch_marker(cell, 3).expect("a mark").width() <= theme::PITCH_MARKER_WIDTH);
@@ -4190,9 +4447,9 @@ mod tests {
         assert!(quiet.height() >= PARAM_MIN_BAR, "velocity 1 is still drawn");
         assert_eq!(quiet.x_range(), x);
 
-        let up = ParamKind::Pitch.bar(plot, x, 12);
+        let up = ParamKind::Pitch.bar(plot, x, 24);
         assert_eq!((up.min.y, up.max.y), (0.0, 63.0));
-        let down = ParamKind::Pitch.bar(plot, x, -6);
+        let down = ParamKind::Pitch.bar(plot, x, -12);
         assert_eq!((down.min.y, down.max.y), (63.0, 94.5));
         assert_eq!(ParamKind::Pitch.bar(plot, x, 0).height(), 0.0);
     }

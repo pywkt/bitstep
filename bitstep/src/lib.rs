@@ -80,9 +80,10 @@ impl PersistentField<'_, SeqSnapshot> for SeqModelField {
 /// Post-v1 "Macros" are out of scope — do not scaffold them here.
 #[derive(Params)]
 pub struct BitstepParams {
-    /// Which of the 8 pattern banks the lanes read from, one-based. A change
-    /// takes effect per lane at that lane's next step boundary, not
-    /// immediately.
+    /// Which pattern bank the lanes read from, one-based. A change takes
+    /// effect per lane at that lane's next step boundary, not immediately.
+    /// In song mode the song picks the pattern, and this only picks the one
+    /// the editor shows.
     #[id = "patsel"]
     pub pattern_select: IntParam,
     /// The sequence itself. Not a parameter — a persistent field, which the
@@ -114,7 +115,7 @@ impl BitstepParams {
 }
 
 impl BitstepParams {
-    /// `patsel` as the engine wants it: a `u8` inside `1..=8`.
+    /// `patsel` as the engine wants it: a `u8` inside `1..=NUM_PATTERNS`.
     ///
     /// nice-plug clamps the parameter whenever a host drives it through a
     /// normalized value, but the plain `i32` is what the parameter actually
@@ -170,11 +171,17 @@ fn block_ctx(transport: &Transport, num_samples: usize, pattern_select: u8) -> B
         return BlockCtx::STOPPED.with_pattern_select(pattern_select);
     };
 
-    let ctx = BlockCtx {
+    let mut ctx = BlockCtx {
         playing: transport.playing,
         ..BlockCtx::new(pos_beats, tempo, transport.sample_rate, num_samples)
             .with_pattern_select(pattern_select)
     };
+    // Song mode's bar length. A host that sends no signature plays 4/4.
+    if let (Some(numerator), Some(denominator)) =
+        (transport.time_sig_numerator, transport.time_sig_denominator)
+    {
+        ctx = ctx.with_time_signature(numerator, denominator);
+    }
     match transport.loop_range_beats() {
         Some((start, end)) => ctx.with_loop(start, end),
         None => ctx,
@@ -563,8 +570,8 @@ mod tests {
     }
 
     /// Range and default of `patsel`, as also asserted by `clap-validator`'s
-    /// `param-default-values` test on the bundle: one-based `1..=8`, starting
-    /// on pattern 1.
+    /// `param-default-values` test on the bundle: one-based `1..=64`,
+    /// starting on pattern 1.
     #[test]
     fn pattern_select_param_is_one_based() {
         let params = test_params();
@@ -573,15 +580,16 @@ mod tests {
         assert_eq!(params.pattern_select.default_plain_value(), 1);
         assert_eq!(params.pattern_select.value(), 1);
         assert_eq!(params.pattern_select.preview_plain(0.0), 1);
-        assert_eq!(params.pattern_select.preview_plain(1.0), 8);
+        assert_eq!(params.pattern_select.preview_plain(1.0), 64);
 
-        // Eight discrete values, so seven steps between them — this is what
-        // the host advertises as a stepped parameter and what its generic UI
+        // 64 discrete values, so 63 steps between them — this is what the
+        // host advertises as a stepped parameter and what its generic UI
         // walks through. Every step must land on a distinct pattern.
-        assert_eq!(params.pattern_select.step_count(), Some(7));
-        let walked: Vec<i32> =
-            (0..=7).map(|step| params.pattern_select.preview_plain(step as f32 / 7.0)).collect();
-        assert_eq!(walked, (1..=8).collect::<Vec<i32>>());
+        assert_eq!(params.pattern_select.step_count(), Some(63));
+        let walked: Vec<i32> = (0..=63)
+            .map(|step| params.pattern_select.preview_plain(step as f32 / 63.0))
+            .collect();
+        assert_eq!(walked, (1..=64).collect::<Vec<i32>>());
 
         // ...and the range is the engine's, so there is one definition of how
         // many patterns exist.
@@ -1038,10 +1046,10 @@ mod tests {
         assert_eq!(clamp_pattern_select(0), 1);
         assert_eq!(clamp_pattern_select(1), 1);
         assert_eq!(clamp_pattern_select(4), 4);
-        assert_eq!(clamp_pattern_select(8), 8);
-        assert_eq!(clamp_pattern_select(9), 8);
-        assert_eq!(clamp_pattern_select(256), 8);
-        assert_eq!(clamp_pattern_select(i32::MAX), 8);
+        assert_eq!(clamp_pattern_select(64), 64);
+        assert_eq!(clamp_pattern_select(65), 64);
+        assert_eq!(clamp_pattern_select(256), 64);
+        assert_eq!(clamp_pattern_select(i32::MAX), 64);
     }
 
     // ---- persistence: the `#[persist = "seq"]` field ----
@@ -1216,9 +1224,8 @@ mod tests {
         params.deserialize_fields(&BTreeMap::from([(String::from("seq"), String::from("{}"))]));
         let empty = params.seq.map(Clone::clone);
         assert!(empty.lanes.is_empty());
-        // Padded on the way in: an empty file still opens with all 8 banks.
-        assert_eq!(empty.patterns.len(), model::NUM_PATTERNS);
-        assert!(empty.patterns.iter().all(|pattern| pattern.lanes.is_empty()));
+        // Patterns nobody touched are not saved, and a load pads them back.
+        assert!(empty.patterns.is_empty());
 
         let lanes: Vec<String> = (0..10_000)
             .map(|id| {
@@ -1236,7 +1243,7 @@ mod tests {
 
         let loaded = params.seq.map(Clone::clone);
         assert_eq!(loaded.lanes.len(), model::MAX_LANES);
-        assert_eq!(loaded.patterns.len(), model::NUM_PATTERNS);
+        assert!(loaded.patterns.is_empty(), "every pattern loaded empty");
         assert!(loaded.lanes.iter().all(|lane| lane.key <= model::Lane::KEY_MAX));
         assert!(loaded.lanes.iter().all(|lane| lane.channel <= model::Lane::CHANNEL_MAX));
         // Re-saving the clamped state writes the current version, so the next

@@ -13,7 +13,7 @@
 //! output buffer are fixed-capacity and allocated before the audio thread
 //! ever sees them.
 
-use crate::model::{MAX_LANES, NUM_PATTERNS, Playhead, SeqData};
+use crate::model::{DEFAULT_BAR_BEATS, MAX_LANES, NUM_PATTERNS, PatternBars, Playhead, SeqData};
 use crate::sequencer::{
     BeatRange, BlockRanges, BlockSegment, BlockTiming, EventBuf, LoopRegion, Prng, SeqEvent,
     StepHit, StepSink, Stitch, TimedEvent, next_step_boundary, playhead_step, scan_lanes,
@@ -43,8 +43,11 @@ pub struct BlockCtx {
     pub num_samples: usize,
     /// The host's active loop (cycle) region in beats, if it is looping.
     pub loop_range: Option<(f64, f64)>,
-    /// The `patsel` parameter, `1..=8`.
+    /// The `patsel` parameter, `1..=NUM_PATTERNS`.
     pub pattern_select: u8,
+    /// How long one bar is in beats, from the host's time signature. Song
+    /// mode plays one pattern per bar. See [`BlockCtx::bar_beats`].
+    pub beats_per_bar: f64,
 }
 
 impl BlockCtx {
@@ -52,6 +55,9 @@ impl BlockCtx {
     /// pattern *index* is one less.
     pub const PATTERN_SELECT_MIN: u8 = 1;
     pub const PATTERN_SELECT_MAX: u8 = NUM_PATTERNS as u8;
+
+    /// The bar length when the host reports no time signature: 4/4.
+    pub const DEFAULT_BAR_BEATS: f64 = DEFAULT_BAR_BEATS;
 
     /// A stopped block of no particular length — what the shell builds when
     /// the host reports no usable transport at all.
@@ -63,6 +69,7 @@ impl BlockCtx {
         num_samples: 0,
         loop_range: None,
         pattern_select: Self::PATTERN_SELECT_MIN,
+        beats_per_bar: Self::DEFAULT_BAR_BEATS,
     };
 
     /// A playing block at `pos_beats`, with no loop and pattern 1 selected;
@@ -77,6 +84,7 @@ impl BlockCtx {
             num_samples,
             loop_range: None,
             pattern_select: Self::PATTERN_SELECT_MIN,
+            beats_per_bar: Self::DEFAULT_BAR_BEATS,
         }
     }
 
@@ -86,10 +94,35 @@ impl BlockCtx {
         self
     }
 
-    /// The same block with `patsel` set to `select` (`1..=8`).
+    /// The same block with `patsel` set to `select` (`1..=NUM_PATTERNS`).
     pub const fn with_pattern_select(mut self, select: u8) -> BlockCtx {
         self.pattern_select = select;
         self
+    }
+
+    /// The same block in a `numerator`/`denominator` time signature. A
+    /// signature that makes no sense leaves the bar at 4/4.
+    pub fn with_time_signature(mut self, numerator: i32, denominator: i32) -> BlockCtx {
+        let beats = f64::from(numerator) * 4.0 / f64::from(denominator);
+        if beats.is_finite() && (Self::MIN_BAR_BEATS..=Self::MAX_BAR_BEATS).contains(&beats) {
+            self.beats_per_bar = beats;
+        }
+        self
+    }
+
+    /// The shortest and longest bars a time signature may give: 1/16 and
+    /// 64/4. Anything outside is a host reporting nonsense.
+    pub const MIN_BAR_BEATS: f64 = 0.25;
+    pub const MAX_BAR_BEATS: f64 = 256.0;
+
+    /// The bar length song mode uses, with a value from outside the sane
+    /// range (only possible from a hand-built context) read as 4/4.
+    pub fn bar_beats(&self) -> f64 {
+        let beats = self.beats_per_bar;
+        match beats.is_finite() && (Self::MIN_BAR_BEATS..=Self::MAX_BAR_BEATS).contains(&beats) {
+            true => beats,
+            false => Self::DEFAULT_BAR_BEATS,
+        }
     }
 
     /// The block's sample ↔ beat conversion. Unusable transport data
@@ -405,6 +438,7 @@ impl Engine {
         out: &mut BlockOutput,
     ) {
         out.clear();
+        playhead.set_bar_beats(ctx.bar_beats());
         let flush_beat = ctx.flush_beat();
         let pattern = ctx.pattern_index();
         if std::mem::take(&mut self.pending_flush) {
@@ -430,10 +464,18 @@ impl Engine {
 
         let timing = ctx.timing();
         let block = self.stitch.begin(ctx.pos_beats, timing.span_beats());
+        let song = data.song.is_on();
+        // Read once per block: lane lengths are live, and this is what places
+        // every entry on the timeline.
+        let lengths = song.then(|| PatternBars::new(data, ctx.bar_beats()));
         if block.jumped {
             self.voices.flush_all(flush_beat, &mut FlushSink { out });
+        }
+        if block.jumped || song {
             // Nothing is mid-step across a jump, so there is no boundary to
-            // wait for: the selected pattern takes effect here.
+            // wait for: the selected pattern takes effect here. Song mode
+            // picks patterns by bar instead, and keeps the switch level with
+            // `patsel` so that turning it off starts from a clean state.
             self.patterns.reset_to(pattern);
         } else {
             self.patterns.request(pattern);
@@ -451,7 +493,13 @@ impl Engine {
             // one, or in an earlier block.
             self.voices
                 .drain_ending(segment.range, &mut SegmentSink { segment, index, out: &mut *out });
-            self.scan_segment(segment, index, data, out);
+            match &lengths {
+                Some(lengths) => {
+                    let song = SongCtx { lengths, bar_beats: ctx.bar_beats() };
+                    self.scan_song_segment(segment, index, data, song, out);
+                }
+                None => self.scan_segment(segment, index, data, out),
+            }
             // A gate is a fraction of a subdivision, so most notes open and
             // close inside one segment; without this second pass they would
             // all be held until the next block.
@@ -462,7 +510,13 @@ impl Engine {
         // The GUI follows the *last* stretch the block played: after a wrap
         // that is the piece after the loop point, not the one before it.
         if let Some(last) = ranges.segments().last() {
-            publish_playhead(data, &self.patterns, last.range, playhead);
+            match &lengths {
+                Some(lengths) => {
+                    let song = SongCtx { lengths, bar_beats: ctx.bar_beats() };
+                    publish_song_playhead(data, song, last.range, playhead);
+                }
+                None => publish_playhead(data, &self.patterns, last.range, playhead),
+            }
         }
 
         out.sort();
@@ -504,29 +558,154 @@ impl Engine {
                 None => rest,
             };
             if !piece.is_empty() {
-                let Engine { voices, patterns, prng, hits, .. } = self;
-                // Scan first (lane order, so the probability rolls draw from
-                // the generator exactly as before), then strike in time order.
-                hits.clear();
-                let mut collected = HitBuf { hits, dropped: 0 };
-                scan_lanes(data, piece, |pos| patterns.active(pos), prng, &mut collected);
-                let dropped = collected.dropped;
-                // (beat, lane) is unique per hit, so this is a total order.
-                hits.sort_unstable_by(|a, b| {
-                    a.beat.total_cmp(&b.beat).then_with(|| a.lane_pos.cmp(&b.lane_pos))
-                });
-                let mut events = SegmentSink { segment, index, out: &mut *out };
-                let mut striker = voices.striking(&mut events);
-                for hit in hits.iter() {
-                    striker.strike(*hit);
-                }
-                out.count_overflow(dropped);
+                let patterns = &self.patterns;
+                let active = |pos| patterns.active(pos);
+                let piece = ScanPiece { range: piece, origin: 0.0 };
+                let events = SegmentSink { segment, index, out: &mut *out };
+                strike_piece(
+                    &mut self.voices,
+                    &mut self.prng,
+                    &mut self.hits,
+                    data,
+                    piece,
+                    active,
+                    events,
+                );
             }
             let Some(beat) = due else { return };
             self.patterns.apply_due(data, beat, rest);
             rest = BeatRange::new(beat, rest.end);
         }
     }
+
+    /// Song mode's [`Self::scan_segment`]: the segment is cut at every
+    /// entry edge, and each piece plays its entry's pattern with every lane
+    /// counted from the entry's first beat, so each entry starts its pattern
+    /// from step 1. Rests and the bars before the song are silent, and so is
+    /// everything after the end of a song that does not loop.
+    ///
+    /// An entry is scanned in its own time (beats from its first bar line)
+    /// and the hits are moved back onto the timeline. The cut points are
+    /// `n * bar_beats`, computed the same way in every block, so an entry
+    /// edge on a block edge splits exactly as the stitch does.
+    fn scan_song_segment(
+        &mut self,
+        segment: &BlockSegment,
+        index: u8,
+        data: &SeqData,
+        song: SongCtx<'_>,
+        out: &mut BlockOutput,
+    ) {
+        let range = segment.range;
+        let bar_beats = song.bar_beats;
+        let Some(mut bar) = bar_index_at(range.start, bar_beats) else { return };
+        // A real block spans an entry or two; this bound only matters to a
+        // host reporting a nonsense tempo, as `MAX_STEPS_PER_LANE` does.
+        for _ in 0..MAX_PIECES_PER_SEGMENT {
+            let (start_bar, end_bar, pattern) = match data.song.locate(bar, song.lengths) {
+                Some(pos) => (pos.start_bar, pos.end_bar(), pos.pattern),
+                // Before the song: silence up to bar 1.
+                None if bar < 0 => (bar, 0, None),
+                None => return,
+            };
+            let start = start_bar as f64 * bar_beats;
+            let end = end_bar as f64 * bar_beats;
+            let piece = BeatRange::new(range.start.max(start), range.end.min(end));
+            if !piece.is_empty()
+                && let Some(pattern) = pattern
+            {
+                let local = BeatRange::new(piece.start - start, piece.end - start);
+                let piece = ScanPiece { range: local, origin: start };
+                let events = SegmentSink { segment, index, out: &mut *out };
+                strike_piece(
+                    &mut self.voices,
+                    &mut self.prng,
+                    &mut self.hits,
+                    data,
+                    piece,
+                    |_| pattern,
+                    events,
+                );
+            }
+            if end >= range.end {
+                return;
+            }
+            bar = end_bar;
+        }
+    }
+}
+
+/// What song mode needs to place entries on the timeline for one block.
+#[derive(Clone, Copy)]
+struct SongCtx<'a> {
+    lengths: &'a PatternBars,
+    bar_beats: f64,
+}
+
+/// The most pieces one segment is cut into before the rest is skipped.
+const MAX_PIECES_PER_SEGMENT: usize = 64;
+
+/// The bar `beat` falls in (bar 0 starts at beat 0), or `None` for a beat
+/// too far out to count bars at.
+fn bar_index_at(beat: f64, bar_beats: f64) -> Option<i64> {
+    let bar = (beat / bar_beats).floor();
+    (bar.is_finite() && bar.abs() < MAX_BAR_INDEX).then_some(bar as i64)
+}
+
+/// The bar the instant just before `beat` falls in: the bar a range ending
+/// at `beat` was last playing, as [`playhead_step`] asks of steps.
+fn bar_index_before(beat: f64, bar_beats: f64) -> Option<i64> {
+    let bar = (beat / bar_beats).ceil() - 1.0;
+    (bar.is_finite() && bar.abs() < MAX_BAR_INDEX).then_some(bar as i64)
+}
+
+/// Past this a bar index no longer fits the song's counting; far beyond any
+/// real song position.
+const MAX_BAR_INDEX: f64 = (1i64 << 40) as f64;
+
+/// One stretch to scan: `range` in the scan's own beats, and where its beat
+/// 0 sits on the timeline (0 everywhere but song mode, whose bars count from
+/// their own start).
+#[derive(Clone, Copy)]
+struct ScanPiece {
+    range: BeatRange,
+    origin: f64,
+}
+
+/// Scans `piece` and strikes its hits through the voice table in time order.
+///
+/// Scan first — lane order, so the probability rolls draw from the generator
+/// in a fixed order — then strike in time order. A free function over the
+/// engine's fields so that `active` may borrow the pattern switch while the
+/// voices are struck.
+fn strike_piece(
+    voices: &mut VoiceTable,
+    prng: &mut Prng,
+    hits: &mut Vec<StepHit>,
+    data: &SeqData,
+    piece: ScanPiece,
+    active: impl Fn(usize) -> usize,
+    mut events: SegmentSink<'_>,
+) {
+    hits.clear();
+    let mut collected = HitBuf { hits, dropped: 0 };
+    scan_lanes(data, piece.range, active, prng, &mut collected);
+    let dropped = collected.dropped;
+    if piece.origin != 0.0 {
+        for hit in hits.iter_mut() {
+            hit.beat += piece.origin;
+            hit.end_beat += piece.origin;
+        }
+    }
+    // (beat, lane) is unique per hit, so this is a total order.
+    hits.sort_unstable_by(|a, b| {
+        a.beat.total_cmp(&b.beat).then_with(|| a.lane_pos.cmp(&b.lane_pos))
+    });
+    let mut striker = voices.striking(&mut events);
+    for hit in hits.iter() {
+        striker.strike(*hit);
+    }
+    events.out.count_overflow(dropped);
 }
 
 /// Stores every lane's current step, plus the pattern being read, into the
@@ -558,6 +737,35 @@ fn publish_playhead(
         playhead.set_step(pos, step);
     }
     playhead.set_pattern(patterns.published() as u32);
+    playhead.set_song_entry(Playhead::NONE);
+    playhead.set_song_bar(Playhead::NONE);
+}
+
+/// Song mode's [`publish_playhead`]: each lane's step counted from the start
+/// of the entry the range ends in, that entry's pattern, the entry and the
+/// bar, counted from the start of this pass through a looped song. A rest or
+/// a bar outside the song shows no pattern and no steps.
+fn publish_song_playhead(data: &SeqData, song: SongCtx<'_>, range: BeatRange, playhead: &Playhead) {
+    let bar = bar_index_before(range.end, song.bar_beats);
+    let pos = bar.and_then(|bar| data.song.locate(bar, song.lengths));
+    let pattern = pos.and_then(|pos| pos.pattern);
+    let local = pos.map(|pos| {
+        let start = pos.start_bar as f64 * song.bar_beats;
+        BeatRange::new(range.start.max(start) - start, range.end - start)
+    });
+    for pos in 0..MAX_LANES {
+        let step = pattern
+            .zip(local)
+            .and_then(|(pattern, local)| playhead_step(data.lane_data(pattern, pos)?, local))
+            .map_or(Playhead::NONE, |step| step as u32);
+        playhead.set_step(pos, step);
+    }
+    playhead.set_pattern(pattern.map_or(Playhead::NONE, |pattern| pattern as u32));
+    let entry = pos.and_then(|pos| u32::try_from(pos.entry).ok());
+    playhead.set_song_entry(entry.unwrap_or(Playhead::NONE));
+    let bar = bar.map(|bar| pos.map_or(bar, |pos| bar - pos.lap_start));
+    let bar = bar.and_then(|bar| u32::try_from(bar).ok()).filter(|&bar| bar != Playhead::NONE);
+    playhead.set_song_bar(bar.unwrap_or(Playhead::NONE));
 }
 
 impl Default for Engine {
@@ -595,8 +803,8 @@ mod tests {
         LaneSpec { key, length, rate, on }
     }
 
-    /// Builds a `SeqData` holding the given lanes, identical in all 8
-    /// patterns (the pattern test overwrites one afterwards).
+    /// Builds a `SeqData` holding the given lanes, identical in every
+    /// pattern (the pattern test overwrites one afterwards).
     fn seq_data(specs: &[LaneSpec]) -> SeqData {
         let lanes: Vec<Lane> = specs
             .iter()
@@ -1141,12 +1349,12 @@ mod tests {
         let third = run_one(&mut Engine::new(), &data, &block.with_pattern_select(3));
         assert_eq!(beats_of(&third, true), [0.5], "pattern 3 strikes the offbeat");
 
-        // Out-of-range selections clamp into 1..=8 instead of silencing the
+        // Out-of-range selections clamp into range instead of silencing the
         // plugin or indexing past the pattern array.
         assert_eq!(BlockCtx::STOPPED.with_pattern_select(0).pattern_index(), 0);
         assert_eq!(BlockCtx::STOPPED.with_pattern_select(1).pattern_index(), 0);
-        assert_eq!(BlockCtx::STOPPED.with_pattern_select(8).pattern_index(), NUM_PATTERNS - 1);
-        assert_eq!(BlockCtx::STOPPED.with_pattern_select(9).pattern_index(), NUM_PATTERNS - 1);
+        assert_eq!(BlockCtx::STOPPED.with_pattern_select(64).pattern_index(), NUM_PATTERNS - 1);
+        assert_eq!(BlockCtx::STOPPED.with_pattern_select(65).pattern_index(), NUM_PATTERNS - 1);
         assert_eq!(BlockCtx::STOPPED.with_pattern_select(u8::MAX).pattern_index(), NUM_PATTERNS - 1);
     }
 
@@ -1986,5 +2194,211 @@ mod tests {
         }
 
         assert_eq!(stitched, [true, false, false], "the seam survives by luck, not by design");
+    }
+
+    // ---- Song mode ----------------------------------------------------------
+
+    /// Two lanes, each on its own key so the tests can tell which pattern a
+    /// note came from: the kick (36) strikes step 0 of pattern 1 only, the
+    /// snare (38) step 4 of pattern 2 only. Song mode is on with `text`.
+    fn song_data(text: &str) -> SeqData {
+        let data = seq_data(&[
+            spec(36, 16, Rate::Sixteenth, &[]),
+            spec(38, 16, Rate::Sixteenth, &[]),
+        ]);
+        data.patterns[0][0].set_step(0, Step::default_on());
+        data.patterns[1][1].set_step(4, Step::default_on());
+        data.with_song(crate::model::Song::from_text(text.to_owned(), true))
+    }
+
+    /// Every note-on in `blocks` as `(beat, key)`, in time order.
+    fn strikes(blocks: &[Vec<TimedEvent>]) -> Vec<(f64, u8)> {
+        notes(blocks).iter().filter(|note| note.on).map(|note| (note.beat, note.key)).collect()
+    }
+
+    /// Each bar plays the pattern the song lists for it, a `0` bar is
+    /// silent, and past the end of a song that stops nothing plays — `patsel`
+    /// does not come back.
+    #[test]
+    fn song_mode_plays_each_bars_pattern() {
+        let data = song_data("1-2-0-1");
+        data.song.set_looped(false);
+        // Six bars of quarter-beat blocks.
+        let blocks = run_blocks(&mut Engine::new(), &data, 0.0, QUARTER_BEAT, 6 * 16);
+        assert_eq!(strikes(&blocks), [(0.0, 36), (5.0, 38), (12.0, 36)]);
+    }
+
+    /// Every entry starts every lane from its first step: a 3-step lane runs
+    /// 0, 3, 6 … within its one-bar entry and starts again on the next one,
+    /// where in pattern mode it would carry on across the bar line.
+    #[test]
+    fn song_mode_restarts_lanes_at_each_bar() {
+        let data = seq_data(&[spec(36, 3, Rate::Sixteenth, &[0])]);
+        let song = data.with_song(crate::model::Song::from_text("1x2".to_owned(), true));
+        let blocks = run_blocks(&mut Engine::new(), &song, 0.0, QUARTER_BEAT, 2 * 16);
+        let beats: Vec<f64> = strikes(&blocks).iter().map(|&(beat, _)| beat).collect();
+        let bar = (0..6).map(|step| step as f64 * 0.75);
+        let expected: Vec<f64> = bar.clone().chain(bar.map(|beat| beat + 4.0)).collect();
+        assert_eq!(beats, expected);
+    }
+
+    /// The bar is the host's: in 3/4 a 12-step pattern is one bar, so the
+    /// second starts on beat 3, and a 16-step one takes two.
+    #[test]
+    fn song_mode_follows_the_time_signature() {
+        let in_three_four = |data: &SeqData, bars: usize| {
+            let mut engine = Engine::new();
+            let mut out = BlockOutput::new();
+            let playhead = Playhead::new();
+            let mut blocks = Vec::new();
+            for index in 0..bars * 12 {
+                let ctx = block_at(0.0, QUARTER_BEAT, index).with_time_signature(3, 4);
+                engine.run_block(&ctx, data, &playhead, &mut out);
+                blocks.push(out.events().to_vec());
+            }
+            assert_eq!(playhead.bar_beats(), 3.0, "published for the GUI");
+            strikes(&blocks)
+        };
+        let data = song_data("1-2");
+        assert_eq!(in_three_four(&data, 4), [(0.0, 36), (4.0, 36), (7.0, 38), (11.0, 38)]);
+        for lane in data.patterns.iter().flatten() {
+            lane.set_length(12);
+        }
+        assert_eq!(in_three_four(&data, 2), [(0.0, 36), (4.0, 38)]);
+        assert_eq!(BlockCtx::STOPPED.with_time_signature(6, 8).bar_beats(), 3.0);
+        assert_eq!(BlockCtx::STOPPED.with_time_signature(7, 8).bar_beats(), 3.5);
+        assert_eq!(BlockCtx::STOPPED.with_time_signature(4, 0).bar_beats(), 4.0, "nonsense");
+        assert_eq!(BlockCtx::STOPPED.with_time_signature(-3, 4).bar_beats(), 4.0, "nonsense");
+    }
+
+    /// Where the blocks fall does not change what plays: the bar lines cut
+    /// the same way whichever block they land in, ratchets and all.
+    #[test]
+    fn song_mode_is_block_size_invariant() {
+        let data = song_data("2-1-2-1x2");
+        data.patterns[0][0].set_step(6, Step::default_on().with_ratchet(3));
+        data.patterns[1][1].set_step(15, Step::default_on().with_ratchet(4));
+        let beats = 5.0 * 4.0;
+        let reference = {
+            let samples = SAMPLES_PER_BEAT / 8;
+            notes(&run_blocks(&mut Engine::new(), &data, 0.0, samples, (beats * 8.0) as usize))
+        };
+        assert!(reference.len() > 10, "{reference:?}");
+        for samples in [64, 100, 333, 512, 4096, SAMPLES_PER_BEAT * 3] {
+            let blocks = (beats * SAMPLES_PER_BEAT as f64 / samples as f64).ceil() as usize;
+            let got = notes(&run_blocks(&mut Engine::new(), &data, 0.0, samples, blocks));
+            let got: Vec<Note> = got.into_iter().filter(|note| note.beat < beats).collect();
+            let want: Vec<Note> =
+                reference.iter().copied().filter(|note| note.beat < beats).collect();
+            assert_eq!(got, want, "{samples}-sample blocks");
+        }
+    }
+
+    /// The playhead shows the bar playing, its pattern, and each lane's step
+    /// counted from the bar line. Past the end it shows the bar and nothing
+    /// else.
+    #[test]
+    fn song_mode_publishes_the_bar_and_its_pattern() {
+        let data = song_data("1-2");
+        data.song.set_looped(false);
+        let mut engine = Engine::new();
+        let mut out = BlockOutput::new();
+        let playhead = Playhead::new();
+        // [5.0, 5.25): bar 2, a beat and a quarter in.
+        for index in 0..=20 {
+            engine.run_block(&block_at(0.0, QUARTER_BEAT, index), &data, &playhead, &mut out);
+        }
+        assert_eq!(playhead.song_bar(), Some(1));
+        assert_eq!(playhead.song_entry(), Some(1));
+        assert_eq!(playhead.pattern(), Some(1));
+        assert_eq!(playing_steps(&playhead), [(0, 4), (1, 4)]);
+
+        // [8.0, 8.25): the third bar, past the two the song lists.
+        for index in 21..=32 {
+            engine.run_block(&block_at(0.0, QUARTER_BEAT, index), &data, &playhead, &mut out);
+        }
+        assert_eq!(playhead.song_bar(), Some(2));
+        assert_eq!(playhead.song_entry(), None);
+        assert_eq!(playhead.pattern(), None);
+        assert!(playing_steps(&playhead).is_empty());
+
+        // Out of song mode the bar is gone and `patsel` plays again.
+        data.song.set_on(false);
+        engine.run_block(&block_at(0.0, QUARTER_BEAT, 33), &data, &playhead, &mut out);
+        assert_eq!(playhead.song_bar(), None);
+        assert_eq!(playhead.song_entry(), None);
+        assert_eq!(playhead.pattern(), Some(0));
+    }
+
+    /// An entry plays its whole pattern: as many bars as its longest lane
+    /// fills, rounded up, with the shorter lanes looping inside it.
+    #[test]
+    fn song_mode_plays_each_pattern_to_its_end() {
+        // Pattern 1 is four bars (32 eighths) over a one-bar lane of 16ths;
+        // pattern 2 cuts the long lane down to one bar.
+        let lanes = [spec(36, 32, Rate::Eighth, &[0, 31]), spec(38, 16, Rate::Sixteenth, &[0])];
+        let data = seq_data(&lanes);
+        data.patterns[1][0].set_length(8);
+        let song = crate::model::Song::from_text("1-2-1".to_owned(), true).with_looped(false);
+        let data = data.with_song(song);
+        let blocks = run_blocks(&mut Engine::new(), &data, 0.0, QUARTER_BEAT, 10 * 16);
+        let long = |at: f64| {
+            let snares = (0..4).map(move |bar| (at + bar as f64 * 4.0, 38));
+            snares.chain([(at, 36), (at + 15.5, 36)])
+        };
+        let mut want: Vec<(f64, u8)> =
+            long(0.0).chain([(16.0, 36), (16.0, 38)]).chain(long(20.0)).collect();
+        want.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        assert_eq!(strikes(&blocks), want, "four bars, one bar, four bars, then silence");
+
+        // The playhead counts from the entry's start: well into the second
+        // bar of the third entry, the eighth-note lane is on step 11.
+        let mut engine = Engine::new();
+        let mut out = BlockOutput::new();
+        let playhead = Playhead::new();
+        for index in 0..=(25 * 4 + 2) {
+            engine.run_block(&block_at(0.0, QUARTER_BEAT, index), &data, &playhead, &mut out);
+        }
+        assert_eq!(playhead.song_entry(), Some(2));
+        assert_eq!(playhead.song_bar(), Some(6));
+        assert_eq!(playhead.pattern(), Some(0));
+        assert_eq!(playing_steps(&playhead), [(0, 11), (1, 6)]);
+    }
+
+    /// A looped song starts again from its first entry after its last, and
+    /// the playhead counts bars from the start of each pass.
+    #[test]
+    fn a_looped_song_starts_again() {
+        let data = song_data("1-2-0");
+        let blocks = run_blocks(&mut Engine::new(), &data, 0.0, QUARTER_BEAT, 7 * 16);
+        // Three bars a pass: kick on 1, snare in bar 2, a silent bar.
+        let want = [(0.0, 36), (5.0, 38), (12.0, 36), (17.0, 38), (24.0, 36)];
+        assert_eq!(strikes(&blocks), want);
+
+        let mut engine = Engine::new();
+        let mut out = BlockOutput::new();
+        let playhead = Playhead::new();
+        // [17.0, 17.25): the second bar of the second pass.
+        for index in 0..=68 {
+            engine.run_block(&block_at(0.0, QUARTER_BEAT, index), &data, &playhead, &mut out);
+        }
+        assert_eq!(playhead.song_bar(), Some(1));
+        assert_eq!(playhead.song_entry(), Some(1));
+        assert_eq!(playing_steps(&playhead), [(0, 4), (1, 4)]);
+    }
+
+    /// Song mode allocates nothing on the audio thread either.
+    #[test]
+    fn song_mode_does_not_allocate() {
+        let data = song_data("1-2-1-0-2x3");
+        let mut engine = Engine::new();
+        let mut out = BlockOutput::new();
+        let playhead = Playhead::new();
+        nice_assert_no_alloc::assert_no_alloc(|| {
+            for index in 0..8 * 16 {
+                let ctx = block_at(0.0, QUARTER_BEAT, index).with_time_signature(7, 8);
+                engine.run_block(&ctx, &data, &playhead, &mut out);
+            }
+        });
     }
 }

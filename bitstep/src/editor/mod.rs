@@ -35,7 +35,10 @@ pub mod theme;
 
 use crate::BitstepParams;
 use crate::engine::BlockCtx;
-use crate::model::{Lane, LaneData, MAX_LANES, Playhead, SeqData, SeqModel, Step};
+use crate::model::{
+    Lane, LaneData, MAX_LANES, NUM_PATTERNS, PatternBars, Playhead, SeqData, SeqModel, Song, Step,
+    parse_song,
+};
 use crate::sequencer::{Prng, Rate, lane_is_audible};
 use crate::state;
 
@@ -155,6 +158,15 @@ const FOLLOW_LABEL: &str = "Follow";
 /// What the top bar's parameter-panel toggle says.
 const PANEL_LABEL: &str = "Params";
 
+/// The label of the top bar's song mode toggle.
+const SONG_LABEL: &str = "Song";
+
+/// The song order text field's id.
+const SONG_TEXT_ID: &str = "bitstep:song-text";
+
+/// The song row's bar cells' id.
+const SONG_STRIP_ID: &str = "bitstep:song-strip";
+
 /// The parameter panel's drawing area, as the step strip's
 /// [`STEP_STRIP_ID`].
 const PARAM_STRIP_ID: &str = "bitstep:param-strip";
@@ -215,6 +227,21 @@ pub struct BitstepEditor {
     /// The destructive menu item that has been clicked once and is waiting to
     /// be clicked again, or `None` when none is ([`LaneConfirm`]).
     confirm: Option<LaneConfirm>,
+    /// A pattern copy that would replace a pattern with notes in it, clicked
+    /// once and waiting for the second click ([`pattern_copy_click`]).
+    pattern_copy: Option<PatternCopy>,
+    /// Which page of pattern buttons the top bar shows.
+    pattern_page: usize,
+    /// The pattern [`Self::pattern_page`] was last moved to show. When the
+    /// shown pattern changes the page follows it; the arrows move it freely
+    /// in between.
+    paged_for: Option<usize>,
+    /// What is being typed into the song order field: the keyboard's buffer,
+    /// like [`Self::rename`]. Each keystroke that reads as a song is written
+    /// through at once.
+    song_edit: Option<String>,
+    /// How far the song row's bar cells are scrolled, in points.
+    song_scroll: f32,
     /// The dice a lane's "randomise" menu item rolls.
     ///
     /// The editor's own generator, never the audio thread's: `randomise_lane`
@@ -394,7 +421,7 @@ impl LaneAction {
 
     fn warning(self) -> &'static str {
         match self {
-            LaneAction::Delete => "Removes the lane and its steps in all 8 patterns. No undo.",
+            LaneAction::Delete => "Removes the lane and its steps in every pattern. No undo.",
             LaneAction::Clear => "Wipes every step of this lane in the pattern on screen. No undo.",
         }
     }
@@ -411,6 +438,13 @@ impl LaneAction {
 struct LaneConfirm {
     lane_id: u32,
     action: LaneAction,
+}
+
+/// A copy of one pattern over another, from the pattern button menu.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PatternCopy {
+    from: usize,
+    to: usize,
 }
 
 /// Where one lane's header sits in the list this frame.
@@ -541,6 +575,11 @@ impl BitstepEditor {
             lane_drag: None,
             rename: None,
             confirm: None,
+            pattern_copy: None,
+            pattern_page: 0,
+            paged_for: None,
+            song_edit: None,
+            song_scroll: 0.0,
             rng: Prng::new(clock_seed()),
             scroll: Vec2::ZERO,
             follow: true,
@@ -1530,29 +1569,307 @@ impl BitstepEditor {
     /// until the switch lands. With nothing playing the parameter is all there
     /// is, so its own button is the selected one and nothing is ever left
     /// unlit.
-    fn ui_pattern_bar(&mut self, ui: &mut egui::Ui, layout: &EditorLayout) {
+    fn ui_pattern_bar(&mut self, ui: &mut egui::Ui, layout: &EditorLayout, data: &SeqData) {
+        let song = data.song.is_on();
         let playing = self.playhead.pattern().and_then(grid_math::pattern_index_button);
         let shown = self.shown_pattern();
-        for index in 0..grid_math::PATTERN_BUTTONS {
-            let slot = layout.pattern_button(index);
+        if self.paged_for != Some(shown) {
+            self.paged_for = Some(shown);
+            self.pattern_page = grid_math::pattern_page(shown);
+        }
+
+        let arrows = [(0, -1, "‹", "Previous 8 patterns"), (1, 1, "›", "Next 8 patterns")];
+        for (side, direction, label, hover) in arrows {
+            let slot = layout.page_button(side);
             if !slot.is_positive() {
                 continue;
             }
-            let active = playing.unwrap_or(shown) == index;
-            // Asked for but not yet reached — the state the accent is for.
-            let pending = shown == index && !active;
-            let mut label = RichText::new((index + 1).to_string());
-            if pending {
+            if ui.put(slot, Button::new(label)).on_hover_text(hover).clicked() {
+                self.pattern_page = grid_math::step_page(self.pattern_page, direction);
+            }
+        }
+
+        for button_index in 0..grid_math::PATTERN_BUTTONS {
+            let slot = layout.pattern_button(button_index);
+            let Some(index) = grid_math::page_pattern(self.pattern_page, button_index) else {
+                continue;
+            };
+            if !slot.is_positive() {
+                continue;
+            }
+            let number = index + 1;
+            // In song mode the song picks what plays, so the lit button is
+            // the pattern being edited and the playing one is accented. Out
+            // of it, the lit button is the one playing and the accent marks
+            // one asked for but not yet reached.
+            let (lit, accent, hover) = if song {
+                let playing_here = playing == Some(index) && shown != index;
+                let hover = match playing_here {
+                    true => format!("Pattern {number} is playing in the song. Click to edit it."),
+                    false => format!("Edit pattern {number}. Right-click to copy it."),
+                };
+                (shown == index, playing_here, hover)
+            } else {
+                let active = playing.unwrap_or(shown) == index;
+                let pending = shown == index && !active;
+                let hover = match pending {
+                    true => format!("Pattern {number} — lanes switch at their next step"),
+                    false => format!("Play pattern {number}. Right-click to copy it."),
+                };
+                (active, pending, hover)
+            };
+            let mut label = RichText::new(number.to_string());
+            if accent {
                 label = label.color(theme::ACCENT);
             }
-            let button = ui.put(slot, Button::new(label).selected(active));
+            let button = ui.put(slot, Button::new(label).selected(lit));
             if button.clicked() {
                 self.set_pattern(index);
             }
-            button.on_hover_text(match pending {
-                true => format!("Pattern {} — lanes switch at their next step", index + 1),
-                false => format!("Play pattern {}", index + 1),
+            self.pattern_menu(&button, data, index);
+            button.on_hover_text(hover);
+        }
+    }
+
+    /// The song row, shown while song mode is on: the order as typed on the
+    /// left, and one cell per entry over the step strip.
+    ///
+    /// The cells show each entry's pattern. The entry playing is filled with
+    /// the accent (with a line under it filling up through an entry longer
+    /// than a bar), and the entries that play the pattern on screen are
+    /// outlined, so the grid's pattern can be found in the song. Clicking a
+    /// cell shows its pattern in the grid.
+    fn ui_song_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        layout: &EditorLayout,
+        data: &SeqData,
+        shown: usize,
+    ) {
+        if layout.song_bar().height() <= 0.0 {
+            // Song mode is off: forget the typing, so the field opens fresh.
+            self.song_edit = None;
+            return;
+        }
+        let song = &data.song;
+        // The bar length the audio thread last saw: until the host has said,
+        // 4/4.
+        let lengths = PatternBars::new(data, self.playhead.bar_beats());
+
+        let slot = layout.song_text();
+        if slot.is_positive() {
+            let model = &self.model;
+            let held = self.song_edit.get_or_insert_with(|| song.text.clone());
+            let field = ui.put(
+                slot,
+                TextEdit::singleline(held)
+                    .id_salt(SONG_TEXT_ID)
+                    .hint_text("Pattern order: 1-2-1-3x2")
+                    .desired_width(slot.width()),
+            );
+            if field.changed() {
+                // A half-typed song is left unwritten until it reads as one.
+                let _ = model.set_song(held);
+            } else if !field.has_focus() && *held != song.text {
+                // A load moved the song under the buffer, or the field was
+                // left holding text that never read as a song.
+                *held = song.text.clone();
+            }
+            let hover = match parse_song(held) {
+                Ok(_) => format!(
+                    "The patterns to play from the start of the song, each to its end. \
+                     \"1-2-1-3\" plays 1, 2, 1, 3; \"4x2\" plays 4 twice; 0 is a silent bar. \
+                     {} bars.",
+                    song.total_bars(&lengths)
+                ),
+                Err(error) => {
+                    let stroke = egui::Stroke::new(theme::HAIRLINE, theme::WARN);
+                    let corner = theme::CONTROL_CORNER;
+                    ui.painter().rect_stroke(field.rect, corner, stroke, StrokeKind::Outside);
+                    format!("{error}. The song keeps playing what it had.")
+                }
+            };
+            field.on_hover_text(hover);
+        }
+
+        let strip = layout.song_strip();
+        if !strip.is_positive() {
+            return;
+        }
+        let entries = song.len();
+        // One more cell than entries: the end marker.
+        let cells = entries + 1;
+        let response = ui.interact(strip, egui::Id::unique(SONG_STRIP_ID), Sense::click());
+        if response.hovered() {
+            let delta = ui.input_mut(|input| std::mem::take(&mut input.smooth_scroll_delta));
+            if delta.is_finite() {
+                self.song_scroll -= delta.x + delta.y;
+            }
+        }
+        // A bar playing in no entry is past the end: the end marker lights.
+        let bar = self.playhead.song_bar();
+        let playing = match self.playhead.song_entry() {
+            Some(entry) => Some((entry as usize).min(entries)),
+            None => bar.map(|_| entries),
+        };
+        if self.follow && let Some(cell) = playing {
+            let scroll = self.song_scroll;
+            self.song_scroll = grid_math::song_follow(scroll, strip.width(), entries, cell);
+        }
+        let max = grid_math::song_max_scroll(strip.width(), entries);
+        self.song_scroll = self.song_scroll.max(0.0).min(max);
+        let scroll = self.song_scroll;
+
+        let painter = ui.painter_at(strip);
+        if entries == 0 {
+            painter.text(
+                strip.left_center(),
+                Align2::LEFT_CENTER,
+                "Type the pattern order on the left to start the song",
+                FontId::proportional(theme::HINT_SIZE * 0.8),
+                theme::TEXT_DIM,
+            );
+        }
+        let font = FontId::proportional(theme::PITCH_LABEL_SIZE + 2.0);
+        let looped = song.is_looped();
+        for index in grid_math::song_visible(strip.width(), scroll, cells) {
+            let cell = grid_math::song_cell(strip, scroll, index);
+            let here = playing == Some(index);
+            if index == entries {
+                // The switch for what happens after the last entry.
+                let (label, colour) = match (looped, here) {
+                    (true, _) => ("loop", theme::ACCENT),
+                    (false, true) => ("end", theme::ACCENT),
+                    (false, false) => ("end", theme::TEXT_DIM),
+                };
+                let stroke = egui::Stroke::new(theme::HAIRLINE, colour);
+                painter.rect_stroke(cell, theme::CELL_CORNER, stroke, StrokeKind::Inside);
+                let small = FontId::proportional(theme::PITCH_LABEL_SIZE);
+                painter.text(cell.center(), Align2::CENTER_CENTER, label, small, colour);
+                continue;
+            }
+            let entry = song.entries[index];
+            let fill = match (here, (index / theme::SONG_ENTRY_GROUP) % 2 == 1) {
+                (true, _) => theme::ACCENT,
+                (false, true) => theme::CELL_SHADED,
+                (false, false) => theme::CELL,
+            };
+            painter.rect_filled(cell, theme::CELL_CORNER, fill);
+            if usize::from(entry) == shown {
+                let stroke = egui::Stroke::new(theme::HAIRLINE, theme::ACCENT);
+                painter.rect_stroke(cell, theme::CELL_CORNER, stroke, StrokeKind::Inside);
+            }
+            let label = match entry {
+                Song::REST => "·".to_owned(),
+                pattern => (usize::from(pattern) + 1).to_string(),
+            };
+            let colour = if here { theme::WINDOW } else { theme::TEXT };
+            painter.text(cell.center(), Align2::CENTER_CENTER, label, font.clone(), colour);
+            // An entry longer than a bar shows how far through it the song is.
+            if here
+                && let Some(bar) = bar
+                && let Some(pos) = song.positions(&lengths).nth(index)
+                && pos.bars > 1
+            {
+                let done = (i64::from(bar) - pos.start_bar + 1) as f32 / pos.bars as f32;
+                let width = cell.width() * done.clamp(0.0, 1.0);
+                let mut line = cell;
+                line.min.y = cell.max.y - theme::SONG_PROGRESS_HEIGHT;
+                line.max.x = cell.min.x + width;
+                painter.rect_filled(line, 0.0, theme::WINDOW);
+            }
+        }
+
+        let hovered = response
+            .hover_pos()
+            .and_then(|pos| grid_math::song_cell_at(strip, scroll, pos))
+            .filter(|&index| index <= entries);
+        let clicked = response
+            .clicked()
+            .then(|| response.interact_pointer_pos())
+            .flatten()
+            .and_then(|pos| grid_math::song_cell_at(strip, scroll, pos));
+        if clicked == Some(entries) {
+            self.model.set_song_looped(!looped);
+        } else if let Some(&entry) = clicked.and_then(|index| song.entries.get(index))
+            && let Some(pattern) = Song::pattern_of(entry)
+        {
+            self.set_pattern(pattern);
+        }
+        if hovered == Some(entries) {
+            let text = match looped {
+                true => "After the last pattern the song starts again from the first. \
+                         Click to stop at the end instead.",
+                false => "After the last pattern the song goes silent. \
+                          Click to loop back to the first pattern instead.",
+            };
+            response.on_hover_text(text);
+        } else if let Some(pos) = hovered.and_then(|index| song.positions(&lengths).nth(index)) {
+            let bars = match pos.bars {
+                1 => format!("Bar {}", pos.start_bar + 1),
+                _ => format!("Bars {}-{}", pos.start_bar + 1, pos.end_bar()),
+            };
+            let text = match pos.pattern {
+                Some(pattern) => format!("{bars}: pattern {}. Click to edit it.", pattern + 1),
+                None => format!("{bars}: silent"),
+            };
+            response.on_hover_text(text);
+        }
+    }
+
+    /// A pattern button's context menu: copy the pattern into another slot.
+    ///
+    /// A copy replaces everything in the target, and nothing can undo it, so
+    /// a target that has notes takes two clicks, as the lane menu's delete
+    /// and clear do. An empty target is copied into on the first click.
+    fn pattern_menu(&mut self, button: &egui::Response, data: &SeqData, from: usize) {
+        let model = &self.model;
+        let armed = &mut self.pattern_copy;
+        let shown = Popup::context_menu(button)
+            .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.label(format!("Copy pattern {} to", from + 1));
+                let spacing = Vec2::splat(theme::ITEM_SPACING);
+                egui::Grid::new(("bitstep:copy-targets", from)).spacing(spacing).show(ui, |ui| {
+                    for to in 0..NUM_PATTERNS {
+                        if to > 0 && to % grid_math::PATTERN_BUTTONS == 0 {
+                            ui.end_row();
+                        }
+                        if to == from {
+                            ui.add_enabled(false, Button::new((to + 1).to_string()));
+                            continue;
+                        }
+                        let empty = pattern_is_empty(data, to);
+                        let waiting = *armed == Some(PatternCopy { from, to });
+                        let (label, hover) = match (waiting, empty) {
+                            (true, _) => (
+                                RichText::new(format!("{}?", to + 1)).color(theme::WARN),
+                                format!(
+                                    "Click again to replace pattern {} with pattern {}. No undo.",
+                                    to + 1,
+                                    from + 1
+                                ),
+                            ),
+                            (false, true) => (
+                                RichText::new((to + 1).to_string()),
+                                format!("Copy into pattern {} (empty)", to + 1),
+                            ),
+                            (false, false) => (
+                                RichText::new((to + 1).to_string()),
+                                format!("Pattern {} has notes: click twice to replace it", to + 1),
+                            ),
+                        };
+                        let item = ui.button(label).on_hover_text(hover);
+                        if item.clicked() && pattern_copy_click(armed, from, to, empty) {
+                            model.copy_pattern(from, to);
+                            ui.close();
+                        }
+                    }
+                });
             });
+        // As with the lane menu, an arm does not outlive the menu it was made in.
+        if shown.is_none() && armed.is_some_and(|copy| copy.from == from) {
+            *armed = None;
         }
     }
 
@@ -1831,7 +2148,7 @@ impl BitstepEditor {
     /// whatever the pattern bar does to the left of them.
     fn ui_top_bar(&mut self, ui: &mut egui::Ui, layout: &EditorLayout, data: &SeqData) {
         self.ui_add_lane(ui, layout, data);
-        self.ui_pattern_bar(ui, layout);
+        self.ui_pattern_bar(ui, layout, data);
 
         let slot = layout.panel_button();
         if slot.is_positive() {
@@ -1856,6 +2173,19 @@ impl BitstepEditor {
                 *follow = !*follow;
             }
             toggle.on_hover_text("Scroll the grid to keep the playhead in view");
+        }
+
+        let slot = layout.song_button();
+        if slot.is_positive() {
+            let on = data.song.is_on();
+            let toggle = ui.put(slot, Button::new(SONG_LABEL).selected(on));
+            if toggle.clicked() {
+                self.model.set_song_on(!on);
+            }
+            toggle.on_hover_text(
+                "Song mode: play patterns in the order you type, one per bar, \
+                 following Bitwig's timeline",
+            );
         }
 
         for (index, mode) in EditMode::ALL.into_iter().enumerate() {
@@ -1891,6 +2221,14 @@ impl BitstepEditor {
                 None => "—".to_owned(),
             },
         );
+        let line = match (data.song.is_on(), self.playhead.song_bar()) {
+            (true, Some(bar)) => {
+                let lengths = PatternBars::new(data, self.playhead.bar_beats());
+                let total = data.song.total_bars(&lengths);
+                format!("{line}, song bar {} of {total}", bar + 1)
+            }
+            _ => line,
+        };
         // Truncated rather than allowed to grow into the toggle's slot.
         ui.scope_builder(
             UiBuilder::new().max_rect(rest).layout(Layout::left_to_right(Align::Center)),
@@ -2389,6 +2727,35 @@ fn confirm_click(confirm: &mut Option<LaneConfirm>, lane_id: u32, action: LaneAc
     false
 }
 
+/// A click on "copy to `to`" in pattern `from`'s menu: `true` when the copy
+/// should go ahead now. An empty target goes on the first click; one with
+/// notes is armed by the first and copied over by the second. Clicking any
+/// other target re-arms rather than copies.
+fn pattern_copy_click(
+    armed: &mut Option<PatternCopy>,
+    from: usize,
+    to: usize,
+    target_empty: bool,
+) -> bool {
+    let click = PatternCopy { from, to };
+    if target_empty || *armed == Some(click) {
+        *armed = None;
+        return true;
+    }
+    *armed = Some(click);
+    false
+}
+
+/// Whether no lane has a step switched on in `pattern`, hidden steps
+/// included (they come back when a lane is lengthened).
+fn pattern_is_empty(data: &SeqData, pattern: usize) -> bool {
+    (0..data.lane_count()).all(|pos| {
+        data.lane_data(pattern, pos).is_none_or(|lane_data| {
+            (0..lane_data.capacity()).all(|index| !lane_data.step(index).is_on())
+        })
+    })
+}
+
 /// A lane row's loop length in the pattern on screen, or 0 for a row with no
 /// data there — what pointer handling needs to know where a row's cells stop.
 ///
@@ -2408,6 +2775,11 @@ fn paint_chrome(painter: &Painter, layout: &EditorLayout) {
     let line = egui::Stroke::new(theme::HAIRLINE, theme::GRID_LINE);
     let bar = layout.top_bar();
     painter.hline(bar.x_range(), bar.max.y, line);
+    let song = layout.song_bar();
+    if song.height() > 0.0 {
+        painter.rect_filled(song, CornerRadius::ZERO, theme::PANEL);
+        painter.hline(song.x_range(), song.max.y, line);
+    }
     let headers = layout.headers();
     painter.vline(headers.max.x, headers.y_range(), line);
 }
@@ -2622,7 +2994,9 @@ impl NiceEguiApp for BitstepEditor {
         let data = self.model.shared();
         let pattern = self.shown_pattern();
         let panel = if self.panel_open { theme::PARAM_PANEL_HEIGHT } else { 0.0 };
-        let layout = EditorLayout::from_theme(ui.max_rect()).with_panel(panel);
+        let song = if data.song.is_on() { theme::SONG_BAR_HEIGHT } else { 0.0 };
+        let layout =
+            EditorLayout::from_theme(ui.max_rect()).with_song_bar(song).with_panel(panel);
         let view = self.settle_scroll(&layout, &data, pattern);
 
         // Before the painting, so a step edited by this frame's press is
@@ -2648,6 +3022,7 @@ impl NiceEguiApp for BitstepEditor {
         self.ui_lane_headers(ui, &layout, &view, &data, pattern);
         self.ui_param_panel(ui, &layout, &data, pattern);
         self.ui_top_bar(ui, &layout, &data);
+        self.ui_song_bar(ui, &layout, &data, pattern);
         // Last of the widgets, so its own layer is created above every one of
         // them and a click on a slider in it cannot fall through to the cell
         // underneath.
@@ -2716,7 +3091,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::model::Step;
+    use crate::model::{NUM_PATTERNS, Step};
     use crate::state;
 
     /// The whole of what can be checked without a display: the editor is
@@ -2971,6 +3346,7 @@ mod tests {
             app.ui_lane_headers(ui, &layout, &view, &data, pattern);
             app.ui_param_panel(ui, &layout, &data, pattern);
             app.ui_top_bar(ui, &layout, &data);
+            app.ui_song_bar(ui, &layout, &data, pattern);
             app.scroll_grid(ui, &layout);
         });
         // Nobody is uploading the font atlas here, and epaint panics on a
@@ -2981,10 +3357,12 @@ mod tests {
         app.model.collect();
     }
 
-    /// The layout `ui()` uses for `app`: the panel included when it is open.
+    /// The layout `ui()` uses for `app`: the song row and the panel
+    /// included when they are shown.
     fn test_layout(app: &BitstepEditor, window: egui::Rect) -> EditorLayout {
         let panel = if app.panel_open { theme::PARAM_PANEL_HEIGHT } else { 0.0 };
-        EditorLayout::from_theme(window).with_panel(panel)
+        let song = if app.model.shared().song.is_on() { theme::SONG_BAR_HEIGHT } else { 0.0 };
+        EditorLayout::from_theme(window).with_song_bar(song).with_panel(panel)
     }
 
     /// Drawing in the parameter panel sets the selected lane's steps to the
@@ -3041,12 +3419,12 @@ mod tests {
         assert_eq!(step(2).velocity(), 100);
         assert_eq!(step(1).velocity(), 127, "only the clicked step");
 
-        // Pitch, as its button would select. The bottom of the panel is -12.
+        // Pitch, as its button would select. The bottom of the panel is -24.
         app.param = ParamKind::Pitch;
         let bottom = plot.max.y - 1.0;
         drag_between(&mut app, &ctx, egui::pos2(column(3), bottom), egui::pos2(column(5), bottom));
         let pitches: Vec<i8> = (3..=5).map(|i| step(i).pitch()).collect();
-        assert_eq!(pitches, [-12; 3]);
+        assert_eq!(pitches, [-24; 3]);
         assert!(!step(5).is_on());
 
         // Another lane's steps were not touched.
@@ -3824,6 +4202,40 @@ mod tests {
     /// silent: an item that fired on one click, or one that stayed armed for
     /// a lane or an action it was not armed for.
     #[test]
+    fn copying_over_a_pattern_with_notes_needs_two_clicks() {
+        let mut armed = None;
+        // An empty target goes straight away.
+        assert!(pattern_copy_click(&mut armed, 0, 1, true));
+        assert_eq!(armed, None);
+        // A target with notes: the first click arms, the second copies.
+        assert!(!pattern_copy_click(&mut armed, 0, 2, false));
+        assert_eq!(armed, Some(PatternCopy { from: 0, to: 2 }));
+        assert!(pattern_copy_click(&mut armed, 0, 2, false));
+        assert_eq!(armed, None);
+        // Clicking another target moves the arm instead of copying.
+        assert!(!pattern_copy_click(&mut armed, 0, 2, false));
+        assert!(!pattern_copy_click(&mut armed, 0, 3, false));
+        assert_eq!(armed, Some(PatternCopy { from: 0, to: 3 }));
+        // So does the same target from another pattern's menu.
+        assert!(!pattern_copy_click(&mut armed, 1, 3, false));
+        assert_eq!(armed, Some(PatternCopy { from: 1, to: 3 }));
+    }
+
+    #[test]
+    fn a_pattern_is_empty_until_a_step_is_on() {
+        let model = SeqModel::new(state::default_data());
+        let data = model.shared();
+        assert!((0..NUM_PATTERNS).all(|pattern| pattern_is_empty(&data, pattern)));
+        let lane_id = data.lane(3).expect("a lane").id;
+        assert!(model.set_step(5, lane_id, 9, Step::OFF.with_pitch(4)));
+        assert!(pattern_is_empty(&model.shared(), 5), "a pitched off step is still empty");
+        assert!(model.toggle_step(5, lane_id, 15));
+        let data = model.shared();
+        assert!(!pattern_is_empty(&data, 5));
+        assert!(pattern_is_empty(&data, 4));
+    }
+
+    #[test]
     fn a_destructive_menu_item_needs_two_clicks() {
         let mut confirm = None;
 
@@ -4037,6 +4449,90 @@ mod tests {
         assert_eq!(params.pattern_select(), 1);
         assert_eq!(app.shown_pattern(), 0);
 
+        model.collect();
+    }
+
+    /// Song mode from the editor: the toggle turns it on and shows the row,
+    /// typing a pattern order writes the song as soon as it reads as one,
+    /// and clicking a bar shows its pattern in the grid.
+    #[test]
+    fn the_song_row_is_switched_on_typed_into_and_clicked() {
+        let model = Arc::new(SeqModel::new(state::default_data()));
+        let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
+        let mut app =
+            BitstepEditor::new(Arc::clone(&params), Arc::clone(&model), Arc::new(Playhead::new()));
+        let host = Arc::new(FakeHost::default());
+        app.gui_context = Some(GuiContext::new(Arc::clone(&host) as Arc<dyn GuiContextInner>));
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+
+        let off = test_layout(&app, test_window());
+        assert_eq!(off.song_bar().height(), 0.0, "no song row while song mode is off");
+        click_at(&mut app, &ctx, off.song_button().center());
+        assert!(model.shared().song.is_on(), "the toggle turns song mode on");
+
+        let on = test_layout(&app, test_window());
+        assert_eq!(on.song_bar().height(), theme::SONG_BAR_HEIGHT);
+        click_at(&mut app, &ctx, on.song_text().center());
+        run_frame(&mut app, &ctx, vec![egui::Event::Text("1-3x2".into())]);
+        assert_eq!(model.shared().song.entries, [0, 2, 2]);
+        assert_eq!(model.shared().song.text, "1-3x2");
+
+        // Half-typed: "1-3x2-9" is a song, "1-3x2-99" is not, and is left
+        // unwritten.
+        run_frame(&mut app, &ctx, vec![egui::Event::Text("-9".into())]);
+        assert_eq!(model.shared().song.text, "1-3x2-9");
+        run_frame(&mut app, &ctx, vec![egui::Event::Text("9".into())]);
+        assert_eq!(model.shared().song.text, "1-3x2-9", "pattern 99 does not exist");
+        assert_eq!(app.song_edit.as_deref(), Some("1-3x2-99"), "but the field keeps it");
+
+        // The second bar plays pattern 3: clicking it shows pattern 3.
+        let strip = on.song_strip();
+        click_at(&mut app, &ctx, grid_math::song_cell(strip, 0.0, 1).center());
+        assert_eq!(params.pattern_select(), 3);
+        assert_eq!(host.calls()[1], "set 3");
+
+        // The cell after the last entry ("1-3x2-9" has four) is the switch
+        // between looping and stopping at the end.
+        assert!(model.shared().song.is_looped(), "looped to begin with");
+        let end = grid_math::song_cell(strip, 0.0, 4).center();
+        click_at(&mut app, &ctx, end);
+        assert!(!model.shared().song.is_looped());
+        click_at(&mut app, &ctx, end);
+        assert!(model.shared().song.is_looped());
+        assert_eq!(params.pattern_select(), 3, "and it picks no pattern");
+
+        // Off again, the row goes and `patsel` plays.
+        click_at(&mut app, &ctx, on.song_button().center());
+        assert!(!model.shared().song.is_on());
+        model.collect();
+    }
+
+    /// The page arrows step through the patterns eight at a time, wrapping
+    /// round, and a button on a later page selects that page's pattern.
+    #[test]
+    fn the_page_arrows_reach_every_pattern() {
+        let model = Arc::new(SeqModel::new(state::default_data()));
+        let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
+        let mut app =
+            BitstepEditor::new(Arc::clone(&params), Arc::clone(&model), Arc::new(Playhead::new()));
+        let host = Arc::new(FakeHost::default());
+        app.gui_context = Some(GuiContext::new(Arc::clone(&host) as Arc<dyn GuiContextInner>));
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let layout = EditorLayout::from_theme(test_window());
+
+        click_at(&mut app, &ctx, layout.page_button(1).center());
+        assert_eq!(app.pattern_page, 1);
+        click_at(&mut app, &ctx, layout.pattern_button(2).center());
+        assert_eq!(params.pattern_select(), 11, "the third button of page 2");
+        assert_eq!(app.pattern_page, 1, "the page holds the pattern shown");
+
+        click_at(&mut app, &ctx, layout.page_button(0).center());
+        click_at(&mut app, &ctx, layout.page_button(0).center());
+        assert_eq!(app.pattern_page, grid_math::PATTERN_PAGES - 1, "back past the first wraps");
+        click_at(&mut app, &ctx, layout.pattern_button(7).center());
+        assert_eq!(params.pattern_select(), 64);
         model.collect();
     }
 

@@ -745,7 +745,7 @@ pub enum SeqEvent {
         velocity: f32,
         /// Mapped by [`pan_to_f32`].
         pan: f32,
-        /// Semitones, `-12..=12`; 0 means no pitch change. Sent as a per-note
+        /// Semitones, `-24..=24`; 0 means no pitch change. Sent as a per-note
         /// tuning expression, so the key (the Drum Machine pad) stays put.
         pitch: i8,
         /// The lane's volume in dB; 0 means as played. Sent as a per-note
@@ -2592,8 +2592,8 @@ mod tests {
         assert_eq!(on(60, 0).with_sample_pad(true).tuning(), 0);
         assert_eq!(on(72, 3).with_sample_pad(true).tuning(), -9);
         // The extremes stay well inside the ±120 a tuning expression takes.
-        assert_eq!(on(0, 12).with_sample_pad(true).tuning(), 72);
-        assert_eq!(on(127, -12).with_sample_pad(true).tuning(), -79);
+        assert_eq!(on(0, 24).with_sample_pad(true).tuning(), 84);
+        assert_eq!(on(127, -24).with_sample_pad(true).tuning(), -91);
         let off = SeqEvent::note_off(0.5, 36, 0, 1 << 20);
         assert_eq!(off.with_sample_pad(true), off, "a note-off is unchanged");
         assert_eq!(off.tuning(), 0);
