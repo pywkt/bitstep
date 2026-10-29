@@ -321,9 +321,9 @@ impl Default for Bitstep {
 
 impl Plugin for Bitstep {
     const NAME: &'static str = "bitstep";
-    const VENDOR: &'static str = "bitstep contributors";
-    const URL: &'static str = "https://codeberg.org/bitstep/bitstep";
-    const EMAIL: &'static str = "noreply@example.com";
+    const VENDOR: &'static str = "pywkt";
+    const URL: &'static str = "https://github.com/pywkt/bitstep";
+    const EMAIL: &'static str = "bitstep@pywkt.com";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
     /// No audio at all: this plugin consumes and emits note events only.
@@ -442,7 +442,7 @@ impl ClapPlugin for Bitstep {
     const CLAP_ID: &'static str = "com.bitstep.bitstep";
     const CLAP_DESCRIPTION: Option<&'static str> = Some(env!("CARGO_PKG_DESCRIPTION"));
     const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_SUPPORT_URL: Option<&'static str> = None;
+    const CLAP_SUPPORT_URL: Option<&'static str> = Some("https://github.com/pywkt/bitstep/issues");
     const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::NoteEffect, ClapFeature::Utility];
 }
 

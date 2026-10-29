@@ -6,7 +6,7 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 license = "ISC"
-authors = ["bitstep contributors"]
+authors = ["pywkt <bitstep@pywkt.com>"]
 
 [profile.release]
 lto = "thin"
