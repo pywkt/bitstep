@@ -250,6 +250,18 @@ impl GridView {
         )
     }
 
+    /// Screen `x` of the line before column `step`: the middle of the gap
+    /// left of it, so a line drawn there touches no cell.
+    pub fn column_boundary_x(&self, step: usize) -> f32 {
+        self.origin.x + self.metrics.step_x(step) - self.metrics.gap().x * 0.5
+    }
+
+    /// Screen `y` of the line under row `row`: the middle of the gap below
+    /// it, as [`Self::column_boundary_x`] is for columns.
+    pub fn row_boundary_y(&self, row: usize) -> f32 {
+        self.origin.y + self.metrics.row_y(row + 1) - self.metrics.gap().y * 0.5
+    }
+
     /// The grab rect of a lane's end handle, centred on the boundary after
     /// its last active step.
     ///
@@ -2851,6 +2863,25 @@ mod tests {
         let outside = pos2(v.viewport().min.x - 1.0, v.viewport().center().y);
         assert_eq!(hit(outside), None, "left of the viewport");
         assert_eq!(hit(pos2(v.viewport().center().x, v.viewport().max.y + 1.0)), None, "below");
+    }
+
+    /// Bar lines and row separators fall in the gaps, touching no cell —
+    /// scrolled or not.
+    #[test]
+    fn boundary_lines_sit_in_the_gaps_between_cells() {
+        for scroll in [Vec2::ZERO, vec2(37.5, 11.0)] {
+            let v = view(scroll);
+            for step in 1..40 {
+                let x = v.column_boundary_x(step);
+                assert!(x > v.cell_rect(0, step - 1).max.x, "after column {}", step - 1);
+                assert!(x < v.cell_rect(0, step).min.x, "before column {step}");
+            }
+            for row in 0..10 {
+                let y = v.row_boundary_y(row);
+                assert!(y > v.cell_rect(row, 0).max.y, "below row {row}");
+                assert!(y < v.cell_rect(row + 1, 0).min.y, "above row {}", row + 1);
+            }
+        }
     }
 
     /// The end handle sits on the boundary after the last step, takes

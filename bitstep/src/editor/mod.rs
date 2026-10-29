@@ -663,7 +663,7 @@ impl BitstepEditor {
         view: &GridView,
         data: &SeqData,
         pattern: usize,
-    ) {
+    ) -> Option<GridHit> {
         let id = egui::Id::unique(STEP_STRIP_ID);
         let response = ui.interact(view.viewport(), id, Sense::drag());
 
@@ -727,6 +727,16 @@ impl BitstepEditor {
             // without finishing it would swallow the click's toggle.
             self.end_gesture(pattern);
         }
+
+        // What a click would land on, for the hover outline: only while no
+        // gesture is running (the gesture's own edits are its feedback) and
+        // only when the strip itself is under the pointer, not a menu or
+        // popover drawn over it.
+        if self.gesture.is_some() || !response.hovered() {
+            return None;
+        }
+        let pos = response.hover_pos()?;
+        view.hit(pos, data.lane_count(), |row| row_length(data, shown, row))
     }
 
     /// A press landed on the strip: start the gesture its cell allows, and
@@ -2141,6 +2151,11 @@ impl BitstepEditor {
                 let bar = kind.bar(plot, x, kind.read(step));
                 painter.rect_filled(bar, CornerRadius::ZERO, fill);
             }
+            // The grid's bar lines, carried down into the panel.
+            let bar_line = egui::Stroke::new(theme::HAIRLINE, theme::BAR_LINE);
+            for index in visible.clone().filter(|&index| theme::is_bar_start(index)) {
+                painter.vline(view.column_boundary_x(index), plot.y_range(), bar_line);
+            }
             if let Some(index) = playing.filter(|index| visible.contains(index)) {
                 let x = view.cell_rect(0, index).x_range();
                 let column = Rect::from_x_y_ranges(x, plot.y_range());
@@ -3012,6 +3027,28 @@ fn paint_markers(painter: &Painter, cell: Rect, step: Step) {
     }
 }
 
+/// The lines under the cells: a faint one under every lane row, and a bar
+/// line every [`theme::BAR_STEPS`] columns down through all the rows. Both
+/// sit in the gaps between cells, so neither covers a step.
+fn paint_grid_lines(painter: &Painter, view: &GridView, data: &SeqData, pattern: usize) {
+    let rows = data.lane_count();
+    let Some(last) = rows.checked_sub(1) else {
+        return;
+    };
+    let line = egui::Stroke::new(theme::HAIRLINE, theme::GRID_LINE);
+    for row in view.visible_rows(rows) {
+        painter.hline(view.viewport().x_range(), view.row_boundary_y(row), line);
+    }
+    let top = view.origin().y;
+    let bottom = view.row_boundary_y(last);
+    let bar = egui::Stroke::new(theme::HAIRLINE, theme::BAR_LINE);
+    for step in view.visible_steps(strip_steps(data, pattern)) {
+        if theme::is_bar_start(step) {
+            painter.vline(view.column_boundary_x(step), egui::Rangef::new(top, bottom), bar);
+        }
+    }
+}
+
 /// Paints the step strip: one row per visible lane, one cell per visible step.
 ///
 /// Only the cells inside `view`'s viewport are drawn. That is not an
@@ -3028,9 +3065,11 @@ fn paint_steps(
     pattern: usize,
     playhead: &Playhead,
     mode: EditMode,
+    hover: Option<GridHit>,
 ) {
     let any_solo = data.any_solo();
     let playing_pattern = playhead.pattern();
+    paint_grid_lines(painter, view, data, pattern);
 
     for row in view.visible_rows(data.lane_count()) {
         // Both are `Some` for every row below `lane_count` — the shape cannot
@@ -3092,10 +3131,26 @@ fn paint_steps(
             painter.rect_filled(view.column_rect(row, index), CornerRadius::ZERO, theme::PLAYHEAD);
         }
 
+        // The cell a click would land on, outlined over everything else.
+        if let Some(GridHit::Cell { row: hovered, step }) = hover
+            && hovered == row
+            && visible.contains(&step)
+        {
+            let outline = egui::Stroke::new(theme::HAIRLINE, theme::HOVER_OUTLINE);
+            let cell = view.cell_rect(row, step);
+            painter.rect_stroke(cell, theme::CELL_CORNER, outline, StrokeKind::Inside);
+        }
+
         // The handle after the last step, which drags the lane's length.
         let handle = view.end_handle_rect(row, length);
         if view.viewport().intersects(handle) {
-            painter.rect_filled(handle, theme::CELL_CORNER, theme::END_HANDLE);
+            let colour = match hover {
+                Some(GridHit::EndHandle { row: hovered }) if hovered == row => {
+                    theme::END_HANDLE_HOVER
+                }
+                _ => theme::END_HANDLE,
+            };
+            painter.rect_filled(handle, theme::CELL_CORNER, colour);
         }
     }
 }
@@ -3187,7 +3242,7 @@ impl NiceEguiApp for BitstepEditor {
         // Before the painting, so a step edited by this frame's press is
         // already drawn in its new state: value edits land in the `SeqData`
         // this frame is holding, not in a replacement for it.
-        self.interact_steps(ui, &view, &data, pattern);
+        let hover = self.interact_steps(ui, &view, &data, pattern);
 
         // No panel is shown, so nothing paints the window for us.
         paint_chrome(ui.painter(), &layout);
@@ -3200,6 +3255,7 @@ impl NiceEguiApp for BitstepEditor {
             pattern,
             &self.playhead,
             self.mode,
+            hover,
         );
         if data.lane_count() == 0 {
             paint_empty_hint(&ui.painter_at(layout.steps()), &layout);
@@ -3696,18 +3752,56 @@ mod tests {
         ctx: &egui::Context,
         pattern: usize,
         events: Vec<egui::Event>,
-    ) {
+    ) -> Option<GridHit> {
         let data = app.model.shared();
         let input =
             egui::RawInput { screen_rect: Some(test_window()), events, ..Default::default() };
+        let mut hover = None;
         let mut output = ctx.run_ui(input, |ui| {
             let layout = test_layout(app, ui.max_rect());
             let view = app.settle_scroll(&layout, &data, pattern);
-            app.interact_steps(ui, &view, &data, pattern);
+            hover = app.interact_steps(ui, &view, &data, pattern);
         });
         output.textures_delta.clear();
         drop(data);
         app.model.collect();
+        hover
+    }
+
+    /// The strip reports the cell (or end handle) under the pointer for the
+    /// hover outline, and nothing while a drag is running.
+    #[test]
+    fn the_strip_reports_what_a_click_would_land_on() {
+        let model = Arc::new(SeqModel::new(state::default_data()));
+        let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
+        let mut app = BitstepEditor::new(params, Arc::clone(&model), Arc::new(Playhead::new()));
+        app.follow = false;
+        let ctx = egui::Context::default();
+        let layout = test_layout(&app, test_window());
+        let view = layout.grid_view(CellMetrics::from_theme(), Vec2::ZERO);
+        let moved = |pos| vec![egui::Event::PointerMoved(pos)];
+
+        // egui hit-tests against the widgets of the frame before, so the
+        // strip needs one frame to exist first.
+        grid_frame(&mut app, &ctx, 0, Vec::new());
+        let cell = view.cell_rect(1, 3).center();
+        let hover = grid_frame(&mut app, &ctx, 0, moved(cell));
+        assert_eq!(hover, Some(GridHit::Cell { row: 1, step: 3 }));
+        let handle = view.end_handle_rect(2, 16).center();
+        let hover = grid_frame(&mut app, &ctx, 0, moved(handle));
+        assert_eq!(hover, Some(GridHit::EndHandle { row: 2 }));
+        let header = layout.headers().center();
+        assert_eq!(grid_frame(&mut app, &ctx, 0, moved(header)), None, "off the strip");
+
+        let press = egui::Event::PointerButton {
+            pos: cell,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        };
+        grid_frame(&mut app, &ctx, 0, vec![egui::Event::PointerMoved(cell), press]);
+        let later = view.cell_rect(1, 6).center();
+        assert_eq!(grid_frame(&mut app, &ctx, 0, moved(later)), None, "quiet mid-drag");
     }
 
     /// A paint drag keeps to the pattern it started in: when the pattern on

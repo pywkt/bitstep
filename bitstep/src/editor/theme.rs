@@ -35,8 +35,18 @@ pub const CONTROL_HOVER: Color32 = Color32::from_gray(56);
 pub const CONTROL_ACTIVE: Color32 = Color32::from_gray(66);
 
 /// Separators and outlines: the top bar's lower edge, the header↔grid
-/// split, and the line egui draws around every widget.
+/// split, the line under each lane row in the step strip, and the line egui
+/// draws around every widget.
 pub const GRID_LINE: Color32 = Color32::from_gray(54);
+
+/// The line at the start of every bar ([`BAR_STEPS`] columns) in the step
+/// strip and the parameter panel: brighter than [`GRID_LINE`], so bars read
+/// over the beat shading.
+pub const BAR_LINE: Color32 = Color32::from_gray(96);
+
+/// The outline on the cell under the pointer, so a click's target is plain
+/// before the button goes down.
+pub const HOVER_OUTLINE: Color32 = Color32::from_gray(210);
 
 /// An off step's cell, on an unshaded column.
 pub const CELL: Color32 = Color32::from_gray(38);
@@ -60,6 +70,9 @@ pub const PLAYHEAD: Color32 = Color32::from_rgba_premultiplied(26, 26, 26, 26);
 
 /// The end handle (`┃`) after a lane's last active step.
 pub const END_HANDLE: Color32 = Color32::from_gray(120);
+
+/// The end handle under the pointer.
+pub const END_HANDLE_HOVER: Color32 = Color32::from_gray(185);
 
 /// An armed destructive menu item — a `delete` or a `clear` waiting for its
 /// second click (`editor::lane_menu`).
@@ -318,6 +331,11 @@ pub const TEXT_CURSOR_WIDTH: f32 = 2.0;
 /// alternating blocks line up with the bar.
 pub const BEAT_STEPS: usize = 4;
 
+/// Columns per bar line: four beats of [`BEAT_STEPS`], a 4/4 bar at 1/16.
+/// The grid's columns are shared by every lane whatever its rate, so this is
+/// a ruler in steps rather than the host's bar — at 1/8 it marks two bars.
+pub const BAR_STEPS: usize = BEAT_STEPS * 4;
+
 /// The size the empty-state hint is drawn at — the one text in the editor
 /// that is not a widget's, shown when there are no lanes. A little above the
 /// body text, because it is all there is to read.
@@ -390,6 +408,12 @@ pub fn dim(colour: Color32, factor: f32) -> Color32 {
 /// the eye can count beats without a ruler.
 pub fn is_shaded_column(step: usize) -> bool {
     (step / BEAT_STEPS) % 2 == 1
+}
+
+/// Whether a bar line is drawn before column `step`: every [`BAR_STEPS`]
+/// columns, but not before the first, where the strip's own edge is.
+pub fn is_bar_start(step: usize) -> bool {
+    step > 0 && step.is_multiple_of(BAR_STEPS)
 }
 
 /// The background of a step's cell, before anything is drawn in it.
@@ -515,6 +539,15 @@ pub fn apply(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bar line every four beats of shading, never before the first column.
+    #[test]
+    fn bar_lines_fall_on_every_fourth_beat() {
+        let bars: Vec<usize> = (0..70).filter(|&step| is_bar_start(step)).collect();
+        assert_eq!(bars, [16, 32, 48, 64]);
+        // Each bar starts an unshaded block, so the line and the shading agree.
+        assert!(bars.iter().all(|&step| !is_shaded_column(step)));
+    }
 
     /// The palette is `state`'s, converted — not a second list — and it keeps
     /// handing out colours past its end so a tenth lane is not black.

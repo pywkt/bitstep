@@ -44,7 +44,10 @@ beat of the bar.
 - **Lane headers** (left): one row per lane, with its name, note, length,
   rate, and mute/solo.
 - **Step grid** (right): one row of steps per lane. Every group of four steps
-  is shaded alternately so you can count beats.
+  is shaded alternately so you can count beats, and a brighter line marks
+  every 16 steps (one bar of 1/16 steps; at other rates it is still every 16
+  steps). The cell under the mouse is outlined, so you can see where a click
+  will land.
 - **Parameter panel** (bottom): the velocity, pan, pitch, chance or ratchet
   of every step in the selected lane, as bars you can draw. See
   [Parameter panel](#parameter-panel).
