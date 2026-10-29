@@ -26,7 +26,7 @@ beat of the bar.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│ ‹[1]…[8]› [Steps][Pitch][Song] status [Params] [+ Lane] [Follow]   │  top bar
+│ ‹[1]…[8]› [Steps][Pitch][Song][Undo][Redo] status [Params] [+ Lane]  │  top bar
 ├──────────────────────────────┬───────────────────────────────────────┤
 │ ⠿● Lane 1  C1  16  1/16 ▾ M S │ ■ □ □ □ ■ □ □ □ ■ □ □ □ ■ □ □ □ ┃      │
 │ ⠿● Lane 2  C#1 16  1/16 ▾ M S │ □ □ □ □ ■ □ □ □ □ □ □ □ ■ □ □ □ ┃      │
@@ -38,9 +38,9 @@ beat of the bar.
 ```
 
 - **Top bar:** the pattern buttons with page arrows either side, the
-  **Steps / Pitch** mode switch, **Song** (see [Song mode](#song-mode)), a
-  status line, **Params** (shows or hides the parameter panel), **+ Lane**,
-  and **Follow**.
+  **Steps / Pitch** mode switch, **Song** (see [Song mode](#song-mode)),
+  **Undo / Redo** (see [Undo](#undo)), a status line, **Params** (shows or
+  hides the parameter panel), **+ Lane**, and **Follow**.
 - **Lane headers** (left): one row per lane, with its name, note, length,
   rate, and mute/solo.
 - **Step grid** (right): one row of steps per lane. Every group of four steps
@@ -185,11 +185,11 @@ pads.
 
 | Control | What it does |
 |---|---|
-| **Name and colour dot** | Drag to move the lane up or down. Press Escape while dragging to put it back. Right-click for the [lane menu](#lane-menu). |
-| **Note** (e.g. `C1`) | The note the lane plays. Drag up/right to raise it, or use the mouse wheel over it. Hold Shift while dragging for finer control. Click to type a note name such as `F#1` or `Bb2`. |
-| **Length** | How many steps the lane has, from 1 to 4096. Drag or click to type. |
+| **Name and colour dot** | Drag to move the lane up or down; drag to the top or bottom edge of the list to scroll it. Press Escape while dragging to put it back. Right-click for the [lane menu](#lane-menu). |
+| **Note** (e.g. `C1`) | The note the lane plays. Drag up/right to raise it, or use the mouse wheel over it. Hold Shift while dragging for finer control. Click to type a note name such as `F#1` or `Bb2`; while typing, Up/Down step it by a semitone. |
+| **Length** | How many steps the lane has, from 1 to 4096. Drag or click to type; while typing, Up/Down add or remove a step. A new length takes effect at once, so a playing lane may jump to a different step. |
 | **Rate** | How long each step is: 1/1 down to 1/64, each also in triplet (T) and dotted (D) versions. |
-| **Volume** (e.g. `0 dB`) | Turns the whole lane up or down, from −36 dB to +12 dB. Drag up or down, or click to type. Right-click to reset to 0 dB. See [Lane volume](#lane-volume). |
+| **Volume** (e.g. `0 dB`) | Turns the whole lane up or down, from −36 dB to +12 dB. Drag up or down, or click to type (Up/Down step 1 dB). Right-click to reset to 0 dB. See [Lane volume](#lane-volume). |
 | **M** | Mute the lane. |
 | **S** | Solo the lane. When any lane is soloed, only soloed lanes play. Mute wins over solo. |
 
@@ -251,7 +251,7 @@ Right-click a lane's name to open its menu:
 - **duplicate:** adds a copy of the lane directly below it, in every
   pattern.
 - **delete:** removes the lane from every pattern. Click it twice to
-  confirm. **This can't be undone.**
+  confirm. [Undo](#undo) brings it back.
 - **clear:** turns off every step in the current pattern and resets their
   settings. Click it twice to confirm.
 - **invert:** flips every step on↔off in the current pattern.
@@ -312,7 +312,7 @@ note and volume are shared by all patterns anyway.
 
 - Copying into an empty pattern happens straight away.
 - If the target pattern has notes, the number turns red with a **?**. Click
-  it again to replace that pattern. **This can't be undone.**
+  it again to replace that pattern. [Undo](#undo) puts it back.
 - The copy is independent: editing it doesn't change the original. You stay
   on the pattern you copied from; click the new one to switch to it.
 
@@ -392,13 +392,36 @@ What else to know:
 
 The current step is highlighted as it plays.
 
+## Undo
+
+**Undo** and **Redo** in the top bar, or **Ctrl+Z** and **Ctrl+Shift+Z**
+(or **Ctrl+Y**) while bitstep's window is in front, step back and forth
+through your edits in bitstep:
+
+- One drag is one step: a whole paint stroke, a length drag or a drawn
+  curve in the parameter panel is undone in one go, and so is typing a lane
+  name or a song order.
+- Everything you edit in bitstep's window can be undone: steps and their
+  settings, lane settings, adding, deleting, duplicating and moving lanes,
+  clear/invert/randomise/nudge/fills, pattern copies and the song.
+- **Mute and solo are not undo steps.** They're for playing, so undo leaves
+  them as they are.
+- **Pattern Select** belongs to Bitwig: use Bitwig's own undo for it.
+- bitstep remembers the last 100 steps. The history starts fresh when the
+  project is opened and isn't saved with it.
+
+Bitwig's own undo doesn't reach changes made inside bitstep, and bitstep's
+undo doesn't reach changes made in Bitwig.
+
 ## Keyboard shortcuts
 
-While bitstep's window is in front, **Space** (play/stop), **F1–F12** and
-shortcuts held with **Ctrl** (save, undo and so on) are passed on to Bitwig,
-so you don't have to click back into Bitwig to start the transport. Other keys
-stay with bitstep, and nothing is passed on while you're typing a lane name or
-a song order.
+While bitstep's window is in front, **Ctrl+Z** and **Ctrl+Shift+Z** / **Ctrl+Y**
+are bitstep's [undo and redo](#undo). **Space** (play/stop), **F1–F12** and
+other shortcuts held with **Ctrl** (save and so on) are passed on to Bitwig,
+so you don't have to click back into Bitwig to start the transport. To use
+Bitwig's undo, click into Bitwig first. Other keys stay with bitstep, and
+nothing is passed on while you're typing a lane name or a song order (there,
+Ctrl+Z undoes your typing).
 
 ## Playing along
 
@@ -444,8 +467,6 @@ window size, follow setting and scroll position are not saved.
 
 ## Things to know
 
-- **There is no undo.** Bitwig's undo doesn't reach changes made inside
-  bitstep's window. Be careful with delete, clear and randomise.
 - **Note names use C3 = middle C (MIDI note 60).** If Bitwig is set to show
   middle C as C4, bitstep's names will read one octave lower than Bitwig's.
 - **Pan, pitch and lane volume depend on the instrument.** If an instrument

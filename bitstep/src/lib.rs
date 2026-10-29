@@ -10,6 +10,7 @@ pub mod engine;
 pub mod model;
 pub mod sequencer;
 pub mod state;
+pub mod undo;
 pub mod voices;
 
 use std::sync::Arc;

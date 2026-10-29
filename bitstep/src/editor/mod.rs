@@ -155,6 +155,13 @@ const VOLUME_DRAG_SPEED: f64 = 0.2;
 /// bundled fonts have no glyph for a play arrow, which drew as an empty box.
 const FOLLOW_LABEL: &str = "Follow";
 
+/// The hover on a lane's length field. A new length takes effect at once —
+/// the lane jumps to the step the new loop puts it on rather than finishing
+/// the loop it was in (`specs/sequencer.md` §Principles rule 1) — which
+/// surprises without a word.
+const LENGTH_HOVER: &str = "Loop length in steps: drag, type, or Up/Down while typing. \
+     A change takes effect at once, so the lane may jump to a different step.";
+
 /// What the top bar's parameter-panel toggle says.
 const PANEL_LABEL: &str = "Params";
 
@@ -175,12 +182,17 @@ const PARAM_STRIP_ID: &str = "bitstep:param-strip";
 /// ~30 Hz, the rate the playhead is driven at.
 ///
 /// nice-plug-egui does not redraw on its own: a frame happens when something
-/// asks for one. Two things do here — this interval, re-requested from
-/// [`NiceEguiApp::ui`] every frame so the playhead keeps moving, and the
-/// [`RepaintNotifier`] the adapter polls at the same interval, which is what
-/// host-side changes (a parameter moved by automation, a state load) come in
-/// through. 30 Hz is enough for a step grid and leaves the GUI thread idle
-/// between frames.
+/// asks for one — input, or the [`RepaintNotifier`] the adapter polls at this
+/// interval. [`NiceEguiApp::ui`] raises the notifier every frame so the
+/// playhead keeps moving, and so does the host side (a parameter moved by
+/// automation, a state load). 30 Hz is enough for a step grid and leaves the
+/// GUI thread idle between frames.
+///
+/// The notifier rather than `egui::Context::request_repaint_after`: on X11
+/// every one of those calls starts a one-shot timer of its own, so each frame
+/// drawn for input started another chain of repaints, and after a minute of
+/// editing the window redrew many times faster than this. The poll timer is
+/// one fixed timer, whatever the frame rate was.
 pub const REPAINT_INTERVAL: Duration = Duration::from_micros(33_333);
 
 /// Everything the editor draws from, and the GUI-only state it accumulates.
@@ -205,6 +217,12 @@ pub struct BitstepEditor {
     /// on the grid. GUI-only state: nothing outside this struct can see it,
     /// and the edits it makes are in the model the instant they happen.
     gesture: Option<Gesture>,
+    /// The pattern [`Self::gesture`] was started in. A gesture only ever
+    /// edits that pattern, as [`StepPopover`] does: if automation moves
+    /// `patsel` mid-drag, the drag pauses until its pattern is back on screen
+    /// rather than carrying on into the one now shown, and a click still
+    /// toggles the step it landed on.
+    gesture_pattern: usize,
     /// The step whose pan/ratchet/probability popover is open, or `None` when
     /// none is. GUI-only, like [`Self::gesture`]: the sliders in it write
     /// straight through the model, so there is no edit buffered here.
@@ -282,6 +300,10 @@ pub struct BitstepEditor {
     /// Whether this window has tried to connect [`Self::key_forwarder`], so
     /// a window with nothing to forward to does not retry every frame.
     key_forwarder_tried: bool,
+    /// The adapter's repaint flag, raised every frame (see
+    /// [`REPAINT_INTERVAL`]). A fresh one until [`create`] hands over the
+    /// instance's, which is all a test needs.
+    repaint: RepaintNotifier,
 }
 
 /// A drawing gesture in the parameter panel: which lane and parameter it
@@ -289,6 +311,10 @@ pub struct BitstepEditor {
 struct ParamStroke {
     lane_id: u32,
     kind: ParamKind,
+    /// The pattern the stroke began in. If `patsel` moves mid-stroke, the
+    /// stroke pauses rather than drawing into the pattern now shown, like a
+    /// grid gesture ([`BitstepEditor::gesture_pattern`]).
+    pattern: usize,
     draw: LevelDraw,
 }
 
@@ -421,8 +447,12 @@ impl LaneAction {
 
     fn warning(self) -> &'static str {
         match self {
-            LaneAction::Delete => "Removes the lane and its steps in every pattern. No undo.",
-            LaneAction::Clear => "Wipes every step of this lane in the pattern on screen. No undo.",
+            LaneAction::Delete => {
+                "Removes the lane and its steps in every pattern. Ctrl+Z brings it back."
+            }
+            LaneAction::Clear => {
+                "Wipes every step of this lane in the pattern on screen. Ctrl+Z undoes it."
+            }
         }
     }
 }
@@ -458,8 +488,10 @@ struct PatternCopy {
 struct HeaderPlace {
     band: Rect,
     row: usize,
-    rows: usize,
     pitch: f32,
+    /// Screen `y` of the top of row 0, scrolled: what turns a pointer's
+    /// screen `y` into the content `y` a [`LaneReorder`] measures in.
+    content_top: f32,
     /// Whether this is the lane the parameter panel is editing, which the
     /// header marks.
     selected: bool,
@@ -570,6 +602,7 @@ impl BitstepEditor {
             playhead,
             gui_context: None,
             gesture: None,
+            gesture_pattern: 0,
             popover: None,
             key_scroll: None,
             lane_drag: None,
@@ -590,6 +623,7 @@ impl BitstepEditor {
             param_draw: None,
             key_forwarder: None,
             key_forwarder_tried: false,
+            repaint: RepaintNotifier::new(),
         }
     }
 
@@ -653,9 +687,14 @@ impl BitstepEditor {
             if button == PointerButton::Secondary || modifiers.alt {
                 self.open_popover(view, data, pattern, pos);
             } else {
+                self.gesture_pattern = pattern;
                 self.begin_gesture(view, data, pattern, pos);
             }
         }
+        // From here on, a gesture in progress edits the pattern it began in,
+        // and only while that pattern is the one on screen.
+        let shown = pattern;
+        let pattern = if self.gesture.is_some() { self.gesture_pattern } else { pattern };
 
         // The handle is a resize grip, so it says so under the pointer —
         // both when it is merely hovered and for as long as a drag of it is
@@ -674,7 +713,9 @@ impl BitstepEditor {
         if response.dragged_by(PointerButton::Primary) {
             // Includes the frame of the press itself, where the pointer has
             // not moved and there is nothing to decide yet.
-            if let Some(pos) = response.interact_pointer_pos() {
+            if pattern == shown
+                && let Some(pos) = response.interact_pointer_pos()
+            {
                 let shift = ui.input(|input| input.modifiers.shift);
                 self.continue_gesture(view, data, pattern, pos, shift);
             }
@@ -1302,14 +1343,66 @@ impl BitstepEditor {
                 let place = HeaderPlace {
                     band: layout.header_row(view, row),
                     row,
-                    rows: data.lane_count(),
                     pitch: view.metrics().row_pitch(),
+                    content_top: view.origin().y,
                     selected: self.panel_open && selected_row == Some(row),
                 };
                 let audible = lane_is_audible(lane, any_solo);
                 self.ui_lane_header(ui, place, lane, lane_data, pattern, audible);
             }
         });
+        self.continue_lane_drag(ui, layout, view, data);
+    }
+
+    /// The rest of a lane reorder once [`reorder_lane`] has picked the lane
+    /// up: follow the pointer, scroll the list when it nears an edge, drop
+    /// on release, put the lane back on Escape.
+    ///
+    /// Here, once a frame, rather than in the dragged lane's own row: the
+    /// lane can be carried to a row that is not drawn (past the bottom of the
+    /// window, or scrolled away), and a row that is not drawn runs no code.
+    fn continue_lane_drag(
+        &mut self,
+        ui: &egui::Ui,
+        layout: &EditorLayout,
+        view: &GridView,
+        data: &SeqData,
+    ) {
+        let Some(held) = self.lane_drag.as_mut() else {
+            return;
+        };
+        // Escape first: egui ends the drag on Escape too, so by the time the
+        // button is looked at the key is all that says the drag was
+        // abandoned rather than finished.
+        if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            if held.drag.target() != held.drag.from() {
+                self.model.move_lane(held.lane_id, held.drag.from());
+            }
+            self.lane_drag = None;
+            return;
+        }
+        if !ui.input(|input| input.pointer.primary_down()) {
+            // Dropped: the lane is already where it was let go.
+            self.lane_drag = None;
+            return;
+        }
+        let Some(pos) = ui.input(|input| input.pointer.interact_pos()) else {
+            return;
+        };
+
+        let headers = layout.headers();
+        let pitch = view.metrics().row_pitch();
+        let step = grid_math::edge_scroll(pos.y, headers.min.y, headers.max.y, pitch, pitch * 0.5);
+        if step != 0.0 {
+            // Clamped by the next frame's `settle_scroll`.
+            self.scroll.y += step;
+        }
+        let content_y = pos.y - view.origin().y;
+        if let Some(target) = held.drag.enter(content_y, data.lane_count()) {
+            // A refusal means the lane has gone (a state load mid-drag); the
+            // next frame has no row for it and the release ends the drag.
+            self.model.move_lane(held.lane_id, target);
+        }
     }
 
     /// One lane's header: drag grip, colour dot, name, key, length, rate,
@@ -1365,7 +1458,7 @@ impl BitstepEditor {
                 ui.scope_id().with(LANE_HANDLE_ID),
                 Sense::click_and_drag(),
             );
-            let dragging = reorder_lane(ui, &handle, model, lane_drag, lane, place);
+            let dragging = reorder_lane(ui, &handle, lane_drag, lane, place);
             if handle.clicked() {
                 // The lane the parameter panel edits.
                 *selected_lane = Some(lane.id);
@@ -1422,7 +1515,8 @@ impl BitstepEditor {
             // The key, shown and typed as a note name. A drag value because
             // the key is changed by dragging or scrolling: egui gives the
             // drag, and `scroll_key` below adds the scroll.
-            let key = ui.put(
+            let (key, steps) = put_stepped(
+                ui,
                 fields.key,
                 DragValue::from_get_set(|value| {
                     if let Some(value) = value {
@@ -1435,25 +1529,32 @@ impl BitstepEditor {
                 .custom_formatter(|value, _| grid_math::note_name(grid_math::widget_key(value)))
                 .custom_parser(|text| grid_math::parse_note_name(text).map(f64::from)),
             );
+            if steps != 0 {
+                let wanted = f64::from(lane.key()) + f64::from(steps);
+                model.set_key(lane.id, grid_math::widget_key(wanted));
+            }
             scroll_key(ui, &key, model, lane, key_scroll);
 
             // The loop length. `LengthEdit` works out whether the lane has room
             // for what was asked; growing it is a shape edit, so it goes first
             // and the length lands in the republished data.
-            ui.put(
+            let set_length = |value: f64| {
+                let edit = LengthEdit::resolve(value, lane_data.capacity());
+                // A failed grow means the lane is gone (a state load between
+                // frames), and then the length has nowhere to go either —
+                // `set_length` would answer `false` as well.
+                let grown =
+                    edit.grow().is_none_or(|steps| model.ensure_capacity(pattern, lane.id, steps));
+                if grown {
+                    model.set_length(pattern, lane.id, edit.length());
+                }
+            };
+            let (length, steps) = put_stepped(
+                ui,
                 fields.length,
                 DragValue::from_get_set(|value| {
                     if let Some(value) = value {
-                        let edit = LengthEdit::resolve(value, lane_data.capacity());
-                        // A failed grow means the lane is gone (a state load
-                        // between frames), and then the length has nowhere to go
-                        // either — `set_length` would answer `false` as well.
-                        let grown = edit
-                            .grow()
-                            .is_none_or(|steps| model.ensure_capacity(pattern, lane.id, steps));
-                        if grown {
-                            model.set_length(pattern, lane.id, edit.length());
-                        }
+                        set_length(value);
                     }
                     // The lane data this frame is holding, so a grow shows one
                     // frame late. The drag itself does not care: egui keeps its
@@ -1467,6 +1568,10 @@ impl BitstepEditor {
                 .range(LengthEdit::MIN..=LengthEdit::MAX)
                 .clip_text(true),
             );
+            if steps != 0 {
+                set_length(f64::from(lane_data.length()) + f64::from(steps));
+            }
+            length.on_hover_text(LENGTH_HOVER);
 
             // The rate: every `Rate`, labelled by its own `Display` (21 of them,
             // so a list rather than a cycle button).
@@ -1491,7 +1596,8 @@ impl BitstepEditor {
 
             // The lane's volume, sent with every note as a per-note volume.
             // Drag, click to type, right-click for 0 dB.
-            let volume = ui.put(
+            let (volume, steps) = put_stepped(
+                ui,
                 fields.volume,
                 DragValue::from_get_set(|value| {
                     if let Some(value) = value {
@@ -1506,6 +1612,10 @@ impl BitstepEditor {
                 })
                 .custom_parser(|text| grid_math::parse_volume(text).map(f64::from)),
             );
+            if steps != 0 {
+                let wanted = f64::from(lane.volume_db()) + f64::from(steps);
+                model.set_volume(lane.id, grid_math::widget_volume(wanted));
+            }
             if volume.secondary_clicked() {
                 model.set_volume(lane.id, 0);
             }
@@ -1845,7 +1955,8 @@ impl BitstepEditor {
                             (true, _) => (
                                 RichText::new(format!("{}?", to + 1)).color(theme::WARN),
                                 format!(
-                                    "Click again to replace pattern {} with pattern {}. No undo.",
+                                    "Click again to replace pattern {} with pattern {}. \
+                                     Ctrl+Z undoes it.",
                                     to + 1,
                                     from + 1
                                 ),
@@ -1976,7 +2087,7 @@ impl BitstepEditor {
                     self.write_params(pattern, lane.id, lane_data, kind, &[(step, value)]);
                 } else if button == PointerButton::Primary {
                     let draw = LevelDraw::begin(step, kind.value_at(plot, pos.y));
-                    self.param_draw = Some(ParamStroke { lane_id: lane.id, kind, draw });
+                    self.param_draw = Some(ParamStroke { lane_id: lane.id, kind, pattern, draw });
                 }
             }
             if response.dragged_by(PointerButton::Primary) || response.drag_started() {
@@ -1985,6 +2096,7 @@ impl BitstepEditor {
                     && let Some(step) = step_under(pos)
                     && let Some(stroke) = self.param_draw.as_mut()
                     && stroke.lane_id == lane.id
+                    && stroke.pattern == pattern
                 {
                     let kind = stroke.kind;
                     let value = kind.value_at(plot, pos.y);
@@ -2107,6 +2219,56 @@ impl BitstepEditor {
         }
     }
 
+    /// Undo and redo from the keyboard, and the commit that makes everything
+    /// edited since the last quiet frame one undo step
+    /// ([`SeqModel::commit_edits`]).
+    ///
+    /// A frame is quiet when no button is down and no gesture or text field
+    /// is open: a paint drag, a length drag or a typed name is one step
+    /// however many writes it made. While a text field has the keyboard,
+    /// Ctrl+Z is left to it — egui's text fields have an undo of their own.
+    fn handle_history(&mut self, ui: &egui::Ui) {
+        if ui.ctx().text_edit_focused() {
+            return;
+        }
+        let (mut undo, mut redo) = (0, 0);
+        ui.input_mut(|input| {
+            input.events.retain(|event| {
+                let egui::Event::Key { key, pressed, modifiers, .. } = event else {
+                    return true;
+                };
+                let Some(action) = keys::history_key(*key, *modifiers) else {
+                    return true;
+                };
+                // Repeats count, so a held Ctrl+Z walks back; the release is
+                // swallowed with the press so the host never sees half a key.
+                match (action, *pressed) {
+                    (keys::HistoryKey::Undo, true) => undo += 1,
+                    (keys::HistoryKey::Redo, true) => redo += 1,
+                    (_, false) => {}
+                }
+                false
+            });
+        });
+
+        let busy = ui.input(|input| input.pointer.any_down())
+            || self.gesture.is_some()
+            || self.lane_drag.is_some()
+            || self.param_draw.is_some();
+        if busy {
+            // Mid-gesture the shortcut is dropped: undoing under a drag would
+            // have the drag's next write land on the restored sequence.
+            return;
+        }
+        self.model.commit_edits();
+        for _ in 0..undo {
+            self.model.undo();
+        }
+        for _ in 0..redo {
+            self.model.redo();
+        }
+    }
+
     /// Passes Space and shortcut keys on to the host's window ([`keys`]),
     /// and takes them out of this frame's input so no widget acts on them
     /// too. Not while a text field is being typed in.
@@ -2186,6 +2348,30 @@ impl BitstepEditor {
                 "Song mode: play patterns in the order you type, one per bar, \
                  following Bitwig's timeline",
             );
+        }
+
+        let history = [
+            ("Undo", "Undo the last edit (Ctrl+Z)", self.model.can_undo()),
+            ("Redo", "Redo the edit just undone (Ctrl+Shift+Z)", self.model.can_redo()),
+        ];
+        for (index, (label, hover, enabled)) in history.into_iter().enumerate() {
+            let slot = layout.history_button(index);
+            if !slot.is_positive() {
+                continue;
+            }
+            // `ui.put`'s own scope, so the button can be greyed out when
+            // there is nothing to step to.
+            let scope = UiBuilder::new()
+                .max_rect(slot)
+                .layout(Layout::centered_and_justified(egui::Direction::TopDown));
+            let button = ui.scope_builder(scope, |ui| ui.add_enabled(enabled, Button::new(label)));
+            let button = button.inner.on_hover_text(hover);
+            if button.clicked() {
+                match index {
+                    0 => self.model.undo(),
+                    _ => self.model.redo(),
+                };
+            }
         }
 
         for (index, mode) in EditMode::ALL.into_iter().enumerate() {
@@ -2402,13 +2588,11 @@ fn new_lane_fields(data: &SeqData) -> (String, u32, u8, u8) {
 /// `move_lane`, which [`LaneReorder::enter`] is what keeps down to one per row
 /// rather than one per frame.
 ///
-/// Moving as it goes is what makes a cancel necessary: `Escape` puts the lane
-/// back where the press found it, which is the only way back from a reorder
-/// the user did not mean, since the plugin has no undo.
+/// Moving as it goes is what makes a cancel worth having: `Escape` puts the
+/// lane back where the press found it, without leaving the gesture.
 fn reorder_lane(
     ui: &egui::Ui,
     handle: &egui::Response,
-    model: &SeqModel,
     held: &mut Option<LaneDrag>,
     lane: &Lane,
     place: HeaderPlace,
@@ -2428,52 +2612,45 @@ fn reorder_lane(
             .input(|input| input.pointer.press_origin())
             .or_else(|| handle.interact_pointer_pos())
             .map_or(place.band.center().y, |pos| pos.y);
-        let drag = LaneReorder::begin(place.row, origin_y, place.pitch);
+        let drag = LaneReorder::begin(place.row, origin_y - place.content_top, place.pitch);
         *held = Some(LaneDrag { lane_id: lane.id, drag });
     }
+    // The rest of the gesture — following the pointer, the drop, Escape — is
+    // [`BitstepEditor::continue_lane_drag`]'s, once a frame.
+    held.as_ref().is_some_and(|held| held.lane_id == lane.id)
+}
 
-    // Every visible row runs this; the gesture belongs to one of them.
-    if !held.as_ref().is_some_and(|held| held.lane_id == lane.id) {
-        return false;
-    }
+/// Puts a whole-number drag value in `rect`, as `ui.put` would, and hands
+/// back with its response how many steps the arrow keys asked for this
+/// frame ([`arrow_steps`]).
+fn put_stepped(ui: &mut egui::Ui, rect: Rect, drag: DragValue<'_>) -> (egui::Response, i32) {
+    let scope = UiBuilder::new()
+        .max_rect(rect)
+        .layout(Layout::centered_and_justified(egui::Direction::TopDown));
+    ui.scope_builder(scope, |ui| {
+        // The id the drag value is about to take: it asks for the next auto
+        // id before anything else.
+        let steps = arrow_steps(ui, ui.next_auto_id());
+        (ui.add(drag), steps)
+    })
+    .inner
+}
 
-    // Escape cancels, putting the lane back on the row it was picked up
-    // from. Checked before the drag is looked at, because egui ends the drag
-    // on Escape too: by the time `dragged_by` is false the key is the only
-    // thing left saying whether the gesture was finished or abandoned.
-    //
-    // Cancelling matters more here than in the step gestures. A reorder is a
-    // shape edit the user cannot undo — nothing in the plugin can, an open
-    // question for now — so without this, a drag begun by accident could only
-    // be put right by dragging the lane back by hand and counting rows.
-    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-        if let Some(held) = held.as_ref()
-            && held.drag.target() != held.drag.from()
-        {
-            model.move_lane(lane.id, held.drag.from());
-        }
-        *held = None;
-        return false;
+/// Up and Down while the drag value with `id` is being typed in: +1 per Up,
+/// −1 per Down, taken out of the input so the field does not see them.
+///
+/// egui's own handling adds the drag `speed` per press — a fraction of a
+/// step for every field here — and the whole-number setters round that
+/// straight back, so the keys did nothing at all.
+fn arrow_steps(ui: &egui::Ui, id: egui::Id) -> i32 {
+    if !ui.memory(|memory| memory.has_focus(id)) {
+        return 0;
     }
-
-    if !handle.dragged_by(PointerButton::Primary) {
-        // Button up, pointer gone from the window, Escape — every way a drag
-        // can end leaves `dragged_by` false, as in [`BitstepEditor::
-        // interact_steps`], so this is where it is finished. The lane is
-        // already where it was dropped.
-        *held = None;
-        return false;
-    }
-
-    if let Some(pos) = handle.interact_pointer_pos()
-        && let Some(held) = held.as_mut()
-        && let Some(target) = held.drag.enter(pos.y, place.rows)
-    {
-        // A refusal means the lane has gone (a state load mid-drag), which
-        // the next frame stops drawing a handle for at all.
-        model.move_lane(lane.id, target);
-    }
-    true
+    ui.input_mut(|input| {
+        let up = input.count_and_consume_key(Modifiers::NONE, egui::Key::ArrowUp);
+        let down = input.count_and_consume_key(Modifiers::NONE, egui::Key::ArrowDown);
+        up as i32 - down as i32
+    })
 }
 
 /// The lane a context menu is for, and what it needs to know about it.
@@ -2575,6 +2752,8 @@ fn lane_menu(
         // ([`grid_math::channel_widget`]).
         ui.horizontal(|ui| {
             ui.label("channel");
+            let id = ui.next_auto_id();
+            let steps = arrow_steps(ui, id);
             ui.add(
                 DragValue::from_get_set(|value| {
                     if let Some(value) = value {
@@ -2586,6 +2765,10 @@ fn lane_menu(
                 .fixed_decimals(0)
                 .range(1..=i64::from(Lane::CHANNEL_MAX) + 1),
             );
+            if steps != 0 {
+                let wanted = grid_math::channel_widget(lane.channel()) + f64::from(steps);
+                model.set_channel(lane.id, grid_math::widget_channel(wanted));
+            }
         });
 
         // Retunes the lane for a keytracked sample left at its default root,
@@ -2635,7 +2818,7 @@ fn lane_menu(
             model.randomise_lane(pattern, lane.id, RANDOMISE_DENSITY, rng);
             ui.close();
         }
-        roll.on_hover_text("Rolls every step of this lane in the pattern on screen. No undo.");
+        roll.on_hover_text("Rolls every step of this lane in the pattern on screen.");
         ui.horizontal(|ui| {
             ui.label("nudge");
             if ui.button("-1").clicked() {
@@ -2985,8 +3168,10 @@ impl NiceEguiApp for BitstepEditor {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame) {
         // Before anything that could early-return: a frame that forgets this
         // is the last frame, and the playhead freezes.
-        ui.ctx().request_repaint_after(REPAINT_INTERVAL);
-        // Before any widget looks at this frame's keys.
+        self.repaint.request_repaint();
+        // Before any widget looks at this frame's keys, and undo before the
+        // forwarding, which would hand Ctrl+Z to the host.
+        self.handle_history(ui);
         self.forward_host_keys(ui, frame);
 
         // One `get()` per frame, as on the audio thread — the shape must not
@@ -3042,6 +3227,8 @@ impl NiceEguiApp for BitstepEditor {
 
     /// Window closed. The handles stay — the next open gets a fresh context.
     fn editor_closed(&mut self) {
+        // The last gesture of the session is a step like any other.
+        self.model.commit_edits();
         self.gui_context = None;
         // The next window is a new X window with a parent of its own.
         self.key_forwarder = None;
@@ -3072,7 +3259,9 @@ pub fn create(
         .with_resize_hint(ResizeHint::RESIZABLE.with_min_logical_size(MIN_SIZE))
         .with_repaint_poll_interval(REPAINT_INTERVAL);
 
-    create_egui_editor(state, notifier, settings, BitstepEditor::new(params, model, playhead))
+    let mut app = BitstepEditor::new(params, model, playhead);
+    app.repaint = notifier.clone();
+    create_egui_editor(state, notifier, settings, app)
 }
 
 /// The window state a fresh plugin instance starts with.
@@ -3338,6 +3527,7 @@ mod tests {
         // The root `Ui`, which is the window — the same thing
         // nice-plug-egui hands `NiceEguiApp::ui`.
         let mut output = ctx.run_ui(input, |ui| {
+            app.handle_history(ui);
             let layout = test_layout(app, ui.max_rect());
             let view = app.settle_scroll(&layout, &data, pattern);
             if data.lane_count() == 0 {
@@ -3498,6 +3688,130 @@ mod tests {
         run_frame(app, ctx, vec![button(false)]);
     }
 
+    /// A frame of the step strip alone, with the pattern on screen given
+    /// explicitly — what automation moving `patsel` between frames looks
+    /// like to [`BitstepEditor::interact_steps`].
+    fn grid_frame(
+        app: &mut BitstepEditor,
+        ctx: &egui::Context,
+        pattern: usize,
+        events: Vec<egui::Event>,
+    ) {
+        let data = app.model.shared();
+        let input =
+            egui::RawInput { screen_rect: Some(test_window()), events, ..Default::default() };
+        let mut output = ctx.run_ui(input, |ui| {
+            let layout = test_layout(app, ui.max_rect());
+            let view = app.settle_scroll(&layout, &data, pattern);
+            app.interact_steps(ui, &view, &data, pattern);
+        });
+        output.textures_delta.clear();
+        drop(data);
+        app.model.collect();
+    }
+
+    /// A paint drag keeps to the pattern it started in: when the pattern on
+    /// screen changes under it, it pauses, and it carries on when its own
+    /// pattern is back.
+    #[test]
+    fn a_paint_drag_stays_in_the_pattern_it_started_in() {
+        let model = Arc::new(SeqModel::new(state::default_data()));
+        let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
+        let mut app = BitstepEditor::new(params, Arc::clone(&model), Arc::new(Playhead::new()));
+        app.follow = false;
+        let ctx = egui::Context::default();
+        let layout = test_layout(&app, test_window());
+        let view = layout.grid_view(CellMetrics::from_theme(), Vec2::ZERO);
+        let row = 1;
+        let on = |pattern: usize, index: usize| {
+            model.shared().lane_data(pattern, row).expect("lane 1").step(index).is_on()
+        };
+        let at = |index: usize| view.cell_rect(row, index).center();
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+
+        grid_frame(&mut app, &ctx, 0, vec![egui::Event::PointerMoved(at(2))]);
+        grid_frame(&mut app, &ctx, 0, vec![egui::Event::PointerMoved(at(2)), button(at(2), true)]);
+        assert!(on(0, 2), "the press painted its cell");
+
+        // Pattern 2 comes on screen mid-drag: the drag paints nowhere.
+        grid_frame(&mut app, &ctx, 1, vec![egui::Event::PointerMoved(at(5))]);
+        assert!((3..=5).all(|index| !on(0, index) && !on(1, index)));
+
+        // Its own pattern back: the run is painted from where it left off.
+        grid_frame(&mut app, &ctx, 0, vec![egui::Event::PointerMoved(at(6))]);
+        grid_frame(&mut app, &ctx, 0, vec![button(at(6), false)]);
+        assert!((2..=6).all(|index| on(0, index)), "pattern 1 got the whole run");
+        assert!((0..16).all(|index| !on(1, index)), "pattern 2 got nothing");
+    }
+
+    /// One press of `key` held with `modifiers`, as a frame of its own.
+    fn press_key(
+        app: &mut BitstepEditor,
+        ctx: &egui::Context,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+    ) {
+        let event = |pressed| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        };
+        run_frame(app, ctx, vec![event(true), event(false)]);
+    }
+
+    /// Undo and redo through real frames: an edit becomes a step once a
+    /// quiet frame has passed, Ctrl+Z and Ctrl+Shift+Z walk it back and
+    /// forth, the Undo button does what Ctrl+Z does, and a shortcut pressed
+    /// with a button held down is dropped rather than undoing under a drag.
+    #[test]
+    fn ctrl_z_and_the_undo_button_step_through_edits() {
+        let model = Arc::new(SeqModel::new(state::default_data()));
+        let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
+        let mut app = BitstepEditor::new(params, Arc::clone(&model), Arc::new(Playhead::new()));
+        let ctx = egui::Context::default();
+        let lane_id = model.shared().lane(0).expect("default lanes").id;
+        let on = |index: usize| model.shared().lane_data(0, 0).expect("lane 0").step(index).is_on();
+        let ctrl = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
+        let before = on(3);
+
+        run_frame(&mut app, &ctx, Vec::new());
+        assert!(!app.model.can_undo(), "opening the editor is not an edit");
+        assert!(model.toggle_step(0, lane_id, 3));
+        run_frame(&mut app, &ctx, Vec::new());
+        assert!(app.model.can_undo(), "a quiet frame made the edit a step");
+
+        press_key(&mut app, &ctx, egui::Key::Z, ctrl);
+        assert_eq!(on(3), before, "Ctrl+Z undid it");
+        press_key(&mut app, &ctx, egui::Key::Z, ctrl | egui::Modifiers::SHIFT);
+        assert_eq!(on(3), !before, "Ctrl+Shift+Z redid it");
+
+        // The top bar's button, clicked.
+        let layout = test_layout(&app, test_window());
+        click_at(&mut app, &ctx, layout.history_button(0).center());
+        assert_eq!(on(3), before, "the Undo button undid it");
+        click_at(&mut app, &ctx, layout.history_button(1).center());
+        assert_eq!(on(3), !before, "and Redo redid it");
+
+        // With a button down somewhere, the shortcut is dropped.
+        let away = layout.status_line().center();
+        let press = egui::Event::PointerButton {
+            pos: away,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        };
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(away), press]);
+        press_key(&mut app, &ctx, egui::Key::Z, ctrl);
+        assert_eq!(on(3), !before, "nothing was undone mid-gesture");
+    }
+
     /// A pointer drag from `from` to `to`, as the four frames egui needs:
     /// the widget, the press, the move it calls a drag, and the release.
     fn drag_between(app: &mut BitstepEditor, ctx: &egui::Context, from: Pos2, to: Pos2) {
@@ -3632,6 +3946,45 @@ mod tests {
         assert!(length() >= LengthEdit::MIN, "a lane always has a step to play");
 
         model.collect();
+    }
+
+    /// Up and Down step the key and length fields by one while they are
+    /// being typed in — egui's own handling stepped by a fraction that the
+    /// whole-number fields rounded away.
+    #[test]
+    fn arrow_keys_step_the_key_and_length_fields() {
+        let model = Arc::new(SeqModel::new(state::default_data()));
+        let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
+        let mut app = BitstepEditor::new(params, Arc::clone(&model), Arc::new(Playhead::new()));
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+
+        let (pattern, row) = (0usize, 1usize);
+        let key = || model.shared().lane(row).expect("lane 1 exists").key();
+        let length = || model.shared().lane_data(pattern, row).expect("lane 1").length();
+        let fields = test_header_fields(row);
+        let none = egui::Modifiers::NONE;
+
+        // A click puts the field into typing; the arrows step it.
+        click_at(&mut app, &ctx, fields.key.center());
+        // A frame for the field to draw itself as a text field and claim the
+        // arrows, as there always is between a click and a key by hand.
+        run_frame(&mut app, &ctx, Vec::new());
+        press_key(&mut app, &ctx, egui::Key::ArrowUp, none);
+        press_key(&mut app, &ctx, egui::Key::ArrowUp, none);
+        assert_eq!(key(), 39, "two up from C#1");
+        press_key(&mut app, &ctx, egui::Key::ArrowDown, none);
+        assert_eq!(key(), 38);
+
+        // The length past the lane's capacity grows the lane.
+        click_at(&mut app, &ctx, fields.length.center());
+        run_frame(&mut app, &ctx, Vec::new());
+        press_key(&mut app, &ctx, egui::Key::ArrowUp, none);
+        assert_eq!(length(), 17, "one up from 16, past the first chunk");
+        press_key(&mut app, &ctx, egui::Key::ArrowDown, none);
+        press_key(&mut app, &ctx, egui::Key::ArrowDown, none);
+        assert_eq!(length(), 15);
+        assert_eq!(key(), 38, "the key field no longer has the keys");
     }
 
     /// Dragging the handle after a lane's last step edits its loop length,
@@ -4060,13 +4413,63 @@ mod tests {
         model.collect();
     }
 
+    /// A lane dragged past the bottom of the lane list scrolls the list and
+    /// keeps going, and the drag is still alive afterwards: it can come back
+    /// up, and the release still ends it.
+    #[test]
+    fn a_lane_dragged_past_the_bottom_scrolls_the_list_and_keeps_going() {
+        let model = Arc::new(SeqModel::new(state::default_data()));
+        for _ in 0..32 {
+            model.add_lane("Extra", 0, 40, 0).expect("lane added");
+        }
+        let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
+        let mut app = BitstepEditor::new(params, Arc::clone(&model), Arc::new(Playhead::new()));
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+
+        let kick = model.shared().lane(0).expect("lane 0").id;
+        let lanes = model.shared().lane_count();
+        let layout = test_layout(&app, test_window());
+        let headers = layout.headers();
+        let visible = (headers.height() / CellMetrics::from_theme().row_pitch()) as usize;
+        assert!(visible < lanes, "the list is longer than the window");
+
+        let grip = test_header_fields(0).handle().center();
+        let below = Pos2::new(grip.x, headers.max.y + 40.0);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(grip)]);
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(grip), button(grip, true)]);
+        // Held below the list: every frame scrolls it a little further, and
+        // the lane rides along to rows that were never on screen.
+        for _ in 0..120 {
+            run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(below)]);
+        }
+        assert!(app.scroll.y > 0.0, "the list scrolled");
+        assert_eq!(model.shared().position_of(kick), Some(lanes - 1), "it reached the end");
+        assert!(app.lane_drag.is_some(), "and the drag is still held");
+
+        // Back up into the middle of the column: the lane comes with it.
+        let middle = Pos2::new(grip.x, headers.center().y);
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(middle)]);
+        let row = model.shared().position_of(kick).expect("lane");
+        assert!(row < lanes - 1, "the drag still follows the pointer");
+        run_frame(&mut app, &ctx, vec![button(middle, false)]);
+        run_frame(&mut app, &ctx, Vec::new());
+        assert!(app.lane_drag.is_none(), "the release ended it");
+        assert_eq!(model.shared().position_of(kick), Some(row), "where it was dropped");
+    }
+
     /// `Escape` in the middle of a reorder puts the lane back on the row it
     /// was picked up from ([`reorder_lane`]).
     ///
-    /// The cancel is the only way back from a reorder — the plugin has no
-    /// undo — so this covers that the lane really does return, that the
-    /// gesture is over afterwards, and that the release which follows the
-    /// cancel does not move it a second time.
+    /// This covers that the lane really does return, that the gesture is
+    /// over afterwards, and that the release which follows the cancel does
+    /// not move it a second time.
     #[test]
     fn escape_cancels_a_lane_reorder() {
         let model = Arc::new(SeqModel::new(state::default_data()));

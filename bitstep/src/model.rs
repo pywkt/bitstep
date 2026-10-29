@@ -11,6 +11,7 @@ use basedrop::{Collector, Handle, Shared, SharedCell};
 
 use crate::sequencer::{Prng, Rate};
 use crate::state::SeqSnapshot;
+use crate::undo::History;
 
 /// One step of one lane, packed into a single `u32` so a step lives in one
 /// `AtomicU32` and the audio thread can read it with a relaxed load.
@@ -996,6 +997,13 @@ pub struct SeqModel {
     /// out in `Drop` to be cleaned up, hence the `Option`.
     collector: Mutex<Option<Collector>>,
     next_lane_id: AtomicU32,
+    /// Bumped by every write (see [`SeqModel::edit_lock`]), so the undo
+    /// history can tell whether anything changed without snapshotting.
+    edits: AtomicU64,
+    /// Undo and redo, as whole-sequence snapshots. GUI and host-load side
+    /// only; the audio thread never takes it. Always locked *before* the
+    /// writer mutex, never while holding it.
+    history: Mutex<History<SeqSnapshot>>,
 }
 
 impl SeqModel {
@@ -1014,6 +1022,8 @@ impl SeqModel {
             writer: Mutex::new(()),
             collector: Mutex::new(Some(collector)),
             next_lane_id: AtomicU32::new(next_lane_id),
+            edits: AtomicU64::new(0),
+            history: Mutex::new(History::new()),
         }
     }
 
@@ -1140,13 +1150,13 @@ impl SeqModel {
 
     /// Turns song mode on or off.
     pub fn set_song_on(&self, on: bool) {
-        let _writer = self.writer_lock();
+        let _writer = self.edit_lock();
         self.cell.get().song.set_on(on);
     }
 
     /// Chooses whether the song starts again after its last entry.
     pub fn set_song_looped(&self, looped: bool) {
-        let _writer = self.writer_lock();
+        let _writer = self.edit_lock();
         self.cell.get().song.set_looped(looped);
     }
 
@@ -1300,7 +1310,7 @@ impl SeqModel {
     /// Returns `false` only if the pattern or lane does not exist.
     pub fn ensure_capacity(&self, pattern: usize, lane_id: u32, steps: usize) -> bool {
         let wanted = steps.clamp(1, MAX_STEPS);
-        let _writer = self.writer_lock();
+        let _writer = self.edit_lock();
         // Scoped so this method's reference to the current data is gone before
         // the replacement is published: while it lives, the retired copy's
         // reference count never reaches zero and `collect()` cannot reclaim it.
@@ -1349,18 +1359,110 @@ impl SeqModel {
     /// edit either lands on the outgoing data (and is discarded with it — the
     /// load wins, as the user asked) or waits and lands on the loaded data.
     /// Never half on each.
+    ///
+    /// The undo history is cleared: what the host loaded is a new starting
+    /// point, not an edit to step back out of.
     pub fn load_snapshot(&self, snapshot: SeqSnapshot) {
         // Built before the lock is taken: it allocates, and nothing in it
         // touches the published data.
         let data = snapshot.into_data();
+        let mut history = self.history_lock();
+        self.install(data);
+        history.clear();
+    }
+
+    /// Publishes a whole replacement sequence: the shared half of a host load
+    /// and an undo.
+    fn install(&self, data: SeqData) {
         let resume = data.max_lane_id().map_or(FIRST_LANE_ID, |id| id.saturating_add(1));
-        let _writer = self.writer_lock();
+        let _writer = self.edit_lock();
         // `fetch_max`, not `store`: ids are never reused within a session, so
         // a snapshot carrying lower ids than this instance has already handed
         // out must not let the next lane take an id some GUI state still
         // means by an older lane.
         self.next_lane_id.fetch_max(resume, Relaxed);
         self.publish(data);
+    }
+
+    // ---- undo and redo ----
+    //
+    // Every write bumps `edits`; the editor calls `commit_edits` whenever the
+    // user is between gestures, and whatever changed since the last commit
+    // becomes one undo step (see `crate::undo`). Mute and solo are left out:
+    // they are switched while playing, and undoing a step edit must not
+    // un-mute a lane. They are blanked in every stored state and kept as they
+    // are on a restore.
+
+    /// Records the edits made since the last call as one undo step. Cheap
+    /// when nothing changed (one atomic load); a snapshot otherwise. GUI
+    /// thread, between gestures.
+    pub fn commit_edits(&self) {
+        let mut history = self.history_lock();
+        self.commit_into(&mut history);
+    }
+
+    /// Steps back one undo step. `false` if there was nothing to undo.
+    pub fn undo(&self) -> bool {
+        self.step_history(History::undo)
+    }
+
+    /// Steps forward again after an undo. `false` if there was nothing to
+    /// redo.
+    pub fn redo(&self) -> bool {
+        self.step_history(History::redo)
+    }
+
+    /// Whether [`SeqModel::undo`] has anything to do, as of the last commit.
+    pub fn can_undo(&self) -> bool {
+        self.history_lock().can_undo()
+    }
+
+    /// Whether [`SeqModel::redo`] has anything to do.
+    pub fn can_redo(&self) -> bool {
+        self.history_lock().can_redo()
+    }
+
+    fn commit_into(&self, history: &mut History<SeqSnapshot>) {
+        history.commit(self.edits.load(Relaxed), || self.history_snapshot());
+    }
+
+    fn step_history(
+        &self,
+        step: impl FnOnce(&mut History<SeqSnapshot>) -> Option<SeqSnapshot>,
+    ) -> bool {
+        let mut history = self.history_lock();
+        self.commit_into(&mut history);
+        let Some(target) = step(&mut history) else {
+            return false;
+        };
+        self.restore(target);
+        history.rebase(self.edits.load(Relaxed));
+        true
+    }
+
+    /// The sequence as the history stores it: mute and solo blanked, so
+    /// switching them is never an undo step.
+    fn history_snapshot(&self) -> SeqSnapshot {
+        let mut snapshot = self.snapshot();
+        for lane in &mut snapshot.lanes {
+            lane.mute = false;
+            lane.solo = false;
+        }
+        snapshot
+    }
+
+    /// Puts a stored state back, keeping each lane's current mute and solo.
+    fn restore(&self, mut snapshot: SeqSnapshot) {
+        {
+            let current = self.cell.get();
+            for lane in &mut snapshot.lanes {
+                if let Some(live) = current.position_of(lane.id).and_then(|pos| current.lane(pos)) {
+                    lane.mute = live.is_muted();
+                    lane.solo = live.is_soloed();
+                }
+            }
+        }
+        self.install(snapshot.into_data());
     }
 
     // ---- bulk ops: value edits over one lane's steps in one pattern ----
@@ -1471,6 +1573,19 @@ impl SeqModel {
         self.writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// The writer lock for a write: counts the edit for the undo history. A
+    /// write that turns out to change nothing still counts, which costs one
+    /// snapshot at the next commit and records no step.
+    fn edit_lock(&self) -> MutexGuard<'_, ()> {
+        let guard = self.writer_lock();
+        self.edits.fetch_add(1, Relaxed);
+        guard
+    }
+
+    fn history_lock(&self) -> MutexGuard<'_, History<SeqSnapshot>> {
+        self.history.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn collector_lock(&self) -> MutexGuard<'_, Option<Collector>> {
         self.collector.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -1481,7 +1596,7 @@ impl SeqModel {
 
     /// Runs a value edit on one lane's settings with the writer lock held.
     fn with_lane(&self, lane_id: u32, f: impl FnOnce(&Lane)) -> bool {
-        let _writer = self.writer_lock();
+        let _writer = self.edit_lock();
         let data = self.cell.get();
         match data.position_of(lane_id).and_then(|pos| data.lane(pos)) {
             Some(lane) => {
@@ -1500,7 +1615,7 @@ impl SeqModel {
         lane_id: u32,
         f: impl FnOnce(&LaneData) -> bool,
     ) -> bool {
-        let _writer = self.writer_lock();
+        let _writer = self.edit_lock();
         let data = self.cell.get();
         match data.position_of(lane_id).and_then(|pos| data.lane_data(pattern, pos)) {
             Some(lane_data) => f(lane_data),
@@ -1513,7 +1628,7 @@ impl SeqModel {
     /// the copy; returning `None` abandons the edit, leaving the old data
     /// published and nothing allocated for the collector.
     fn shape_edit<R>(&self, f: impl FnOnce(&mut SeqData) -> Option<R>) -> Option<R> {
-        let _writer = self.writer_lock();
+        let _writer = self.edit_lock();
         let mut next = (*self.cell.get()).clone();
         let result = f(&mut next)?;
         self.publish(next);
@@ -3383,6 +3498,162 @@ mod tests {
 
         stop.store(true, Relaxed);
         reader.join().expect("the reader never saw misaligned data");
+    }
+
+    // ---- undo and redo ----
+
+    /// A model with one lane and a committed starting point, the way the
+    /// editor leaves it after its first frame.
+    fn committed_model() -> (SeqModel, u32) {
+        let model = SeqModel::empty();
+        let id = model.add_lane("Kick", 0x10_20_30, 36, 0).expect("lane added");
+        model.commit_edits();
+        (model, id)
+    }
+
+    fn step_on(model: &SeqModel, pattern: usize, lane_id: u32, index: usize) -> bool {
+        let data = model.shared();
+        let pos = data.position_of(lane_id).expect("lane");
+        data.lane_data(pattern, pos).expect("pattern").step(index).is_on()
+    }
+
+    #[test]
+    fn undo_and_redo_step_through_committed_edits() {
+        let (model, id) = committed_model();
+        assert!(!model.can_undo());
+
+        // One gesture: three cells painted, then the button comes up.
+        for index in 0..3 {
+            assert!(model.toggle_step(0, id, index));
+        }
+        model.commit_edits();
+        assert!(model.set_key(id, 40));
+        model.commit_edits();
+        assert!(model.can_undo() && !model.can_redo());
+
+        assert!(model.undo());
+        assert_eq!(model.shared().lane(0).expect("lane").key(), 36, "the key came back");
+        assert!(step_on(&model, 0, id, 2), "the steps are a step further back");
+        assert!(model.undo());
+        assert!((0..3).all(|index| !step_on(&model, 0, id, index)), "the paint came back as one");
+        assert!(!model.undo(), "nothing before the starting point");
+
+        assert!(model.redo());
+        assert!((0..3).all(|index| step_on(&model, 0, id, index)));
+        assert!(model.redo());
+        assert_eq!(model.shared().lane(0).expect("lane").key(), 40);
+        assert!(!model.redo());
+    }
+
+    #[test]
+    fn undo_puts_a_deleted_lane_back_with_its_id_and_steps() {
+        let (model, id) = committed_model();
+        assert!(model.toggle_step(5, id, 7));
+        model.commit_edits();
+        assert!(model.remove_lane(id));
+        model.commit_edits();
+        assert_eq!(model.shared().lane_count(), 0);
+
+        assert!(model.undo());
+        assert_eq!(model.shared().lane(0).map(|lane| lane.id), Some(id));
+        assert!(step_on(&model, 5, id, 7), "its steps in another pattern too");
+
+        // A lane added now must not reuse an id the redo would bring back.
+        assert!(model.redo());
+        let fresh = model.add_lane("Snare", 0, 38, 0).expect("lane added");
+        assert_ne!(fresh, id);
+    }
+
+    #[test]
+    fn undo_covers_the_song_and_pattern_copies() {
+        let (model, id) = committed_model();
+        assert!(model.toggle_step(0, id, 0));
+        model.commit_edits();
+        assert!(model.copy_pattern(0, 3));
+        model.commit_edits();
+        model.set_song_on(true);
+        assert!(model.set_song("1-4").is_ok());
+        model.commit_edits();
+
+        assert!(model.undo());
+        assert!(!model.shared().song.is_on(), "song switch and text were one step");
+        assert!(step_on(&model, 3, id, 0));
+        assert!(model.undo());
+        assert!(!step_on(&model, 3, id, 0), "the copy is undone");
+        assert!(step_on(&model, 0, id, 0), "but not the edit before it");
+    }
+
+    #[test]
+    fn mute_and_solo_are_not_undo_steps_and_survive_an_undo() {
+        let (model, id) = committed_model();
+        assert!(model.set_mute(id, true));
+        model.commit_edits();
+        assert!(!model.can_undo(), "muting is not an edit to undo");
+
+        assert!(model.toggle_step(0, id, 0));
+        model.commit_edits();
+        assert!(model.set_solo(id, true));
+        model.commit_edits();
+        assert!(model.undo());
+        let data = model.shared();
+        let lane = data.lane(0).expect("lane");
+        assert!(!step_on(&model, 0, id, 0), "the step edit was undone");
+        assert!(lane.is_muted() && lane.is_soloed(), "mute and solo stayed as they are");
+    }
+
+    #[test]
+    fn an_edit_after_undo_clears_redo() {
+        let (model, id) = committed_model();
+        assert!(model.toggle_step(0, id, 0));
+        model.commit_edits();
+        assert!(model.undo());
+        assert!(model.can_redo());
+        assert!(model.toggle_step(0, id, 1));
+        model.commit_edits();
+        assert!(!model.can_redo());
+        assert!(!model.redo());
+    }
+
+    #[test]
+    fn a_host_load_clears_the_history() {
+        let (model, id) = committed_model();
+        assert!(model.toggle_step(0, id, 0));
+        model.commit_edits();
+        assert!(model.can_undo());
+
+        let saved = model.snapshot();
+        model.load_snapshot(saved);
+        assert!(!model.can_undo() && !model.can_redo());
+        assert!(!model.undo(), "nothing to step back into from before the load");
+        assert!(step_on(&model, 0, id, 0));
+
+        // Editing after the load records against the loaded state.
+        model.commit_edits();
+        assert!(model.toggle_step(0, id, 0));
+        model.commit_edits();
+        assert!(model.undo());
+        assert!(step_on(&model, 0, id, 0));
+    }
+
+    #[test]
+    fn a_write_of_the_same_value_is_not_an_undo_step() {
+        let (model, id) = committed_model();
+        assert!(model.set_key(id, 36));
+        model.commit_edits();
+        assert!(!model.can_undo());
+    }
+
+    #[test]
+    fn undo_does_not_leak_the_sequences_it_replaces() {
+        let (model, id) = committed_model();
+        for index in 0..10 {
+            assert!(model.toggle_step(0, id, index));
+            model.commit_edits();
+        }
+        while model.undo() {}
+        while model.redo() {}
+        model.collect();
+        assert_eq!(model.live_allocs(), 1);
     }
 
     // ---- Playhead ----

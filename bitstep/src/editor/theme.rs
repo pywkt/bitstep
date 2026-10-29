@@ -229,6 +229,9 @@ pub const MODE_WIDTH: f32 = 52.0;
 /// Width of the song mode toggle, right after the edit-mode buttons.
 pub const SONG_WIDTH: f32 = 52.0;
 
+/// Width of each of the undo and redo buttons, right after the song toggle.
+pub const HISTORY_WIDTH: f32 = 52.0;
+
 /// Height of the song row under the top bar: a control and its padding, as
 /// the top bar is.
 pub const SONG_BAR_HEIGHT: f32 = TOP_BAR_HEIGHT;

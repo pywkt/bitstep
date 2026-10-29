@@ -20,6 +20,7 @@ and program beats on a grid, like Bitwig's Stepwise, but with:
 - **Song mode:** type the pattern order (`1-2-1-3x2`) and bitstep plays the
   patterns one after another along Bitwig's timeline, so changing a pattern
   changes the whole song without re-recording.
+- **Undo and redo** for everything you edit in bitstep (Ctrl+Z / Ctrl+Shift+Z).
 - Edit while the transport runs; everything is saved with your project.
 
 bitstep makes no sound itself, and only plays while Bitwig's transport is

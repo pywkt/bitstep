@@ -817,6 +817,32 @@ pub fn drag_rows(from: usize, dy: f32, pitch: f32, rows: usize) -> usize {
     wanted.max(0.0).min(last as f64) as usize
 }
 
+/// How far to scroll the lane list this frame while a lane is dragged with
+/// the pointer at screen `y`, over a column running from `top` to `bottom`.
+///
+/// Nothing while the pointer is clear of the edges; within `band` of one, or
+/// past it, the list scrolls that way, faster the further in the pointer is,
+/// up to `max` points a frame. Negative scrolls up. A column too short for two
+/// bands shrinks them to half its height each, so the middle never scrolls.
+pub fn edge_scroll(y: f32, top: f32, bottom: f32, band: f32, max: f32) -> f32 {
+    if ![y, top, bottom, band, max].iter().all(|v| v.is_finite()) || bottom <= top || max <= 0.0 {
+        return 0.0;
+    }
+    let band = band.min((bottom - top) * 0.5);
+    if band <= 0.0 {
+        return 0.0;
+    }
+    let into = if y < top + band {
+        y - (top + band)
+    } else if y > bottom - band {
+        y - (bottom - band)
+    } else {
+        return 0.0;
+    };
+    // At the edge itself this is half speed; a band past it, full speed.
+    (into / band * max * 0.5).clamp(-max, max)
+}
+
 /// A lane-reorder gesture in progress: the row the press picked up, and the
 /// pointer position it is measured from — the header's drag handle is how
 /// lanes are reordered.
@@ -829,9 +855,11 @@ pub fn drag_rows(from: usize, dy: f32, pitch: f32, rows: usize) -> usize {
 /// lane's current position back each frame would feed the gesture's own moves
 /// into its next result, and the row would run away down the list.
 ///
-/// Measured in screen `y`, not content `y`, like [`EndHandleDrag`]: the lane
-/// follows the hand, and a header column that scrolls mid-gesture must not
-/// reorder anything on its own.
+/// Measured in *content* `y` (screen `y` plus the vertical scroll), unlike
+/// [`EndHandleDrag`]: a lane dragged to the edge of the column scrolls the
+/// list ([`edge_scroll`]), and the lane has to travel with the content that
+/// scrolls under the hand, or it could never reach a row that was off screen
+/// when the drag began.
 #[derive(Clone, Copy, Debug)]
 pub struct LaneReorder {
     from: usize,
@@ -1249,13 +1277,31 @@ impl EditorLayout {
         Rect::from_min_max(pos2(left, room.min.y), pos2(right, room.max.y))
     }
 
-    /// What is left of [`Self::bar_status`] after the edit-mode buttons and
-    /// the song toggle — where the instance's status line is drawn.
+    /// The undo (0) and redo (1) buttons: right after the song toggle.
+    /// Empty when there is no room, like a squeezed mode button.
+    pub fn history_button(&self, index: usize) -> Rect {
+        let room = self.bar_status();
+        let left = room.min.x
+            + MODE_BUTTONS as f32 * (theme::MODE_WIDTH + theme::ITEM_SPACING)
+            + theme::SONG_WIDTH
+            + theme::ITEM_SPACING
+            + index as f32 * (theme::HISTORY_WIDTH + theme::ITEM_SPACING);
+        let right = (left + theme::HISTORY_WIDTH).min(room.max.x);
+        if index >= HISTORY_BUTTONS || right <= left {
+            return Rect::from_min_max(room.min, room.min);
+        }
+        Rect::from_min_max(pos2(left, room.min.y), pos2(right, room.max.y))
+    }
+
+    /// What is left of [`Self::bar_status`] after the edit-mode buttons, the
+    /// song toggle and the undo/redo pair — where the instance's status line
+    /// is drawn.
     pub fn status_line(&self) -> Rect {
         let room = self.bar_status();
         let used = MODE_BUTTONS as f32 * (theme::MODE_WIDTH + theme::ITEM_SPACING)
             + theme::SONG_WIDTH
-            + theme::ITEM_SPACING;
+            + theme::ITEM_SPACING
+            + HISTORY_BUTTONS as f32 * (theme::HISTORY_WIDTH + theme::ITEM_SPACING);
         let start = (room.min.x + used).min(room.max.x);
         Rect::from_min_max(pos2(start, room.min.y), room.max)
     }
@@ -1275,6 +1321,9 @@ impl EditorLayout {
 
 /// How many edit-mode buttons the top bar has: steps and pitch.
 pub const MODE_BUTTONS: usize = 2;
+
+/// How many history buttons the top bar has: undo and redo.
+pub const HISTORY_BUTTONS: usize = 2;
 
 /// The most of the space under the top bar the parameter panel may take.
 pub const PANEL_MAX_SHARE: f32 = 0.5;
@@ -4364,6 +4413,41 @@ mod tests {
         assert!(pitch.min.x > steps.max.x, "in order");
         assert!(layout.status_line().min.x > pitch.max.x, "the status line follows them");
         assert!(!layout.mode_button(MODE_BUTTONS).is_positive(), "no third button");
+    }
+
+    #[test]
+    fn edge_scroll_moves_the_list_only_near_or_past_an_edge() {
+        let (top, bottom, band, max) = (100.0, 500.0, 30.0, 15.0);
+        let scroll = |y: f32| edge_scroll(y, top, bottom, band, max);
+        assert_eq!(scroll(300.0), 0.0, "the middle is still");
+        assert_eq!(scroll(top + band), 0.0, "the band's inner edge is still");
+        assert!(scroll(top + 10.0) < 0.0, "near the top scrolls up");
+        assert!(scroll(bottom - 10.0) > 0.0, "near the bottom scrolls down");
+        assert!(scroll(bottom + 5.0) > scroll(bottom - 5.0), "deeper is faster");
+        assert_eq!(scroll(bottom + 1000.0), max, "capped");
+        assert_eq!(scroll(top - 1000.0), -max);
+        assert_eq!(scroll(f32::NAN), 0.0);
+        assert_eq!(edge_scroll(120.0, 100.0, 100.0, band, max), 0.0, "no column, no scroll");
+        // A column shorter than two bands still has a still middle.
+        assert_eq!(edge_scroll(120.0, 100.0, 140.0, band, max), 0.0);
+    }
+
+    #[test]
+    fn undo_and_redo_sit_between_the_song_toggle_and_the_status_line() {
+        let layout = EditorLayout::from_theme(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 520.0)));
+        let (undo, redo) = (layout.history_button(0), layout.history_button(1));
+        assert!(undo.is_positive() && redo.is_positive());
+        assert!(undo.min.x > layout.song_button().max.x, "after the song toggle");
+        assert!(redo.min.x > undo.max.x, "in order");
+        assert!(layout.status_line().min.x > redo.max.x, "the status line follows them");
+        assert!(!layout.history_button(HISTORY_BUTTONS).is_positive(), "no third button");
+
+        // Squeezed: the buttons give way rather than spill past the bar.
+        let narrow = EditorLayout::from_theme(Rect::from_min_size(Pos2::ZERO, vec2(420.0, 300.0)));
+        for index in 0..HISTORY_BUTTONS {
+            let slot = narrow.history_button(index);
+            assert!(slot.max.x <= narrow.bar_status().max.x + 0.001, "{slot:?}");
+        }
     }
 
     /// Each parameter's value ↔ height mapping: the bottom of the plot is the

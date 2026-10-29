@@ -11,7 +11,9 @@
 //! Only transport and shortcut keys are passed on — Space, anything held with
 //! Ctrl, and F1–F12 — and never while a text field is being typed in. Keys the
 //! editor uses itself (Escape, Enter, Tab, the arrows, Delete) stay here, so a
-//! key meant for a popover cannot delete something in the host.
+//! key meant for a popover cannot delete something in the host. So do undo
+//! and redo ([`history_key`]): with the editor focused they step through
+//! bitstep's own edits, as in any plugin with an undo of its own.
 
 use egui::{Key, Modifiers};
 
@@ -25,6 +27,26 @@ const KEYSYM_SPACE: u32 = 0x20;
 
 /// The X keysym of F1; F2..F12 follow it.
 const KEYSYM_F1: u32 = 0xFFBE;
+
+/// Which way through the edit history a key steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryKey {
+    Undo,
+    Redo,
+}
+
+/// The undo/redo shortcut `key` held with `modifiers` stands for, if any:
+/// Ctrl+Z undoes, Ctrl+Shift+Z and Ctrl+Y redo. Alt+anything is left alone.
+pub fn history_key(key: Key, modifiers: Modifiers) -> Option<HistoryKey> {
+    if !modifiers.command || modifiers.alt {
+        return None;
+    }
+    match (key, modifiers.shift) {
+        (Key::Z, false) => Some(HistoryKey::Undo),
+        (Key::Z, true) | (Key::Y, false) => Some(HistoryKey::Redo),
+        _ => None,
+    }
+}
 
 /// The X keysym to pass `key` on to the host as, when it is held with
 /// `modifiers` — or `None` when the editor keeps it.
@@ -216,6 +238,19 @@ mod tests {
         }
         // Not a function key, even though the name starts with F.
         assert_eq!(forwarded_keysym(Key::F13, NONE), None);
+    }
+
+    #[test]
+    fn undo_and_redo_keys_are_recognised() {
+        // On Linux a held Ctrl arrives as both `ctrl` and `command`.
+        let ctrl = Modifiers::CTRL | Modifiers::COMMAND;
+        assert_eq!(history_key(Key::Z, ctrl), Some(HistoryKey::Undo));
+        assert_eq!(history_key(Key::Z, ctrl | Modifiers::SHIFT), Some(HistoryKey::Redo));
+        assert_eq!(history_key(Key::Y, ctrl), Some(HistoryKey::Redo));
+        assert_eq!(history_key(Key::Z, NONE), None, "plain Z is typing");
+        assert_eq!(history_key(Key::Z, ctrl | Modifiers::ALT), None);
+        assert_eq!(history_key(Key::Y, ctrl | Modifiers::SHIFT), None);
+        assert_eq!(history_key(Key::S, ctrl), None, "save still goes to the host");
     }
 
     #[test]
