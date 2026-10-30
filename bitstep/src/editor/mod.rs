@@ -101,6 +101,11 @@ const RATE_COMBO_ID: &str = "bitstep:lane-rate";
 /// control in the row.
 const LANE_HANDLE_ID: &str = "bitstep:lane-handle";
 
+/// What the in-place name field ([`NameEdit`]) salts its id with, inside its
+/// row's own [`LANE_HEADER_ID`] scope, so it keeps its focus and selection
+/// through a scroll or a reorder like every other control in the row.
+const NAME_EDIT_ID: &str = "bitstep:lane-name-edit";
+
 /// What the top bar's `+ lane` button says.
 const ADD_LANE_LABEL: &str = "+ Lane";
 
@@ -251,6 +256,9 @@ pub struct BitstepEditor {
     /// written through, so the model is still the truth — this is the
     /// keyboard's buffer, not a pending edit.
     rename: Option<LaneRename>,
+    /// The lane name being typed in place, after a double-click on the
+    /// name, or `None` when no name is being edited that way ([`NameEdit`]).
+    name_edit: Option<NameEdit>,
     /// The destructive menu item that has been clicked once and is waiting to
     /// be clicked again, or `None` when none is ([`LaneConfirm`]).
     confirm: Option<LaneConfirm>,
@@ -415,6 +423,34 @@ struct LaneDrag {
 struct LaneRename {
     lane_id: u32,
     text: String,
+}
+
+/// A lane name being typed in place: a double-click on the name swaps it
+/// for a text field holding the whole name, selected, so typing replaces it.
+///
+/// Unlike the menu's field ([`LaneRename`]), nothing is written while the
+/// user types: Enter or leaving the field (a click elsewhere, Tab, the row
+/// scrolling away) saves the name, and Escape puts the old one back — which
+/// needs the old one untouched until then. By lane id, like every gesture.
+struct NameEdit {
+    lane_id: u32,
+    text: String,
+    /// Set until the field has been drawn once: that frame gives it the
+    /// keyboard and selects the whole name.
+    opening: bool,
+    /// Whether this frame drew the field. A row scrolled out of view is not
+    /// drawn, its field loses the keyboard with it, and that counts as
+    /// leaving the field.
+    shown: bool,
+}
+
+/// How an in-place name edit ended ([`name_field`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NameEditEnd {
+    /// Enter, or the field lost the keyboard: keep what was typed.
+    Save,
+    /// Escape: keep the name the lane had.
+    Cancel,
 }
 
 /// A menu item that destroys data irreversibly, and so is clicked twice
@@ -616,6 +652,7 @@ impl BitstepEditor {
             key_scroll: None,
             lane_drag: None,
             rename: None,
+            name_edit: None,
             confirm: None,
             pattern_copy: None,
             pattern_page: 0,
@@ -1345,6 +1382,9 @@ impl BitstepEditor {
         }
         let any_solo = data.any_solo();
         let selected_row = self.selected_row(data);
+        if let Some(edit) = self.name_edit.as_mut() {
+            edit.shown = false;
+        }
 
         ui.scope_builder(UiBuilder::new().max_rect(headers), |ui| {
             // A row the vertical scroll has taken out of the column must not
@@ -1370,6 +1410,13 @@ impl BitstepEditor {
                 self.ui_lane_header(ui, place, lane, lane_data, pattern, audible);
             }
         });
+        // A name field whose row was not drawn has lost the keyboard without
+        // being told: that is leaving the field, so the name is saved.
+        if let Some(edit) = self.name_edit.take_if(|edit| !edit.shown)
+            && let Some(lane) = data.position_of(edit.lane_id).and_then(|pos| data.lane(pos))
+        {
+            save_name(&self.model, lane, edit);
+        }
         self.continue_lane_drag(ui, layout, view, data);
     }
 
@@ -1449,6 +1496,7 @@ impl BitstepEditor {
         let key_scroll = &mut self.key_scroll;
         let lane_drag = &mut self.lane_drag;
         let rename = &mut self.rename;
+        let name_edit = &mut self.name_edit;
         let confirm = &mut self.confirm;
         let rng = &mut self.rng;
         let selected_lane = &mut self.selected_lane;
@@ -1481,6 +1529,15 @@ impl BitstepEditor {
             if handle.clicked() {
                 // The lane the parameter panel edits.
                 *selected_lane = Some(lane.id);
+            }
+            // A double-click on the name (not the grip or the dot) types a
+            // new one in place ([`NameEdit`]).
+            let pointer = handle.interact_pointer_pos();
+            let on_name = pointer.is_some_and(|pos| fields.name.contains(pos));
+            let editing = name_edit.as_ref().is_some_and(|edit| edit.lane_id == lane.id);
+            if handle.double_clicked() && on_name && !editing {
+                let text = lane.name.clone();
+                *name_edit = Some(NameEdit { lane_id: lane.id, text, opening: true, shown: true });
             }
             if place.selected {
                 ui.painter().rect_filled(band, CornerRadius::ZERO, theme::SELECTED_ROW);
@@ -1522,14 +1579,25 @@ impl BitstepEditor {
 
             // The name: left-aligned and truncated, because it is what the eye
             // finds the row by and a long one may not push the controls out of
-            // line. Renaming is in the context menu behind it.
-            ui.scope_builder(
-                UiBuilder::new().max_rect(fields.name).layout(Layout::left_to_right(Align::Center)),
-                |ui| {
-                    let name = RichText::new(&lane.name).color(text);
-                    ui.add(Label::new(name).truncate().selectable(false));
+            // line. A double-click types a new one in place; renaming is also
+            // in the context menu behind it.
+            match name_edit.as_mut().filter(|edit| edit.lane_id == lane.id) {
+                Some(edit) => match name_field(ui, fields.name, edit) {
+                    Some(NameEditEnd::Save) => {
+                        let edit = name_edit.take().expect("the edit just drawn");
+                        save_name(model, lane, edit);
+                    }
+                    Some(NameEditEnd::Cancel) => *name_edit = None,
+                    None => {}
                 },
-            );
+                None => {
+                    let layout = Layout::left_to_right(Align::Center);
+                    ui.scope_builder(UiBuilder::new().max_rect(fields.name).layout(layout), |ui| {
+                        let name = RichText::new(&lane.name).color(text);
+                        ui.add(Label::new(name).truncate().selectable(false));
+                    });
+                }
+            }
 
             // The key, shown and typed as a note name. A drag value because
             // the key is changed by dragging or scrolling: egui gives the
@@ -2570,6 +2638,42 @@ fn write_field(
 ///
 /// A clock that refuses to answer (a system time before the epoch) falls back
 /// to [`Prng::DEFAULT_SEED`] rather than panicking inside the host.
+/// Draws an in-place name edit ([`NameEdit`]) over the name's slot, and
+/// says whether it ended this frame.
+///
+/// The first frame takes the keyboard and selects the whole name, so the
+/// first key typed replaces it. After that the field is done as soon as it
+/// no longer has the keyboard: egui gives it up on Enter, on Escape and on a
+/// click elsewhere, and Escape is the one that leaves the name as it was.
+fn name_field(ui: &mut egui::Ui, rect: Rect, edit: &mut NameEdit) -> Option<NameEditEnd> {
+    edit.shown = true;
+    let id = ui.make_persistent_id(NAME_EDIT_ID);
+    let field = TextEdit::singleline(&mut edit.text).id(id).char_limit(LANE_NAME_LIMIT);
+    let response = ui.put(rect, field);
+    if std::mem::take(&mut edit.opening) {
+        response.request_focus();
+        let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+        let all = egui::text_selection::CCursorRange::select_all_str(&edit.text);
+        state.cursor.set_char_range(Some(all));
+        state.store(ui.ctx(), id);
+        return None;
+    }
+    if response.has_focus() {
+        return None;
+    }
+    let escaped = ui.input(|input| input.key_pressed(egui::Key::Escape));
+    Some(if escaped { NameEditEnd::Cancel } else { NameEditEnd::Save })
+}
+
+/// Saves what an in-place name edit typed as `lane`'s name. A blank name
+/// keeps the old one, and an unchanged one writes nothing: a rename is a
+/// shape edit, which republishes the whole sequence.
+fn save_name(model: &SeqModel, lane: &Lane, edit: NameEdit) {
+    if !edit.text.trim().is_empty() && edit.text != lane.name {
+        model.rename_lane(lane.id, edit.text);
+    }
+}
+
 fn clock_seed() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4104,6 +4208,120 @@ mod tests {
         press_key(&mut app, &ctx, egui::Key::ArrowDown, none);
         assert_eq!(length(), 31);
         assert_eq!(key(), 38, "the key field no longer has the keys");
+    }
+
+    /// Half a second of quiet frames, so the next click is not counted as
+    /// part of a double- (or triple-) click with the ones before it: frames
+    /// here are 1/60 s apart, and egui counts clicks by time.
+    fn pause(app: &mut BitstepEditor, ctx: &egui::Context) {
+        for _ in 0..30 {
+            run_frame(app, ctx, Vec::new());
+        }
+    }
+
+    /// A double-click on a lane's name types a new one in place: the field
+    /// opens with the whole name selected, so typing replaces it, and Enter
+    /// saves it as one undo step. A double-click on the grip is not one on
+    /// the name.
+    #[test]
+    fn double_clicking_a_name_renames_the_lane_in_place() {
+        let model = Arc::new(SeqModel::new(state::default_data()));
+        let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
+        let mut app = BitstepEditor::new(params, Arc::clone(&model), Arc::new(Playhead::new()));
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let row = 1;
+        let name = || model.shared().lane(row).expect("lane 1 exists").name.clone();
+        let fields = test_header_fields(row);
+        let none = egui::Modifiers::NONE;
+
+        click_at(&mut app, &ctx, fields.grip.center());
+        click_at(&mut app, &ctx, fields.grip.center());
+        assert!(app.name_edit.is_none(), "the grip picks the lane up; it does not rename it");
+        pause(&mut app, &ctx);
+
+        click_at(&mut app, &ctx, fields.name.center());
+        click_at(&mut app, &ctx, fields.name.center());
+        let lane_id = model.shared().lane(row).expect("lane 1").id;
+        assert!(app.name_edit.as_ref().is_some_and(|edit| edit.lane_id == lane_id));
+        assert!(ctx.text_edit_focused(), "the field has the keyboard");
+
+        run_frame(&mut app, &ctx, vec![egui::Event::Text("Snare".into())]);
+        assert_eq!(name(), "Lane 2", "nothing is written while typing");
+        press_key(&mut app, &ctx, egui::Key::Enter, none);
+        assert_eq!(name(), "Snare", "the typed name replaced the selected one");
+        assert!(app.name_edit.is_none(), "Enter closes the field");
+        assert!(!ctx.text_edit_focused());
+
+        // A quiet frame commits the rename as one step, which Ctrl+Z undoes.
+        run_frame(&mut app, &ctx, Vec::new());
+        press_key(&mut app, &ctx, egui::Key::Z, egui::Modifiers::COMMAND);
+        assert_eq!(name(), "Lane 2");
+    }
+
+    /// The other ways out of an in-place rename: a click elsewhere saves,
+    /// Escape keeps the old name, and so does a name typed down to nothing.
+    #[test]
+    fn an_in_place_rename_saves_on_leaving_and_cancels_on_escape() {
+        let model = Arc::new(SeqModel::new(state::default_data()));
+        let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
+        let mut app = BitstepEditor::new(params, Arc::clone(&model), Arc::new(Playhead::new()));
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let name = |row: usize| model.shared().lane(row).expect("a default lane").name.clone();
+        let none = egui::Modifiers::NONE;
+        let double_click = |app: &mut BitstepEditor, row: usize| {
+            pause(app, &ctx);
+            let at = test_header_fields(row).name.center();
+            click_at(app, &ctx, at);
+            click_at(app, &ctx, at);
+            assert!(app.name_edit.is_some(), "row {row}'s name is being edited");
+        };
+
+        // Clicking another lane's name is leaving the field: saved.
+        double_click(&mut app, 2);
+        run_frame(&mut app, &ctx, vec![egui::Event::Text("Hat".into())]);
+        pause(&mut app, &ctx);
+        click_at(&mut app, &ctx, test_header_fields(5).name.center());
+        assert_eq!(name(2), "Hat");
+        assert!(app.name_edit.is_none());
+
+        // Escape: the old name stays.
+        double_click(&mut app, 3);
+        run_frame(&mut app, &ctx, vec![egui::Event::Text("Nope".into())]);
+        press_key(&mut app, &ctx, egui::Key::Escape, none);
+        assert_eq!(name(3), "Lane 4");
+        assert!(app.name_edit.is_none());
+
+        // Deleting the selected name and pressing Enter: a lane keeps a name.
+        double_click(&mut app, 3);
+        press_key(&mut app, &ctx, egui::Key::Backspace, none);
+        press_key(&mut app, &ctx, egui::Key::Enter, none);
+        assert_eq!(name(3), "Lane 4");
+        assert!(app.name_edit.is_none());
+    }
+
+    /// A name being edited whose row scrolls out of view is saved, as a
+    /// field that loses the keyboard any other way is.
+    #[test]
+    fn an_in_place_rename_scrolled_away_is_saved() {
+        let model = Arc::new(SeqModel::new(state::default_data()));
+        for index in 0..30 {
+            model.add_lane(format!("Extra {index}"), 0, 50, 0).expect("room for a lane");
+        }
+        let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
+        let mut app = BitstepEditor::new(params, Arc::clone(&model), Arc::new(Playhead::new()));
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+
+        let at = test_header_fields(0).name.center();
+        click_at(&mut app, &ctx, at);
+        click_at(&mut app, &ctx, at);
+        run_frame(&mut app, &ctx, vec![egui::Event::Text("Kick".into())]);
+        app.scroll.y = 20.0 * theme::ROW_PITCH;
+        run_frame(&mut app, &ctx, Vec::new());
+        assert_eq!(model.shared().lane(0).expect("lane 0").name, "Kick");
+        assert!(app.name_edit.is_none());
     }
 
     /// Dragging the handle after a lane's last step edits its loop length,

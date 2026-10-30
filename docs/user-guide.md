@@ -188,7 +188,7 @@ pads.
 
 | Control | What it does |
 |---|---|
-| **Name and colour dot** | Drag to move the lane up or down; drag to the top or bottom edge of the list to scroll it. Press Escape while dragging to put it back. Right-click for the [lane menu](#lane-menu). |
+| **Name and colour dot** | Drag to move the lane up or down; drag to the top or bottom edge of the list to scroll it. Press Escape while dragging to put it back. Double-click the name to rename the lane: the whole name is selected, so just type. Press Enter or click anywhere else to keep the new name, or Escape to keep the old one. Right-click for the [lane menu](#lane-menu). |
 | **Note** (e.g. `C1`) | The note the lane plays. Drag up/right to raise it, or use the mouse wheel over it. Hold Shift while dragging for finer control. Click to type a note name such as `F#1` or `Bb2`; while typing, Up/Down step it by a semitone. |
 | **Length** | How many steps the lane has, from 1 to 4096. Drag or click to type; while typing, Up/Down add or remove a step. A new length takes effect at once, so a playing lane may jump to a different step. |
 | **Rate** | How long each step is: 1/1 down to 1/64, each also in triplet (T) and dotted (D) versions. |
