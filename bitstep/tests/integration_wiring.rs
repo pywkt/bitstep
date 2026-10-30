@@ -304,8 +304,11 @@ fn build_patch(model: &SeqModel, lanes: &[u32]) {
     for index in [0, 2] {
         assert!(model.set_step(0, kick, index, Step::default_on()));
     }
-    // The snare keeps the default 1/16 over 16 steps: three different rates
-    // in one pattern is what makes the per-lane step grids worth checking.
+    // The snare plays 1/16 over 16 steps: three different rates in one
+    // pattern is what makes the per-lane step grids worth checking. The
+    // length is set, like the keys, so a change to the default length does
+    // not move it.
+    assert!(model.set_length(0, snare, 16));
     for index in [4, 12] {
         assert!(model.set_step(0, snare, index, Step::default_on()));
     }
@@ -516,7 +519,7 @@ fn a_scripted_session_plays_edits_loops_and_stops() {
     // The GUI's feedback: every lane on the last step of its own grid (a 1/4
     // lane of 4, a 1/16 lane of 16, a 1/8 lane of 8), and the pattern being
     // played is the one `patsel` names.
-    // Lanes 4–7 are the untouched defaults: 1/16 over 16.
+    // Lanes 4–7 are the untouched defaults: 1/16 over 32, halfway through.
     assert_eq!(
         playing_steps(&session.playhead),
         vec![(0, 3), (1, 15), (2, 7), (3, 3), (4, 15), (5, 15), (6, 15), (7, 15)]
@@ -533,6 +536,7 @@ fn a_scripted_session_plays_edits_loops_and_stops() {
     // four, so the hat's own cycle now drifts against the bar.
     assert!(model.set_length(0, hat, 10));
     let clap = model.add_lane("Clap", 0x65_43_21, 39, 3).expect("room for a fifth lane");
+    assert!(model.set_length(0, clap, 16));
     assert!(model.set_step(0, clap, 8, Step::default_on()));
 
     let edited = session.play(8);
@@ -552,7 +556,7 @@ fn a_scripted_session_plays_edits_loops_and_stops() {
     // have been its step 0 and sounded.
     assert_eq!(
         playing_steps(&session.playhead),
-        vec![(0, 3), (1, 15), (2, 5), (3, 3), (4, 15), (5, 15), (6, 15), (7, 15), (8, 15)]
+        vec![(0, 3), (1, 15), (2, 5), (3, 3), (4, 31), (5, 31), (6, 31), (7, 31), (8, 15)]
     );
 
     // ---- phase 3: the host moves `patsel`, beats [8, 12) ----

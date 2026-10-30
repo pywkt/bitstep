@@ -392,6 +392,8 @@ fn an_abuse_session_never_leaves_a_note_hanging() {
     assert!(rig.model.set_rate(0, pad, Rate::Whole));
     assert!(rig.model.set_length(0, pad, 1));
     assert!(rig.model.set_step(0, pad, 0, Step::default_on()));
+    // Every step of a one-bar hat, so a sixteenth is always sounding.
+    assert!(rig.model.set_length(0, hat, 16));
     for index in 0..16 {
         assert!(rig.model.set_step(0, hat, index, Step::default_on()));
     }

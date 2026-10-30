@@ -455,15 +455,20 @@ pub struct LaneData {
 }
 
 impl LaneData {
-    /// The loop length a fresh lane plays — one bar of 1/16 steps.
-    pub const DEFAULT_LENGTH: u32 = 16;
+    /// The loop length a fresh lane plays — two bars of 1/16 steps.
+    pub const DEFAULT_LENGTH: u32 = 32;
 
-    /// A fresh lane's content: 16 off steps, length 16, rate 1/16.
+    /// The capacity a fresh lane is allocated with: just enough for
+    /// [`LaneData::DEFAULT_LENGTH`], in whole [`CAPACITY_CHUNK`]s.
+    pub const DEFAULT_CAPACITY: usize = chunked_capacity(Self::DEFAULT_LENGTH as usize);
+
+    /// A fresh lane's content: 32 off steps, length 32, rate 1/16.
     pub fn empty() -> LaneData {
-        LaneData::with_capacity(CAPACITY_CHUNK)
+        LaneData::with_capacity(Self::DEFAULT_CAPACITY)
     }
 
-    /// `capacity` steps, all off, length `min(16, capacity)`, rate 1/16.
+    /// `capacity` steps, all off, length `min(DEFAULT_LENGTH, capacity)`,
+    /// rate 1/16.
     ///
     /// The capacity is clamped to `1..=MAX_STEPS` but otherwise used exactly
     /// as asked, so a state load reproduces the saved capacity (and with it
@@ -486,11 +491,12 @@ impl LaneData {
         self.steps.len()
     }
 
-    /// Whether this is exactly what [`LaneData::empty`] makes: one chunk of
-    /// untouched steps, default length and rate. A state save leaves out
-    /// trailing patterns made only of these, since a load recreates them.
+    /// Whether this is exactly what [`LaneData::empty`] makes: the default
+    /// capacity of untouched steps, default length and rate. A state save
+    /// leaves out trailing patterns made only of these, since a load
+    /// recreates them.
     pub fn is_pristine(&self) -> bool {
-        self.capacity() == CAPACITY_CHUNK
+        self.capacity() == Self::DEFAULT_CAPACITY
             && self.length.load(Relaxed) == Self::DEFAULT_LENGTH
             && self.rate() == Rate::DEFAULT
             && self.steps.iter().all(|cell| cell.load(Relaxed) == Step::OFF.bits())
@@ -2135,8 +2141,8 @@ mod tests {
         assert_eq!(
             before,
             vec![
-                (36, 0, false, 16, Rate::Sixteenth, Step::OFF),
-                (38, 1, false, 16, Rate::Sixteenth, Step::OFF),
+                (36, 0, false, 32, Rate::Sixteenth, Step::OFF),
+                (38, 1, false, 32, Rate::Sixteenth, Step::OFF),
             ]
         );
 
@@ -2160,7 +2166,7 @@ mod tests {
             read_block(&data, 0, 3),
             vec![
                 (40, 9, false, 8, Rate::Sixteenth, edited),
-                (38, 1, true, 16, Rate::EighthTriplet, Step::OFF),
+                (38, 1, true, 32, Rate::EighthTriplet, Step::OFF),
             ]
         );
         // And an in-place read-modify-write is visible the same way.
@@ -2182,16 +2188,18 @@ mod tests {
         for pattern in 1..NUM_PATTERNS {
             let other = data.lane_data(pattern, 0).unwrap();
             assert_eq!(other.step(0), Step::OFF, "pattern {pattern} shares step storage");
-            assert_eq!(other.length(), 16);
+            assert_eq!(other.length(), LaneData::DEFAULT_LENGTH);
             assert_eq!(other.rate(), Rate::DEFAULT);
         }
     }
 
     #[test]
-    fn a_fresh_lane_data_is_one_bar_of_sixteenths() {
+    fn a_fresh_lane_data_is_two_bars_of_sixteenths() {
         let lane_data = LaneData::empty();
-        assert_eq!(lane_data.capacity(), CAPACITY_CHUNK);
-        assert_eq!(lane_data.length(), 16);
+        assert_eq!(lane_data.capacity(), 32);
+        assert_eq!(lane_data.capacity(), LaneData::DEFAULT_CAPACITY);
+        assert_eq!(lane_data.capacity() % CAPACITY_CHUNK, 0, "whole chunks");
+        assert_eq!(lane_data.length(), 32);
         assert_eq!(lane_data.rate(), Rate::Sixteenth);
         assert_eq!(lane_data.rate().rate_beats(), 0.25);
         assert!((0..lane_data.capacity()).all(|i| !lane_data.step(i).is_on()));
@@ -2394,7 +2402,7 @@ mod tests {
         }
         // The supplied entries kept their values; the padding is empty.
         assert_eq!(data.lane_data(0, 1).unwrap().step(0), marked);
-        assert_eq!(data.lane_data(0, 2).unwrap().capacity(), CAPACITY_CHUNK);
+        assert_eq!(data.lane_data(0, 2).unwrap().capacity(), LaneData::DEFAULT_CAPACITY);
         assert_eq!(data.lane_data(0, 2).unwrap().step(0), Step::OFF);
         assert_eq!(data.lane_data(1, 2).unwrap().step(0), marked);
         assert_eq!(data.lane_data(7, 0).unwrap().step(0), Step::OFF);
@@ -2608,7 +2616,7 @@ mod tests {
         assert_eq!(lane.is_sample_pad(), Lane::SAMPLE_PAD_DEFAULT);
         for pattern in 0..NUM_PATTERNS {
             let lane_data = data.lane_data(pattern, 0).expect("lane data");
-            assert_eq!(lane_data.capacity(), CAPACITY_CHUNK);
+            assert_eq!(lane_data.capacity(), LaneData::DEFAULT_CAPACITY);
             assert_eq!(lane_data.length(), LaneData::DEFAULT_LENGTH);
             assert_eq!(lane_data.rate(), Rate::DEFAULT);
             assert!((0..lane_data.capacity()).all(|i| lane_data.step(i) == Step::OFF));
@@ -3054,6 +3062,10 @@ mod tests {
         model.add_lane("kick", 0, 36, 0).expect("room for a lane");
         model.add_lane("snare", 0, 38, 0).expect("room for a lane");
         let data = model.shared();
+        // Every lane starts as one bar of sixteenths.
+        for pattern in &data.patterns[..3] {
+            pattern.iter().for_each(|lane_data| lane_data.set_length(16));
+        }
         // Pattern 2: 16 quarters is four bars, whatever the other lane does.
         data.patterns[1][0].set_rate(Rate::Quarter);
         // Pattern 3: 12 triplet eighths fill one bar exactly.
@@ -3141,7 +3153,8 @@ mod tests {
         let slower = LaneData::empty();
         slower.set_rate(Rate::Eighth);
         assert!(!slower.is_pristine());
-        assert!(!LaneData::with_capacity(32).is_pristine(), "grown");
+        assert!(!LaneData::with_capacity(48).is_pristine(), "grown");
+        assert!(!LaneData::with_capacity(16).is_pristine(), "a 16-step lane from an old save");
     }
 
     #[test]

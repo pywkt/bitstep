@@ -13,8 +13,8 @@ If it isn't installed yet, start with [Installing bitstep](install.md).
    on its first pads (C1 upwards).
 2. Add **bitstep** to the same track, *before* the Drum Machine.
 3. Open bitstep's window. You'll see eight lanes, **Lane 1** to **Lane 8**,
-   on notes C1 to G1, one per Drum Machine pad in order. Each is 16 steps
-   long.
+   on notes C1 to G1, one per Drum Machine pad in order. Each is 32 steps
+   long: two bars of 1/16 steps.
 4. Press play in Bitwig and click some steps. They play on the next pass, so
    you don't need to stop the transport to edit.
 
@@ -280,7 +280,7 @@ Right-click a lane's name to open its menu:
 ### Adding lanes
 
 Click **+ Lane** in the top bar. The new lane appears at the bottom, playing
-the note above the previous last lane, with 16 steps at 1/16. You can have up
+the note above the previous last lane, with 32 steps at 1/16. You can have up
 to 256 lanes.
 
 ## Patterns
@@ -342,9 +342,10 @@ every part of the song that uses it changes too.
 **How long each pattern plays:** as long as its longest lane, rounded up to
 whole bars. A pattern of 16 sixteenth notes is one bar of 4/4, 32 sixteenths
 (or 32 eighths) is two (or four) bars, and a pattern whose longest lane is 12
-sixteenths still takes a whole bar. Shorter lanes repeat inside the pattern,
-as they do outside song mode. Change a lane's length or rate and the song
-moves with it.
+sixteenths still takes a whole bar. Lanes start at 32 sixteenths, so a pattern
+you haven't shortened plays for two bars. Shorter lanes repeat inside the
+pattern, as they do outside song mode. Change a lane's length or rate and the
+song moves with it.
 
 How to write the order:
 

@@ -433,11 +433,11 @@ fn free_lane_id(taken: &[u32]) -> u32 {
 mod tests {
     use super::*;
 
-    use crate::model::{CAPACITY_CHUNK, MAX_STEPS};
+    use crate::model::MAX_STEPS;
 
     /// Three lanes with every identity field, flag, rate, length and step
     /// field set to something distinguishable, and capacities that are *not*
-    /// `CAPACITY_CHUNK` multiples so a conversion that quietly rounds shows
+    /// `crate::model::CAPACITY_CHUNK` multiples so a conversion that quietly rounds shows
     /// up. Lengths sit well below capacity, so most steps are hidden.
     fn sample_data() -> SeqData {
         let lanes = vec![
@@ -741,10 +741,10 @@ mod tests {
         assert_eq!((padded.length(), padded.rate(), padded.capacity()), (
             LaneData::DEFAULT_LENGTH,
             Rate::DEFAULT,
-            CAPACITY_CHUNK
+            LaneData::DEFAULT_CAPACITY
         ));
         let missing_pattern = data.lane_data(7, 0).expect("aligned");
-        assert_eq!(missing_pattern.capacity(), CAPACITY_CHUNK);
+        assert_eq!(missing_pattern.capacity(), LaneData::DEFAULT_CAPACITY);
     }
 
     #[test]
@@ -827,7 +827,8 @@ mod tests {
         assert_eq!((lane_data.capacity(), lane_data.length()), (2, 2));
         assert!(lane_data.step(0).is_on());
         assert_eq!(lane_data.step(1), Step::OFF);
-        assert_eq!(data.lane_data(7, 0).expect("aligned").capacity(), CAPACITY_CHUNK);
+        let missing_pattern = data.lane_data(7, 0).expect("aligned");
+        assert_eq!(missing_pattern.capacity(), LaneData::DEFAULT_CAPACITY);
     }
 
     /// A stored object with no `version` is this version, not version 0 — a
@@ -981,7 +982,7 @@ mod tests {
                 let lane_data = data.lane_data(pattern, pos).expect("aligned");
                 assert_eq!(
                     (lane_data.length(), lane_data.rate(), lane_data.capacity()),
-                    (LaneData::DEFAULT_LENGTH, Rate::Sixteenth, CAPACITY_CHUNK),
+                    (LaneData::DEFAULT_LENGTH, Rate::Sixteenth, LaneData::DEFAULT_CAPACITY),
                     "pattern {pattern} lane {pos}"
                 );
                 assert!(

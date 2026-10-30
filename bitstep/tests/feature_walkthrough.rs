@@ -39,7 +39,10 @@ use nice_plug::params::InternalParamMut;
 
 use bitstep::BitstepParams;
 use bitstep::engine::{BlockCtx, BlockOutput, Engine};
-use bitstep::model::{Lane, NUM_PATTERNS, Playhead, SeqData, SeqModel, Step, chunked_capacity};
+use bitstep::model::{
+    CAPACITY_CHUNK, Lane, LaneData, NUM_PATTERNS, Playhead, SeqData, SeqModel, Step,
+    chunked_capacity,
+};
 use bitstep::sequencer::{
     BeatRange, BlockRanges, GATE_FRACTION, Rate, SeqEvent, TimedEvent, pan_to_f32,
     velocity_to_f32,
@@ -283,15 +286,19 @@ const KIT: [(&str, u8); 4] = [("Kick", 36), ("Snare", 38), ("Hat", 42), ("Perc",
 
 /// A fresh sequence holding [`KIT`], laid out as `state::default_data` lays
 /// out its own lanes: ids from 1, palette colours, channel 0, empty patterns.
+/// Every lane is one bar of 1/16 in one capacity chunk, spelled out rather
+/// than left to `LaneData::empty`, for the same reason as [`KIT`].
 fn kit_data() -> SeqData {
-    SeqData::from_lanes(
-        KIT.iter()
-            .enumerate()
-            .map(|(index, &(name, key))| {
-                Lane::new(1 + index as u32, name, state::LANE_PALETTE[index], key, 0)
-            })
-            .collect(),
-    )
+    let lanes: Vec<Lane> = KIT
+        .iter()
+        .enumerate()
+        .map(|(index, &(name, key))| {
+            Lane::new(1 + index as u32, name, state::LANE_PALETTE[index], key, 0)
+        })
+        .collect();
+    let one_bar = || LaneData::with_capacity(CAPACITY_CHUNK);
+    let patterns = std::array::from_fn(|_| lanes.iter().map(|_| one_bar()).collect());
+    SeqData::new(lanes, patterns)
 }
 
 impl Rig {

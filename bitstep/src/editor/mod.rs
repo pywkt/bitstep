@@ -49,9 +49,18 @@ use grid_math::{
 use keys::KeyForwarder;
 
 /// The window a fresh instance opens at, in logical points: wide enough for
-/// the pinned lane header plus a bar and a half of 1/16 steps, tall enough for
-/// the top bar and a handful of lanes.
-pub const DEFAULT_SIZE: LogicalSize<f32> = LogicalSize::new(1100.0, 580.0);
+/// the pinned lane header plus a whole fresh lane — every step of
+/// [`LaneData::DEFAULT_LENGTH`] and its end handle, with nothing to scroll —
+/// and tall enough for the top bar and a handful of lanes.
+///
+/// Derived from the theme rather than typed out, so a change to the cell size
+/// or the default length keeps the window fitting.
+pub const DEFAULT_SIZE: LogicalSize<f32> = LogicalSize::new(
+    theme::HEADER_WIDTH
+        + LaneData::DEFAULT_LENGTH as f32 * theme::CELL_PITCH
+        + theme::END_HANDLE_WIDTH,
+    580.0,
+);
 
 /// The smallest window the host may resize to. Below this the header stops
 /// fitting and the grid has no room left, so the host is told not to go there
@@ -3368,6 +3377,22 @@ mod tests {
         assert!(hint.can_resize_horizontally && hint.can_resize_vertically);
     }
 
+    /// The window a fresh instance opens at shows a whole fresh lane: every
+    /// step and the end handle on screen, nothing to scroll — and not a
+    /// column wider than that.
+    #[test]
+    fn the_default_window_shows_a_whole_fresh_lane() {
+        let layout = EditorLayout::from_theme(test_window());
+        let view = layout.grid_view(CellMetrics::from_theme(), Vec2::ZERO);
+        let steps = LaneData::DEFAULT_LENGTH as usize;
+
+        assert_eq!(view.max_scroll_x(steps), 0.0, "a fresh lane needs no scrolling");
+        assert!(view.visible_steps(steps).contains(&(steps - 1)), "its last step is drawn");
+        let handle = view.end_handle_rect(0, LaneData::DEFAULT_LENGTH);
+        assert!(layout.steps().contains_rect(handle), "its end handle is on screen");
+        assert!(view.max_scroll_x(steps + 1) > 0.0, "one step more would need scrolling");
+    }
+
     /// The editor shares the plugin's sequence rather than a copy of it: a
     /// write through the model the editor was built with is visible to the
     /// handle the audio thread reads.
@@ -3787,7 +3812,7 @@ mod tests {
         let cell = view.cell_rect(1, 3).center();
         let hover = grid_frame(&mut app, &ctx, 0, moved(cell));
         assert_eq!(hover, Some(GridHit::Cell { row: 1, step: 3 }));
-        let handle = view.end_handle_rect(2, 16).center();
+        let handle = view.end_handle_rect(2, LaneData::DEFAULT_LENGTH).center();
         let hover = grid_frame(&mut app, &ctx, 0, moved(handle));
         assert_eq!(hover, Some(GridHit::EndHandle { row: 2 }));
         let header = layout.headers().center();
@@ -3987,9 +4012,9 @@ mod tests {
         let length = || model.shared().lane_data(pattern, row).expect("lane 1").length();
         let capacity = || model.shared().lane_data(pattern, row).expect("lane 1").capacity();
 
-        // The snare, as `state::default_data` leaves it: D1, a bar of 1/16
-        // steps, and exactly one capacity chunk to hold them.
-        assert_eq!((key(), length(), capacity()), (37, 16, 16));
+        // The snare, as `state::default_data` leaves it: C#1, two bars of
+        // 1/16 steps, and exactly the capacity to hold them.
+        assert_eq!((key(), length(), capacity()), (37, 32, 32));
         assert_eq!(grid_math::note_name(key()), "C#1");
 
         // Right is up: 40 points at a quarter-semitone each is about ten.
@@ -4006,7 +4031,7 @@ mod tests {
 
         // The length past the lane's capacity: the grow happens first, so the
         // length the lane ends up with is the one asked for rather than the
-        // 16 a bare `set_length` would have clamped it to.
+        // 32 a bare `set_length` would have clamped it to.
         drag_between(
             &mut app,
             &ctx,
@@ -4014,7 +4039,7 @@ mod tests {
             fields.length.center() + egui::vec2(40.0, 0.0),
         );
         let grown = length();
-        assert!((17..=32).contains(&grown), "a drag right lengthened the lane to {grown}");
+        assert!((33..=48).contains(&grown), "a drag right lengthened the lane to {grown}");
         assert!(capacity() >= grown as usize, "the lane was grown to hold its length");
         assert_eq!(capacity() % crate::model::CAPACITY_CHUNK, 0, "grown in whole chunks");
 
@@ -4025,8 +4050,8 @@ mod tests {
         for other in [0usize, 2, 3] {
             let data = model.shared();
             let lane_data = data.lane_data(pattern, other).expect("every lane has data");
-            assert_eq!(lane_data.length(), 16, "lane {other} kept its length");
-            assert_eq!(lane_data.capacity(), 16, "and its capacity");
+            assert_eq!(lane_data.length(), 32, "lane {other} kept its length");
+            assert_eq!(lane_data.capacity(), 32, "and its capacity");
         }
 
         // Shorter again, which needs no shape edit at all.
@@ -4074,10 +4099,10 @@ mod tests {
         click_at(&mut app, &ctx, fields.length.center());
         run_frame(&mut app, &ctx, Vec::new());
         press_key(&mut app, &ctx, egui::Key::ArrowUp, none);
-        assert_eq!(length(), 17, "one up from 16, past the first chunk");
+        assert_eq!(length(), 33, "one up from 32, past the lane's capacity");
         press_key(&mut app, &ctx, egui::Key::ArrowDown, none);
         press_key(&mut app, &ctx, egui::Key::ArrowDown, none);
-        assert_eq!(length(), 15);
+        assert_eq!(length(), 31);
         assert_eq!(key(), 38, "the key field no longer has the keys");
     }
 
@@ -4091,7 +4116,11 @@ mod tests {
     /// rather than a silent clamp.
     #[test]
     fn dragging_the_end_handle_edits_the_loop_length() {
-        let model = Arc::new(SeqModel::new(state::default_data()));
+        // The hat in pattern 1 is one full capacity chunk of 16 steps, as an
+        // older project saves it, so the drag below has to grow it.
+        let mut data = state::default_data();
+        data.patterns[0][2] = LaneData::with_capacity(crate::model::CAPACITY_CHUNK);
+        let model = Arc::new(SeqModel::new(data));
         let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
         let mut app = BitstepEditor::new(params, Arc::clone(&model), Arc::new(Playhead::new()));
 
@@ -4101,8 +4130,6 @@ mod tests {
         let length = || model.shared().lane_data(pattern, row).expect("lane 2 exists").length();
         let capacity = || model.shared().lane_data(pattern, row).expect("lane 2 exists").capacity();
 
-        // The hat, as `state::default_data` leaves it: a bar of steps in one
-        // capacity chunk.
         assert_eq!((length(), capacity()), (16, 16));
         let pitch = view.metrics().step_pitch();
         let grip = view.end_handle_rect(row, 16).center();
@@ -4127,8 +4154,9 @@ mod tests {
 
         // Nothing else moved: not the lane above, not the same lane in
         // another pattern.
-        assert_eq!(model.shared().lane_data(pattern, 1).expect("lane 1").length(), 16);
-        assert_eq!(model.shared().lane_data(1, row).expect("pattern 1").length(), 16);
+        let fresh = LaneData::DEFAULT_LENGTH;
+        assert_eq!(model.shared().lane_data(pattern, 1).expect("lane 1").length(), fresh);
+        assert_eq!(model.shared().lane_data(1, row).expect("pattern 1").length(), fresh);
         assert_eq!(model.shared().lane_count(), 8, "a grow keeps the shape");
         assert_eq!(model.shared().lane(row).expect("lane 2").name, "Lane 3");
 
@@ -4142,7 +4170,7 @@ mod tests {
             grip + egui::vec2(pitch * 4.0, across), false,
         );
         assert_eq!(length(), 20, "the drag is locked to the handle's own lane");
-        assert_eq!(model.shared().lane_data(pattern, 0).expect("lane 0").length(), 16);
+        assert_eq!(model.shared().lane_data(pattern, 0).expect("lane 0").length(), fresh);
 
         // Dragging back restores the length the press found, and past the
         // left end it stops at the shortest loop a lane may have.
@@ -4229,7 +4257,7 @@ mod tests {
         // However far it was scrolled, an offset past the end of a shortened
         // lane comes back legal rather than leaving the grid blank.
         let lane_id = model.shared().lane(0).expect("lane 0").id;
-        for row in [0usize, 1] {
+        for row in 0..model.shared().lane_count() {
             let id = model.shared().lane(row).expect("the default lanes").id;
             assert!(model.set_length(pattern, id, 16));
         }
