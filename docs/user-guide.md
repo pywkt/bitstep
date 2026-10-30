@@ -26,7 +26,7 @@ beat of the bar.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│ ‹[1]…[8]› [Steps][Pitch][Song][Undo][Redo] status [Params] [+ Lane]  │  top bar
+│ ‹[1]…[8]› [Steps][Pitch][Song][Grid][Undo][Redo] … [Params][+ Lane]   │  top bar
 ├──────────────────────────────┬───────────────────────────────────────┤
 │ ⠿● Lane 1  C1  16  1/16 ▾ M S │ ■ □ □ □ ■ □ □ □ ■ □ □ □ ■ □ □ □ ┃      │
 │ ⠿● Lane 2  C#1 16  1/16 ▾ M S │ □ □ □ □ ■ □ □ □ □ □ □ □ ■ □ □ □ ┃      │
@@ -38,9 +38,10 @@ beat of the bar.
 ```
 
 - **Top bar:** the pattern buttons with page arrows either side, the
-  **Steps / Pitch** mode switch, **Song** (see [Song mode](#song-mode)),
-  **Undo / Redo** (see [Undo](#undo)), a status line, **Params** (shows or
-  hides the parameter panel), **+ Lane**, and **Follow**.
+  **Steps / Pitch** mode switch, **Song** and, in song mode, **Grid** (see
+  [Song mode](#song-mode)), **Undo / Redo** (see [Undo](#undo)), a status
+  line, **Params** (shows or hides the parameter panel), **+ Lane**, and
+  **Follow**.
 - **Lane headers** (left): one row per lane, with its name, note, length,
   rate, and mute/solo.
 - **Step grid** (right): one row of steps per lane. Every group of four steps
@@ -318,79 +319,115 @@ note and volume are shared by all patterns anyway.
   it again to replace that pattern. [Undo](#undo) puts it back.
 - The copy is independent: editing it doesn't change the original. You stay
   on the pattern you copied from; click the new one to switch to it.
+- A pattern's [name](#song-mode) stays with its slot and isn't copied.
 
 ### Switching patterns from Bitwig
 
 The pattern is a Bitwig parameter called **Pattern Select** (1–64), so you
 can automate it in the arranger, or map a modulator or controller to it. It's
 bitstep's only automatable parameter. In song mode the song picks what plays,
-and Pattern Select only picks which pattern the grid shows.
+and Pattern Select only picks which pattern's steps you see.
 
 ## Song mode
 
-Song mode plays your patterns in an order you type, one after another,
-following Bitwig's timeline. Nothing is recorded, so when you change a pattern
-every part of the song that uses it changes too.
+Song mode plays your patterns from a song grid, following Bitwig's timeline.
+The grid has one row for each of the 64 patterns and one column per bar. You
+place a pattern by clicking in its row, and anything placed in the same bars
+on different rows plays together. Nothing is recorded, so when you change a
+pattern, every part of the song that uses it changes too.
 
-1. Click **Song** in the top bar. A song row appears under it.
-2. Type the order into the field on the left, for example
-   `1-2-1-3-1-4-3-5`.
-3. Press play in Bitwig. The song starts at bar 1 of the arranger with the
-   first pattern, and each pattern plays to its end before the next one
-   starts.
+1. Click **Song** in the top bar. Song mode turns on, the song grid takes the
+   place of the steps, and a **Grid** button appears next to **Song**.
+2. Click in a pattern's row at the bar where it should start. The pattern is
+   placed there as a block, as long as the pattern itself (see below).
+3. Press play in Bitwig. The song starts at bar 1 of Bitwig's arranger.
 
-**How long each pattern plays:** as long as its longest lane, rounded up to
-whole bars. A pattern of 16 sixteenth notes is one bar of 4/4, 32 sixteenths
-(or 32 eighths) is two (or four) bars, and a pattern whose longest lane is 12
-sixteenths still takes a whole bar. Lanes start at 32 sixteenths, so a pattern
-you haven't shortened plays for two bars. Shorter lanes repeat inside the
-pattern, as they do outside song mode. Change a lane's length or rate and the
-song moves with it.
+```
+ [Loop] 12 bars │ 1       5       9       13
+ ───────────────┼─────────────────────────────
+ Pattern 1      │ [1 ───][1 ───]
+ Pattern 2      │                [2 ───]
+ Pattern 3      │ [3 ────────────────────]     ← plays along with 1 and 2
+ …
+ Pattern 64     │
+```
 
-How to write the order:
+**Working with blocks:**
 
-- Numbers are pattern numbers, 1–64, separated by `-`, `,` or spaces.
-- `3x4` plays pattern 3 four times in a row: `1x4-2x4` is pattern 1 four
-  times, then pattern 2 four times.
-- `0` is one silent bar.
-- After the last pattern the song starts again from the first. To stop there
-  instead, click the **loop** cell at the end of the song row: it changes to
-  **end**, and after the last pattern bitstep stays silent until you start
-  again from earlier in the song. Click it again to go back to looping.
-- A song can list up to 1024 patterns.
+- **Place:** click an empty bar in a row. The block is that row's pattern.
+  Press and drag to the right to draw it longer in one go.
+- **Move:** drag a block left or right. Drag it up or down to another row to
+  play a different pattern there instead.
+- **Resize:** drag a block's right edge. A block longer than its pattern plays
+  the pattern again from its first step each time it comes round (thin lines
+  inside the block mark where). A block shorter than its pattern cuts it off.
+- **Delete:** right-click a block.
+- **Escape** while dragging puts the block back where it was.
+- **Select a pattern:** click its name on the left. The row is highlighted,
+  and it's the pattern you see if you click **Grid** to switch to the steps.
+- **Name a pattern:** double-click its name on the left and type, for example
+  `Verse` or `Chorus`. Press Enter or click anywhere else to keep it, or
+  Escape to keep the old name. Delete the name (or leave it as
+  `Pattern N`) to go back to the number. Names are up to 64 characters,
+  saved with the project, and shown when you hover over the pattern's
+  button in the top bar.
+- **Edit a pattern:** double-click one of its blocks, or select it and click
+  **Grid**. The steps view opens on that pattern while the song keeps
+  playing. Click **Grid** to go back to the grid.
 
-The song changes as you type. While what you've typed isn't a valid order
-(say, a pattern number above 64), the field gets a red outline, its tooltip
-says what's wrong, and the song keeps playing what it had.
+**How long a block is when placed:** as long as its pattern's longest lane,
+rounded up to whole bars. A pattern of 16 sixteenth notes is one bar of 4/4,
+32 sixteenths (or 32 eighths) is two (or four) bars, and a pattern whose
+longest lane is 12 sixteenths still takes a whole bar. Lanes start at 32
+sixteenths, so a pattern you haven't shortened is placed two bars long. The
+length of each pattern is shown next to its name. If the block would run into
+the next block in its row, it's cut short to fit. Once placed, a block keeps
+its length even if you change the pattern later; drag its edge to change it.
+
+**Patterns playing together:** every lane of every pattern that has a block
+in a bar plays. If two of them hit the same note at the same moment, it
+sounds once. For example, put a kick-and-snare pattern on one row and a
+hi-hat pattern on another, over the same bars.
 
 What else to know:
 
-- **Each pattern in the song starts every lane from its first step**, even
-  when the same pattern plays twice in a row.
+- **The song ends after its last block.** It then starts again from bar 1.
+  To stop there instead, click **Loop** in the top-left corner of the grid:
+  it changes to **End**, and after the last block bitstep stays silent until
+  you start again from earlier in the song. Click it again to go back to
+  looping. The corner also shows how many bars the song is.
+- **Each block starts its pattern from the first step**, even when the same
+  pattern plays in the block before it.
 - **Bars follow Bitwig's time signature** (4 beats in 4/4, 3 in 3/4 or 6/8).
-  Keep one time signature for the whole song. In 3/4, a 12-step pattern of
-  sixteenths is one bar; a 16-step one takes two.
-- **The song row** shows one cell for each pattern in the order, with its
-  number. The one playing is filled in blue, with a line along its bottom
-  that fills up as a pattern longer than a bar plays through. The cells that
-  use the pattern you're editing have a blue outline. Every 4 cells are
-  shaded alternately so you can count. Hover over a cell to see which bars it
-  plays, and click it to edit its pattern. Scroll the row with the mouse
-  wheel; with **Follow** on it keeps the playing pattern in view. The last
-  cell, **loop** or **end**, chooses what happens after the last pattern.
-- **Editing while it plays:** clicking a pattern button only chooses which
-  pattern you edit. The playhead shows in the grid only while the pattern on
-  screen is the one playing, so you can edit any pattern in peace and watch
-  the playing one by clicking its button. That button's number is blue while
-  you're looking at another pattern.
+  Keep one time signature for the whole song.
+- **While it plays**, a blue line runs down the grid at the current bar, and
+  the blocks sounding are lit and outlined. The names of the patterns that
+  are sounding turn blue. With **Follow** on, the grid scrolls to keep the
+  line in view. Scroll the grid with the mouse wheel (rows) and Shift + wheel
+  (bars).
+- **Grid switches between the song grid and the steps** while song mode is
+  on, without changing what plays: click it to edit the selected pattern's
+  steps, and again to come back. It's only there in song mode. Turning song
+  mode off goes back to the steps, and the pattern buttons play one pattern
+  at a time again.
+- **Editing while it plays:** in the steps view, the pattern buttons only
+  choose which pattern you edit. The playhead shows in the steps only while
+  the pattern on screen is sounding in the song. A pattern button's number is
+  blue while that pattern is sounding and you're looking at another one.
 - **Looping and jumping** in Bitwig's arranger work: bitstep plays whichever
   bar the arranger is on.
+- **Projects saved with a typed song order** (from older versions of bitstep)
+  open with that order laid out on the grid, one block after another from
+  bar 1. A silent bar (`0`) at the very end of an old order is dropped, since
+  the song now ends with its last block.
 - Click **Song** again to go back to playing one pattern at a time.
 
 ## Scrolling and follow
 
-- **Mouse wheel:** scrolls lanes up and down, when there are more than fit.
-- **Shift + wheel** (or a horizontal scroll): scrolls steps left and right.
+- **Mouse wheel:** scrolls lanes (or, in the song grid, patterns) up and
+  down, when there are more than fit.
+- **Shift + wheel** (or a horizontal scroll): scrolls steps (or bars) left
+  and right.
 - **Follow** (on by default): keeps the playhead in view while playing.
   Turn it off if you want to scroll freely while the transport runs.
 
@@ -402,12 +439,12 @@ The current step is highlighted as it plays.
 (or **Ctrl+Y**) while bitstep's window is in front, step back and forth
 through your edits in bitstep:
 
-- One drag is one step: a whole paint stroke, a length drag or a drawn
-  curve in the parameter panel is undone in one go, and so is typing a lane
-  name or a song order.
+- One drag is one step: a whole paint stroke, a length drag, a drawn curve
+  in the parameter panel or moving or resizing a song block is undone in one
+  go, and so is typing a lane or pattern name.
 - Everything you edit in bitstep's window can be undone: steps and their
   settings, lane settings, adding, deleting, duplicating and moving lanes,
-  clear/invert/randomise/nudge/fills, pattern copies and the song.
+  clear/invert/randomise/nudge/fills, pattern copies and the song grid.
 - **Mute and solo are not undo steps.** They're for playing, so undo leaves
   them as they are.
 - **Pattern Select** belongs to Bitwig: use Bitwig's own undo for it.
@@ -424,8 +461,8 @@ are bitstep's [undo and redo](#undo). **Space** (play/stop), **F1–F12** and
 other shortcuts held with **Ctrl** (save and so on) are passed on to Bitwig,
 so you don't have to click back into Bitwig to start the transport. To use
 Bitwig's undo, click into Bitwig first. Other keys stay with bitstep, and
-nothing is passed on while you're typing a lane name or a song order (there,
-Ctrl+Z undoes your typing).
+nothing is passed on while you're typing a lane name (there, Ctrl+Z undoes
+your typing).
 
 ## Playing along
 
@@ -454,9 +491,9 @@ it armed and don't play the clip.
 ## Saving
 
 Everything is saved with your Bitwig project: all lanes and all 64 patterns,
-including steps hidden past a lane's end, the song order, whether song mode
+including steps hidden past a lane's end, the song grid, whether song mode
 is on and whether the song loops, plus the selected pattern. The
-window size, follow setting and scroll position are not saved.
+window size, view, follow setting and scroll position are not saved.
 
 ## Limits
 
@@ -465,7 +502,8 @@ window size, follow setting and scroll position are not saved.
 | Lanes | 256 |
 | Steps per lane | 4096 |
 | Patterns | 64 |
-| Song length | 1024 patterns |
+| Song length | 4096 bars |
+| Blocks in a song | 4096 |
 | Ratchet | 8 repeats |
 | Pitch | ±24 semitones |
 

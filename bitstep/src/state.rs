@@ -14,7 +14,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    FIRST_LANE_ID, Lane, LaneData, MAX_LANES, NUM_PATTERNS, SeqData, Song, Step,
+    DEFAULT_BAR_BEATS, FIRST_LANE_ID, Lane, LaneData, MAX_LANES, NUM_PATTERNS, PatternBars,
+    SeqData, Song, SongBlock, Step, blocks_from_order, clean_pattern_name, parse_song,
 };
 use crate::sequencer::Rate;
 
@@ -47,21 +48,36 @@ pub struct SeqSnapshot {
     pub song: SongSnapshot,
 }
 
-/// Song mode as saved: the switches and the order as typed.
+/// Song mode as saved: the switches and the blocks on the song grid.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(default)]
 pub struct SongSnapshot {
     pub on: bool,
-    /// Starts again after the last entry. Saves from before the choice
+    /// Starts again after the last block. Saves from before the choice
     /// existed stopped there, but load looped: it is what a song should do.
     pub looped: bool,
+    pub blocks: Vec<SongBlockSnapshot>,
+    /// The typed pattern order (`1-2-1-3x2`) of saves from before the grid.
+    /// Read only: a save with no blocks and an order that parses opens with
+    /// that order laid out on the grid. Never written.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub text: String,
 }
 
 impl Default for SongSnapshot {
     fn default() -> SongSnapshot {
-        SongSnapshot { on: false, looped: true, text: String::new() }
+        SongSnapshot { on: false, looped: true, blocks: Vec::new(), text: String::new() }
     }
+}
+
+/// One block on the song grid: a pattern index (0 = pattern 1), its first
+/// bar (0 = bar 1) and how many bars it lasts.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(default)]
+pub struct SongBlockSnapshot {
+    pub pattern: u8,
+    pub start: u32,
+    pub bars: u32,
 }
 
 /// One lane's identity and live settings. Its steps live in the patterns.
@@ -92,6 +108,10 @@ pub struct LaneSnapshot {
 #[serde(default)]
 pub struct PatternSnapshot {
     pub lanes: Vec<LaneDataSnapshot>,
+    /// The pattern's own name; left out when it has none, and absent from
+    /// every save from before patterns had names.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name: String,
 }
 
 /// One lane's content in one pattern.
@@ -151,22 +171,35 @@ impl SeqSnapshot {
     pub fn from_data(data: &SeqData) -> SeqSnapshot {
         // Patterns past the last one anybody touched load back as exactly
         // what they are, so they are not written.
-        let used = data
-            .patterns
-            .iter()
-            .rposition(|pattern| !pattern.iter().all(LaneData::is_pristine))
+        let used = (0..NUM_PATTERNS)
+            .rposition(|pattern| {
+                !data.patterns[pattern].iter().all(LaneData::is_pristine)
+                    || !data.pattern_name(pattern).is_empty()
+            })
             .map_or(0, |last| last + 1);
         SeqSnapshot {
             version: CURRENT_VERSION,
             lanes: data.lanes.iter().map(LaneSnapshot::from_lane).collect(),
-            patterns: data.patterns[..used]
-                .iter()
-                .map(|pattern| PatternSnapshot::from_lane_data(pattern))
+            patterns: (0..used)
+                .map(|pattern| PatternSnapshot {
+                    name: data.pattern_name(pattern).to_owned(),
+                    ..PatternSnapshot::from_lane_data(&data.patterns[pattern])
+                })
                 .collect(),
             song: SongSnapshot {
                 on: data.song.is_on(),
                 looped: data.song.is_looped(),
-                text: data.song.text.clone(),
+                blocks: data
+                    .song
+                    .blocks()
+                    .iter()
+                    .map(|block| SongBlockSnapshot {
+                        pattern: block.pattern,
+                        start: block.start,
+                        bars: block.bars,
+                    })
+                    .collect(),
+                text: String::new(),
             },
         }
     }
@@ -188,13 +221,36 @@ impl SeqSnapshot {
         // `SeqData::new` truncates and pads each pattern to `lanes.len()`, so
         // a misaligned file only needs the pattern *count* fixed here.
         self.patterns.truncate(NUM_PATTERNS);
+        let names = std::array::from_fn(|pattern| match self.patterns.get(pattern) {
+            Some(snapshot) => clean_pattern_name(&snapshot.name),
+            None => String::new(),
+        });
         let mut patterns = self.patterns.into_iter();
         let patterns = std::array::from_fn(|_| match patterns.next() {
             Some(pattern) => pattern.to_lane_data(),
             None => Vec::new(),
         });
-        let song = Song::from_text(self.song.text, self.song.on).with_looped(self.song.looped);
-        SeqData::new(lanes, patterns).with_song(song)
+        let mut data = SeqData::new(lanes, patterns);
+        data.pattern_names = names;
+        let song = &self.song;
+        let blocks = match (song.blocks.is_empty(), parse_song(&song.text)) {
+            // A save from before the grid: its order, laid out as it played
+            // in 4/4.
+            (true, Ok(entries)) if !entries.is_empty() => {
+                blocks_from_order(&entries, &PatternBars::all(&data, DEFAULT_BAR_BEATS))
+            }
+            _ => song
+                .blocks
+                .iter()
+                .map(|block| SongBlock {
+                    pattern: block.pattern,
+                    start: block.start,
+                    bars: block.bars,
+                })
+                .collect(),
+        };
+        let song = Song::from_blocks(blocks, song.on).with_looped(song.looped);
+        data.with_song(song)
     }
 }
 
@@ -243,6 +299,7 @@ impl PatternSnapshot {
     fn from_lane_data(lane_data: &[LaneData]) -> PatternSnapshot {
         PatternSnapshot {
             lanes: lane_data.iter().map(LaneDataSnapshot::from_lane_data).collect(),
+            name: String::new(),
         }
     }
 
@@ -433,7 +490,7 @@ fn free_lane_id(taken: &[u32]) -> u32 {
 mod tests {
     use super::*;
 
-    use crate::model::MAX_STEPS;
+    use crate::model::{MAX_SONG_BARS, MAX_STEPS};
 
     /// Three lanes with every identity field, flag, rate, length and step
     /// field set to something distinguishable, and capacities that are *not*
@@ -681,6 +738,7 @@ mod tests {
                             steps: vec![StepSnapshot::default(); steps],
                         })
                         .collect(),
+                    name: String::new(),
                 })
                 .collect(),
             song: SongSnapshot::default(),
@@ -900,18 +958,52 @@ mod tests {
         assert!(back.lanes[0].is_sample_pad());
     }
 
-    /// Song mode is saved and loaded, and a save from before it existed
-    /// loads with it off and empty.
+    /// The song grid is saved and loaded, and a save from before song mode
+    /// existed loads with it off and empty.
     #[test]
-    fn the_song_round_trips() {
-        let data = default_data().with_song(Song::from_text("1-2x3-0".into(), true));
-        let json = serde_json::to_string(&SeqSnapshot::from_data(&data)).expect("saves");
+    fn pattern_names_round_trip_and_are_cleaned_on_load() {
+        let mut data = default_data();
+        data.pattern_names[1] = "Verse".into();
+        data.pattern_names[40] = "Outro".into();
+        let snapshot = SeqSnapshot::from_data(&data);
+        assert_eq!(snapshot.patterns.len(), 41, "a named pattern is kept, steps or not");
+        let json = serde_json::to_string(&snapshot).expect("saves");
+        assert_eq!(json.matches("\"name\":\"Verse\"").count(), 1);
         let back: SeqSnapshot = serde_json::from_str(&json).expect("loads");
         let back = back.into_data();
+        assert_eq!(back.pattern_name(1), "Verse");
+        assert_eq!(back.pattern_name(40), "Outro");
+        assert_eq!(back.pattern_name(0), "");
+
+        let hostile = format!(
+            r#"{{"patterns":[{{"name":"  A\u0007B  "}},{{"name":"{}"}}]}}"#,
+            "y".repeat(500)
+        );
+        let hostile: SeqSnapshot = serde_json::from_str(&hostile).expect("loads");
+        let hostile = hostile.into_data();
+        assert_eq!(hostile.pattern_name(0), "AB");
+        assert_eq!(hostile.pattern_name(1).len(), crate::model::MAX_PATTERN_NAME_CHARS);
+    }
+
+    #[test]
+    fn the_song_round_trips() {
+        let blocks = vec![
+            SongBlock { pattern: 0, start: 0, bars: 2 },
+            SongBlock { pattern: 1, start: 0, bars: 4 },
+            SongBlock { pattern: 0, start: 2, bars: 1 },
+            SongBlock { pattern: 63, start: 9, bars: 3 },
+        ];
+        let data = default_data().with_song(Song::from_blocks(blocks.clone(), true));
+        let snapshot = SeqSnapshot::from_data(&data);
+        let json = serde_json::to_string(&snapshot).expect("saves");
+        assert!(!json.contains("\"text\""), "a new save writes no typed order: {json}");
+        let back: SeqSnapshot = serde_json::from_str(&json).expect("loads");
+        assert_eq!(back, snapshot);
+        let back = back.into_data();
         assert!(back.song.is_on());
-        assert_eq!(back.song.text, "1-2x3-0");
-        assert_eq!(back.song.entries, [0, 1, 1, 1, Song::REST]);
         assert!(back.song.is_looped());
+        assert_eq!(back.song.blocks(), Song::from_blocks(blocks, true).blocks());
+        assert_eq!(back.song.total_bars(), 12);
 
         data.song.set_looped(false);
         let json = serde_json::to_string(&SeqSnapshot::from_data(&data)).expect("saves");
@@ -922,9 +1014,71 @@ mod tests {
             serde_json::from_str(r#"{"version":1,"lanes":[],"patterns":[]}"#).expect("loads");
         let old = old.into_data();
         assert!(!old.song.is_on() && old.song.is_empty());
+    }
+
+    /// A save from before the grid holds a typed order: it opens laid out on
+    /// the grid as it played — each entry its pattern's length in 4/4, one
+    /// after another from bar 1, a rest one empty bar.
+    #[test]
+    fn a_typed_song_order_opens_on_the_grid() {
+        let data = default_data();
+        let mut snapshot = SeqSnapshot::from_data(&data);
+        // Pattern 3's first lane is 48 sixteenths: three bars.
+        let mut long = LaneDataSnapshot::from_lane_data(&LaneData::with_capacity(48));
+        long.length = 48;
+        while snapshot.patterns.len() < 3 {
+            snapshot.patterns.push(PatternSnapshot::from_lane_data(&data.patterns[0]));
+        }
+        snapshot.patterns[2].lanes[0] = long;
+        snapshot.song = SongSnapshot {
+            on: true,
+            looped: true,
+            blocks: Vec::new(),
+            text: "1-2x2-0-3".into(),
+        };
+
+        let song = snapshot.into_data().song;
+        assert!(song.is_on());
+        let block = |pattern, start, bars| SongBlock { pattern, start, bars };
+        assert_eq!(
+            song.blocks(),
+            [block(0, 0, 2), block(1, 2, 2), block(1, 4, 2), block(2, 7, 3)],
+            "fresh lanes are two bars; the rest is bar 7"
+        );
+
         let older = r#"{"version":1,"lanes":[],"patterns":[],"song":{"on":true,"text":"1"}}"#;
         let older: SeqSnapshot = serde_json::from_str(older).expect("loads");
-        assert!(older.into_data().song.is_looped(), "a song saved before the choice loops");
+        let older = older.into_data().song;
+        assert!(older.is_looped(), "a song saved before the choice loops");
+        assert_eq!(older.blocks(), [block(0, 0, 1)], "a pattern with no lanes is one bar");
+
+        let broken = r#"{"song":{"on":true,"text":"1-banana"}}"#;
+        let broken: SeqSnapshot = serde_json::from_str(broken).expect("loads");
+        assert!(broken.into_data().song.is_empty(), "an order that never parsed plays nothing");
+    }
+
+    /// Song blocks from a hostile file are repaired rather than trusted: a
+    /// pattern past the last is dropped, a block is clamped onto the grid and
+    /// made at least one bar long, and of two blocks of one pattern that
+    /// overlap the earlier is kept.
+    #[test]
+    fn hostile_song_blocks_are_repaired() {
+        let json = r#"{"song":{"on":true,"blocks":[
+            {"pattern":99,"start":0,"bars":4},
+            {"pattern":0,"start":4,"bars":0},
+            {"pattern":1,"start":0,"bars":8},
+            {"pattern":1,"start":3,"bars":2},
+            {"pattern":2,"start":4294967295,"bars":4294967295},
+            {"pattern":3,"start":4090,"bars":100}
+        ]}}"#;
+        let snapshot: SeqSnapshot = serde_json::from_str(json).expect("loads");
+        let song = snapshot.into_data().song;
+        let block = |pattern, start, bars| SongBlock { pattern, start, bars };
+        assert_eq!(
+            song.blocks(),
+            [block(1, 0, 8), block(0, 4, 1), block(3, 4090, MAX_SONG_BARS - 4090)]
+        );
+        assert_eq!(song.total_bars(), MAX_SONG_BARS);
     }
 
     /// Patterns past the last one with anything in them are left out of a

@@ -245,20 +245,59 @@ pub const SONG_WIDTH: f32 = 52.0;
 /// Width of each of the undo and redo buttons, right after the song toggle.
 pub const HISTORY_WIDTH: f32 = 52.0;
 
-/// Height of the song row under the top bar: a control and its padding, as
-/// the top bar is.
-pub const SONG_BAR_HEIGHT: f32 = TOP_BAR_HEIGHT;
+/// Width of the grid/steps view toggle, right after the song mode toggle
+/// (shown in song mode only).
+pub const ARRANGE_WIDTH: f32 = 52.0;
 
-/// One entry's cell in the song row, and the gap between cells. Room for two
-/// digits.
-pub const SONG_CELL_WIDTH: f32 = 24.0;
-pub const SONG_CELL_GAP: f32 = 2.0;
+// ---- the arranger (song grid) ----
 
-/// Every this many entries a song cell is shaded, so entries can be counted.
-pub const SONG_ENTRY_GROUP: usize = 4;
+/// One bar's column in the arranger, and the gap between columns: the step
+/// grid's own column pitch, so the two views read as one instrument.
+pub const ARRANGE_BAR_WIDTH: f32 = CELL_WIDTH;
+pub const ARRANGE_BAR_GAP: f32 = CELL_GAP;
+pub const ARRANGE_BAR_PITCH: f32 = ARRANGE_BAR_WIDTH + ARRANGE_BAR_GAP;
 
-/// The progress line along the bottom of a playing song entry.
-pub const SONG_PROGRESS_HEIGHT: f32 = 2.0;
+/// One pattern's row in the arranger, and the gap between rows. Shorter than
+/// a lane row, so more of the 64 patterns fit on screen.
+pub const ARRANGE_ROW_HEIGHT: f32 = 22.0;
+pub const ARRANGE_ROW_GAP: f32 = 2.0;
+pub const ARRANGE_ROW_PITCH: f32 = ARRANGE_ROW_HEIGHT + ARRANGE_ROW_GAP;
+
+/// The bar-number ruler along the top of the arranger. Tall enough for the
+/// loop switch in its corner, a control shorter than [`CONTROL_HEIGHT`].
+pub const ARRANGE_RULER_HEIGHT: f32 = 26.0;
+
+/// The pattern names' column down the left of the arranger: "Pattern 64"
+/// and its length in bars, much narrower than a lane header, which holds a
+/// lane's whole row of fields.
+pub const ARRANGE_HEADER_WIDTH: f32 = 140.0;
+
+/// How wide the grab for a block's right edge (its resize handle) is,
+/// inside the block.
+pub const ARRANGE_EDGE_WIDTH: f32 = 7.0;
+
+/// How many empty bars the arranger shows past the end of the song, so
+/// there is always room to place the next block.
+pub const ARRANGE_SPARE_BARS: u32 = 32;
+
+/// Every this many bars the arranger's columns are shaded and numbered.
+pub const ARRANGE_BAR_GROUP: u32 = 4;
+
+/// The arranger's playhead: a line down the bar being played.
+pub const ARRANGE_PLAYHEAD: Color32 = ACCENT;
+pub const ARRANGE_PLAYHEAD_WIDTH: f32 = 2.0;
+
+/// How much a block that is not sounding is dimmed against one that is.
+pub const ARRANGE_IDLE_FACTOR: f32 = 0.55;
+
+/// The lines inside a stretched block where its pattern starts again.
+pub const ARRANGE_REPEAT_LINE: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 90);
+
+/// The colour of pattern `pattern`'s blocks: the lane palette in turn, so
+/// neighbouring rows are told apart at a glance.
+pub fn pattern_colour(pattern: usize) -> Color32 {
+    lane_swatch(pattern)
+}
 
 /// The width of the top bar's toggle for the parameter panel, placed from
 /// the right like the follow toggle and the `+ Lane` button.

@@ -29,6 +29,8 @@ use nice_plug_egui::{
     create_egui_editor,
 };
 
+mod arrange;
+pub mod arrange_math;
 pub mod grid_math;
 pub mod keys;
 pub mod theme;
@@ -36,8 +38,7 @@ pub mod theme;
 use crate::BitstepParams;
 use crate::engine::BlockCtx;
 use crate::model::{
-    Lane, LaneData, MAX_LANES, NUM_PATTERNS, PatternBars, Playhead, SeqData, SeqModel, Song, Step,
-    parse_song,
+    Lane, LaneData, MAX_LANES, NUM_PATTERNS, Playhead, SeqData, SeqModel, Step,
 };
 use crate::sequencer::{Prng, Rate, lane_is_audible};
 use crate::state;
@@ -182,11 +183,8 @@ const PANEL_LABEL: &str = "Params";
 /// The label of the top bar's song mode toggle.
 const SONG_LABEL: &str = "Song";
 
-/// The song order text field's id.
-const SONG_TEXT_ID: &str = "bitstep:song-text";
-
-/// The song row's bar cells' id.
-const SONG_STRIP_ID: &str = "bitstep:song-strip";
+/// The label of the top bar's grid/steps view toggle (song mode only).
+const ARRANGE_LABEL: &str = "Grid";
 
 /// The parameter panel's drawing area, as the step strip's
 /// [`STEP_STRIP_ID`].
@@ -271,12 +269,22 @@ pub struct BitstepEditor {
     /// shown pattern changes the page follows it; the arrows move it freely
     /// in between.
     paged_for: Option<usize>,
-    /// What is being typed into the song order field: the keyboard's buffer,
-    /// like [`Self::rename`]. Each keystroke that reads as a song is written
-    /// through at once.
-    song_edit: Option<String>,
-    /// How far the song row's bar cells are scrolled, in points.
-    song_scroll: f32,
+    /// Which view the window shows: the steps of one pattern, or the song
+    /// grid. GUI-only, and the grid only in song mode: turning song mode on
+    /// shows the grid, off goes back to the steps ([`Self::follow_song_mode`]).
+    view: View,
+    /// Song mode as the GUI last saw it, so a change from anywhere (the
+    /// toggle, a project load) switches the view once.
+    song_on: bool,
+    /// How far the arranger is scrolled, in points: its own offset, so
+    /// switching views keeps each where it was.
+    arrange_scroll: Vec2,
+    /// A block being moved or resized in the arranger, while the button is
+    /// down ([`arrange::ArrangeGesture`]).
+    arrange_gesture: Option<arrange::ArrangeGesture>,
+    /// The block the last press in the arranger placed, while presses keep
+    /// landing on it: a double-click on an empty bar must place, not open.
+    arrange_placed: Option<crate::model::SongBlock>,
     /// The dice a lane's "randomise" menu item rolls.
     ///
     /// The editor's own generator, never the audio thread's: `randomise_lane`
@@ -333,6 +341,15 @@ struct ParamStroke {
     /// grid gesture ([`BitstepEditor::gesture_pattern`]).
     pattern: usize,
     draw: LevelDraw,
+}
+
+/// What the window shows under the top bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    /// One pattern's steps, lane by lane: the step grid and its panel.
+    Steps,
+    /// The song grid: one row per pattern, one column per bar.
+    Arrange,
 }
 
 /// What the primary button does on the step grid.
@@ -433,7 +450,7 @@ struct LaneRename {
 /// scrolling away) saves the name, and Escape puts the old one back — which
 /// needs the old one untouched until then. By lane id, like every gesture.
 struct NameEdit {
-    lane_id: u32,
+    target: NameTarget,
     text: String,
     /// Set until the field has been drawn once: that frame gives it the
     /// keyboard and selects the whole name.
@@ -442,6 +459,15 @@ struct NameEdit {
     /// drawn, its field loses the keyboard with it, and that counts as
     /// leaving the field.
     shown: bool,
+}
+
+/// What an in-place name edit ([`NameEdit`]) renames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NameTarget {
+    /// A lane, by id: its header's name in the steps view.
+    Lane(u32),
+    /// A pattern, by index: its row's name in the song grid.
+    Pattern(usize),
 }
 
 /// How an in-place name edit ended ([`name_field`]).
@@ -657,8 +683,11 @@ impl BitstepEditor {
             pattern_copy: None,
             pattern_page: 0,
             paged_for: None,
-            song_edit: None,
-            song_scroll: 0.0,
+            view: View::Steps,
+            song_on: false,
+            arrange_scroll: Vec2::ZERO,
+            arrange_gesture: None,
+            arrange_placed: None,
             rng: Prng::new(clock_seed()),
             scroll: Vec2::ZERO,
             follow: true,
@@ -670,6 +699,92 @@ impl BitstepEditor {
             key_forwarder: None,
             key_forwarder_tried: false,
             repaint: RepaintNotifier::new(),
+        }
+    }
+
+    /// The window split for the view on show: the steps view with its
+    /// parameter panel (when open), the arranger with its ruler.
+    fn layout(&self, full: Rect) -> EditorLayout {
+        let layout = match self.view {
+            View::Steps => {
+                let panel = if self.panel_open { theme::PARAM_PANEL_HEIGHT } else { 0.0 };
+                EditorLayout::from_theme(full).with_panel(panel)
+            }
+            View::Arrange => {
+                EditorLayout::new(full, theme::TOP_BAR_HEIGHT, theme::ARRANGE_HEADER_WIDTH)
+                    .with_ruler(theme::ARRANGE_RULER_HEIGHT)
+            }
+        };
+        layout.with_view_toggle(self.song_on)
+    }
+
+    /// Keeps the view in step with song mode: when it turns on the grid is
+    /// shown, when it turns off the steps are (the grid is for song mode
+    /// only). Nothing changes while it stays the same, so the view toggle
+    /// can pick the steps in song mode.
+    fn follow_song_mode(&mut self, on: bool) {
+        if on != self.song_on {
+            self.song_on = on;
+            self.show_view(if on { View::Arrange } else { View::Steps });
+        }
+    }
+
+    /// The steps view under the top bar: the step strip, the lane headers
+    /// and the parameter panel.
+    fn ui_steps(
+        &mut self,
+        ui: &mut egui::Ui,
+        layout: &EditorLayout,
+        data: &SeqData,
+        pattern: usize,
+    ) {
+        let view = self.settle_scroll(layout, data, pattern);
+
+        // Before the painting, so a step edited by this frame's press is
+        // already drawn in its new state: value edits land in the `SeqData`
+        // this frame is holding, not in a replacement for it.
+        let hover = self.interact_steps(ui, &view, data, pattern);
+
+        // No panel is shown, so nothing paints the window for us.
+        paint_chrome(ui.painter(), layout);
+        // Clipped to the strip: a lane longer than the window — or one the
+        // scroll has moved out of it — must not draw over the headers.
+        paint_steps(
+            &ui.painter_at(layout.steps()),
+            &view,
+            data,
+            pattern,
+            &self.playhead,
+            self.mode,
+            hover,
+        );
+        if data.lane_count() == 0 {
+            paint_empty_hint(&ui.painter_at(layout.steps()), layout);
+        }
+        self.ui_lane_headers(ui, layout, &view, data, pattern);
+        self.ui_param_panel(ui, layout, data, pattern);
+    }
+
+    /// Shows pattern `pattern`'s steps: the steps view, with `patsel` moved
+    /// to it (which in song mode picks only what is shown).
+    fn open_pattern(&mut self, pattern: usize) {
+        self.set_pattern(pattern);
+        self.show_view(View::Steps);
+    }
+
+    /// Switches the view, dropping whatever the other one had in hand: a
+    /// gesture or popover of the steps view must not come back later on a
+    /// grid it was not started on, nor a block drag outlive the arranger.
+    fn show_view(&mut self, view: View) {
+        self.view = view;
+        self.arrange_gesture = None;
+        self.arrange_placed = None;
+        self.gesture = None;
+        self.popover = None;
+        // A name being typed in place is left by switching away: saved now,
+        // as a click elsewhere would save it.
+        if let Some(edit) = self.name_edit.take() {
+            save_name(&self.model, edit);
         }
     }
 
@@ -1323,7 +1438,12 @@ impl BitstepEditor {
         if delta == Vec2::ZERO || !delta.is_finite() {
             return;
         }
-        self.scroll -= delta;
+        // Each view keeps its own offset; the arranger clamps its own the
+        // next frame, as `settle_scroll` does the strip's.
+        match self.view {
+            View::Steps => self.scroll -= delta,
+            View::Arrange => self.arrange_scroll -= delta,
+        }
     }
 
     /// Settles the step strip's scroll offset for this frame, and hands back
@@ -1383,7 +1503,7 @@ impl BitstepEditor {
         let any_solo = data.any_solo();
         let selected_row = self.selected_row(data);
         if let Some(edit) = self.name_edit.as_mut() {
-            edit.shown = false;
+            edit.shown = !matches!(edit.target, NameTarget::Lane(_));
         }
 
         ui.scope_builder(UiBuilder::new().max_rect(headers), |ui| {
@@ -1412,10 +1532,8 @@ impl BitstepEditor {
         });
         // A name field whose row was not drawn has lost the keyboard without
         // being told: that is leaving the field, so the name is saved.
-        if let Some(edit) = self.name_edit.take_if(|edit| !edit.shown)
-            && let Some(lane) = data.position_of(edit.lane_id).and_then(|pos| data.lane(pos))
-        {
-            save_name(&self.model, lane, edit);
+        if let Some(edit) = self.name_edit.take_if(|edit| !edit.shown) {
+            save_name(&self.model, edit);
         }
         self.continue_lane_drag(ui, layout, view, data);
     }
@@ -1534,10 +1652,12 @@ impl BitstepEditor {
             // new one in place ([`NameEdit`]).
             let pointer = handle.interact_pointer_pos();
             let on_name = pointer.is_some_and(|pos| fields.name.contains(pos));
-            let editing = name_edit.as_ref().is_some_and(|edit| edit.lane_id == lane.id);
+            let name_target = NameTarget::Lane(lane.id);
+            let editing = name_edit.as_ref().is_some_and(|edit| edit.target == name_target);
             if handle.double_clicked() && on_name && !editing {
                 let text = lane.name.clone();
-                *name_edit = Some(NameEdit { lane_id: lane.id, text, opening: true, shown: true });
+                let target = name_target;
+                *name_edit = Some(NameEdit { target, text, opening: true, shown: true });
             }
             if place.selected {
                 ui.painter().rect_filled(band, CornerRadius::ZERO, theme::SELECTED_ROW);
@@ -1581,11 +1701,11 @@ impl BitstepEditor {
             // finds the row by and a long one may not push the controls out of
             // line. A double-click types a new one in place; renaming is also
             // in the context menu behind it.
-            match name_edit.as_mut().filter(|edit| edit.lane_id == lane.id) {
+            match name_edit.as_mut().filter(|edit| edit.target == name_target) {
                 Some(edit) => match name_field(ui, fields.name, edit) {
                     Some(NameEditEnd::Save) => {
                         let edit = name_edit.take().expect("the edit just drawn");
-                        save_name(model, lane, edit);
+                        save_name(model, edit);
                     }
                     Some(NameEditEnd::Cancel) => *name_edit = None,
                     None => {}
@@ -1800,7 +1920,7 @@ impl BitstepEditor {
             // of it, the lit button is the one playing and the accent marks
             // one asked for but not yet reached.
             let (lit, accent, hover) = if song {
-                let playing_here = playing == Some(index) && shown != index;
+                let playing_here = self.playhead.song_plays(index) && shown != index;
                 let hover = match playing_here {
                     true => format!("Pattern {number} is playing in the song. Click to edit it."),
                     false => format!("Edit pattern {number}. Right-click to copy it."),
@@ -1815,6 +1935,11 @@ impl BitstepEditor {
                 };
                 (active, pending, hover)
             };
+            // A named pattern says its name first.
+            let hover = match data.pattern_name(index) {
+                "" => hover,
+                name => format!("{name}\n{hover}"),
+            };
             let mut label = RichText::new(number.to_string());
             if accent {
                 label = label.color(theme::ACCENT);
@@ -1825,192 +1950,6 @@ impl BitstepEditor {
             }
             self.pattern_menu(&button, data, index);
             button.on_hover_text(hover);
-        }
-    }
-
-    /// The song row, shown while song mode is on: the order as typed on the
-    /// left, and one cell per entry over the step strip.
-    ///
-    /// The cells show each entry's pattern. The entry playing is filled with
-    /// the accent (with a line under it filling up through an entry longer
-    /// than a bar), and the entries that play the pattern on screen are
-    /// outlined, so the grid's pattern can be found in the song. Clicking a
-    /// cell shows its pattern in the grid.
-    fn ui_song_bar(
-        &mut self,
-        ui: &mut egui::Ui,
-        layout: &EditorLayout,
-        data: &SeqData,
-        shown: usize,
-    ) {
-        if layout.song_bar().height() <= 0.0 {
-            // Song mode is off: forget the typing, so the field opens fresh.
-            self.song_edit = None;
-            return;
-        }
-        let song = &data.song;
-        // The bar length the audio thread last saw: until the host has said,
-        // 4/4.
-        let lengths = PatternBars::new(data, self.playhead.bar_beats());
-
-        let slot = layout.song_text();
-        if slot.is_positive() {
-            let model = &self.model;
-            let held = self.song_edit.get_or_insert_with(|| song.text.clone());
-            let field = ui.put(
-                slot,
-                TextEdit::singleline(held)
-                    .id_salt(SONG_TEXT_ID)
-                    .hint_text("Pattern order: 1-2-1-3x2")
-                    .desired_width(slot.width()),
-            );
-            if field.changed() {
-                // A half-typed song is left unwritten until it reads as one.
-                let _ = model.set_song(held);
-            } else if !field.has_focus() && *held != song.text {
-                // A load moved the song under the buffer, or the field was
-                // left holding text that never read as a song.
-                *held = song.text.clone();
-            }
-            let hover = match parse_song(held) {
-                Ok(_) => format!(
-                    "The patterns to play from the start of the song, each to its end. \
-                     \"1-2-1-3\" plays 1, 2, 1, 3; \"4x2\" plays 4 twice; 0 is a silent bar. \
-                     {} bars.",
-                    song.total_bars(&lengths)
-                ),
-                Err(error) => {
-                    let stroke = egui::Stroke::new(theme::HAIRLINE, theme::WARN);
-                    let corner = theme::CONTROL_CORNER;
-                    ui.painter().rect_stroke(field.rect, corner, stroke, StrokeKind::Outside);
-                    format!("{error}. The song keeps playing what it had.")
-                }
-            };
-            field.on_hover_text(hover);
-        }
-
-        let strip = layout.song_strip();
-        if !strip.is_positive() {
-            return;
-        }
-        let entries = song.len();
-        // One more cell than entries: the end marker.
-        let cells = entries + 1;
-        let response = ui.interact(strip, egui::Id::unique(SONG_STRIP_ID), Sense::click());
-        if response.hovered() {
-            let delta = ui.input_mut(|input| std::mem::take(&mut input.smooth_scroll_delta));
-            if delta.is_finite() {
-                self.song_scroll -= delta.x + delta.y;
-            }
-        }
-        // A bar playing in no entry is past the end: the end marker lights.
-        let bar = self.playhead.song_bar();
-        let playing = match self.playhead.song_entry() {
-            Some(entry) => Some((entry as usize).min(entries)),
-            None => bar.map(|_| entries),
-        };
-        if self.follow && let Some(cell) = playing {
-            let scroll = self.song_scroll;
-            self.song_scroll = grid_math::song_follow(scroll, strip.width(), entries, cell);
-        }
-        let max = grid_math::song_max_scroll(strip.width(), entries);
-        self.song_scroll = self.song_scroll.max(0.0).min(max);
-        let scroll = self.song_scroll;
-
-        let painter = ui.painter_at(strip);
-        if entries == 0 {
-            painter.text(
-                strip.left_center(),
-                Align2::LEFT_CENTER,
-                "Type the pattern order on the left to start the song",
-                FontId::proportional(theme::HINT_SIZE * 0.8),
-                theme::TEXT_DIM,
-            );
-        }
-        let font = FontId::proportional(theme::PITCH_LABEL_SIZE + 2.0);
-        let looped = song.is_looped();
-        for index in grid_math::song_visible(strip.width(), scroll, cells) {
-            let cell = grid_math::song_cell(strip, scroll, index);
-            let here = playing == Some(index);
-            if index == entries {
-                // The switch for what happens after the last entry.
-                let (label, colour) = match (looped, here) {
-                    (true, _) => ("loop", theme::ACCENT),
-                    (false, true) => ("end", theme::ACCENT),
-                    (false, false) => ("end", theme::TEXT_DIM),
-                };
-                let stroke = egui::Stroke::new(theme::HAIRLINE, colour);
-                painter.rect_stroke(cell, theme::CELL_CORNER, stroke, StrokeKind::Inside);
-                let small = FontId::proportional(theme::PITCH_LABEL_SIZE);
-                painter.text(cell.center(), Align2::CENTER_CENTER, label, small, colour);
-                continue;
-            }
-            let entry = song.entries[index];
-            let fill = match (here, (index / theme::SONG_ENTRY_GROUP) % 2 == 1) {
-                (true, _) => theme::ACCENT,
-                (false, true) => theme::CELL_SHADED,
-                (false, false) => theme::CELL,
-            };
-            painter.rect_filled(cell, theme::CELL_CORNER, fill);
-            if usize::from(entry) == shown {
-                let stroke = egui::Stroke::new(theme::HAIRLINE, theme::ACCENT);
-                painter.rect_stroke(cell, theme::CELL_CORNER, stroke, StrokeKind::Inside);
-            }
-            let label = match entry {
-                Song::REST => "·".to_owned(),
-                pattern => (usize::from(pattern) + 1).to_string(),
-            };
-            let colour = if here { theme::WINDOW } else { theme::TEXT };
-            painter.text(cell.center(), Align2::CENTER_CENTER, label, font.clone(), colour);
-            // An entry longer than a bar shows how far through it the song is.
-            if here
-                && let Some(bar) = bar
-                && let Some(pos) = song.positions(&lengths).nth(index)
-                && pos.bars > 1
-            {
-                let done = (i64::from(bar) - pos.start_bar + 1) as f32 / pos.bars as f32;
-                let width = cell.width() * done.clamp(0.0, 1.0);
-                let mut line = cell;
-                line.min.y = cell.max.y - theme::SONG_PROGRESS_HEIGHT;
-                line.max.x = cell.min.x + width;
-                painter.rect_filled(line, 0.0, theme::WINDOW);
-            }
-        }
-
-        let hovered = response
-            .hover_pos()
-            .and_then(|pos| grid_math::song_cell_at(strip, scroll, pos))
-            .filter(|&index| index <= entries);
-        let clicked = response
-            .clicked()
-            .then(|| response.interact_pointer_pos())
-            .flatten()
-            .and_then(|pos| grid_math::song_cell_at(strip, scroll, pos));
-        if clicked == Some(entries) {
-            self.model.set_song_looped(!looped);
-        } else if let Some(&entry) = clicked.and_then(|index| song.entries.get(index))
-            && let Some(pattern) = Song::pattern_of(entry)
-        {
-            self.set_pattern(pattern);
-        }
-        if hovered == Some(entries) {
-            let text = match looped {
-                true => "After the last pattern the song starts again from the first. \
-                         Click to stop at the end instead.",
-                false => "After the last pattern the song goes silent. \
-                          Click to loop back to the first pattern instead.",
-            };
-            response.on_hover_text(text);
-        } else if let Some(pos) = hovered.and_then(|index| song.positions(&lengths).nth(index)) {
-            let bars = match pos.bars {
-                1 => format!("Bar {}", pos.start_bar + 1),
-                _ => format!("Bars {}-{}", pos.start_bar + 1, pos.end_bar()),
-            };
-            let text = match pos.pattern {
-                Some(pattern) => format!("{bars}: pattern {}. Click to edit it.", pattern + 1),
-                None => format!("{bars}: silent"),
-            };
-            response.on_hover_text(text);
         }
     }
 
@@ -2346,7 +2285,8 @@ impl BitstepEditor {
         let busy = ui.input(|input| input.pointer.any_down())
             || self.gesture.is_some()
             || self.lane_drag.is_some()
-            || self.param_draw.is_some();
+            || self.param_draw.is_some()
+            || self.arrange_gesture.is_some();
         if busy {
             // Mid-gesture the shortcut is dropped: undoing under a drag would
             // have the drag's next write land on the restored sequence.
@@ -2435,11 +2375,26 @@ impl BitstepEditor {
             let toggle = ui.put(slot, Button::new(SONG_LABEL).selected(on));
             if toggle.clicked() {
                 self.model.set_song_on(!on);
+                self.follow_song_mode(!on);
             }
             toggle.on_hover_text(
-                "Song mode: play patterns in the order you type, one per bar, \
+                "Song mode: play the patterns placed on the song grid, \
                  following Bitwig's timeline",
             );
+        }
+
+        let slot = layout.arrange_button();
+        if slot.is_positive() {
+            let shown = self.view == View::Arrange;
+            let toggle = ui.put(slot, Button::new(ARRANGE_LABEL).selected(shown));
+            if toggle.clicked() {
+                self.show_view(if shown { View::Steps } else { View::Arrange });
+            }
+            toggle.on_hover_text(match shown {
+                true => "Showing the song grid. Click to edit the selected pattern's steps \
+                         (or double-click a block to edit its pattern).",
+                false => "Back to the song grid",
+            });
         }
 
         let history = [
@@ -2501,9 +2456,7 @@ impl BitstepEditor {
         );
         let line = match (data.song.is_on(), self.playhead.song_bar()) {
             (true, Some(bar)) => {
-                let lengths = PatternBars::new(data, self.playhead.bar_beats());
-                let total = data.song.total_bars(&lengths);
-                format!("{line}, song bar {} of {total}", bar + 1)
+                format!("{line}, song bar {} of {}", bar + 1, data.song.total_bars())
             }
             _ => line,
         };
@@ -2648,8 +2601,15 @@ fn write_field(
 fn name_field(ui: &mut egui::Ui, rect: Rect, edit: &mut NameEdit) -> Option<NameEditEnd> {
     edit.shown = true;
     let id = ui.make_persistent_id(NAME_EDIT_ID);
-    let field = TextEdit::singleline(&mut edit.text).id(id).char_limit(LANE_NAME_LIMIT);
-    let response = ui.put(rect, field);
+    let limit = match edit.target {
+        NameTarget::Lane(_) => LANE_NAME_LIMIT,
+        NameTarget::Pattern(_) => crate::model::MAX_PATTERN_NAME_CHARS,
+    };
+    let field = TextEdit::singleline(&mut edit.text).id(id).char_limit(limit);
+    // No taller than its slot: a song grid row is shorter than a control.
+    let mut slot = ui.new_child(UiBuilder::new().max_rect(rect));
+    slot.spacing_mut().interact_size.y = slot.spacing().interact_size.y.min(rect.height());
+    let response = slot.put(rect, field);
     if std::mem::take(&mut edit.opening) {
         response.request_focus();
         let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
@@ -2665,12 +2625,27 @@ fn name_field(ui: &mut egui::Ui, rect: Rect, edit: &mut NameEdit) -> Option<Name
     Some(if escaped { NameEditEnd::Cancel } else { NameEditEnd::Save })
 }
 
-/// Saves what an in-place name edit typed as `lane`'s name. A blank name
-/// keeps the old one, and an unchanged one writes nothing: a rename is a
-/// shape edit, which republishes the whole sequence.
-fn save_name(model: &SeqModel, lane: &Lane, edit: NameEdit) {
-    if !edit.text.trim().is_empty() && edit.text != lane.name {
-        model.rename_lane(lane.id, edit.text);
+/// Saves what an in-place name edit typed. An unchanged name writes
+/// nothing: a rename is a shape edit, which republishes the whole sequence.
+/// A blank lane name keeps the old one; a blank pattern name takes its name
+/// away, so it shows as "Pattern N" again.
+fn save_name(model: &SeqModel, edit: NameEdit) {
+    match edit.target {
+        NameTarget::Lane(lane_id) => {
+            let data = model.shared();
+            let Some(lane) = data.position_of(lane_id).and_then(|pos| data.lane(pos)) else {
+                return;
+            };
+            if !edit.text.trim().is_empty() && edit.text != lane.name {
+                model.rename_lane(lane_id, edit.text);
+            }
+        }
+        // `rename_pattern` cleans the name and skips an unchanged one. The
+        // label a pattern without a name shows, saved as it was, is no name.
+        NameTarget::Pattern(pattern) => {
+            let unnamed = edit.text.trim() == arrange::default_pattern_label(pattern);
+            model.rename_pattern(pattern, if unnamed { "" } else { &edit.text });
+        }
     }
 }
 
@@ -3086,10 +3061,10 @@ fn paint_chrome(painter: &Painter, layout: &EditorLayout) {
     let line = egui::Stroke::new(theme::HAIRLINE, theme::GRID_LINE);
     let bar = layout.top_bar();
     painter.hline(bar.x_range(), bar.max.y, line);
-    let song = layout.song_bar();
-    if song.height() > 0.0 {
-        painter.rect_filled(song, CornerRadius::ZERO, theme::PANEL);
-        painter.hline(song.x_range(), song.max.y, line);
+    let ruler = layout.ruler();
+    if ruler.height() > 0.0 {
+        painter.rect_filled(ruler, CornerRadius::ZERO, theme::PANEL);
+        painter.hline(ruler.x_range(), ruler.max.y, line);
     }
     let headers = layout.headers();
     painter.vline(headers.max.x, headers.y_range(), line);
@@ -3346,41 +3321,23 @@ impl NiceEguiApp for BitstepEditor {
         // change underneath a half-drawn grid.
         let data = self.model.shared();
         let pattern = self.shown_pattern();
-        let panel = if self.panel_open { theme::PARAM_PANEL_HEIGHT } else { 0.0 };
-        let song = if data.song.is_on() { theme::SONG_BAR_HEIGHT } else { 0.0 };
-        let layout =
-            EditorLayout::from_theme(ui.max_rect()).with_song_bar(song).with_panel(panel);
-        let view = self.settle_scroll(&layout, &data, pattern);
-
-        // Before the painting, so a step edited by this frame's press is
-        // already drawn in its new state: value edits land in the `SeqData`
-        // this frame is holding, not in a replacement for it.
-        let hover = self.interact_steps(ui, &view, &data, pattern);
-
-        // No panel is shown, so nothing paints the window for us.
-        paint_chrome(ui.painter(), &layout);
-        // Clipped to the strip: a lane longer than the window — or one the
-        // scroll has moved out of it — must not draw over the headers.
-        paint_steps(
-            &ui.painter_at(layout.steps()),
-            &view,
-            &data,
-            pattern,
-            &self.playhead,
-            self.mode,
-            hover,
-        );
-        if data.lane_count() == 0 {
-            paint_empty_hint(&ui.painter_at(layout.steps()), &layout);
+        self.follow_song_mode(data.song.is_on());
+        let layout = self.layout(ui.max_rect());
+        match self.view {
+            View::Steps => self.ui_steps(ui, &layout, &data, pattern),
+            View::Arrange => {
+                // No panel is shown, so nothing paints the window for us.
+                paint_chrome(ui.painter(), &layout);
+                self.ui_arrange(ui, &layout, &data, pattern);
+            }
         }
-        self.ui_lane_headers(ui, &layout, &view, &data, pattern);
-        self.ui_param_panel(ui, &layout, &data, pattern);
         self.ui_top_bar(ui, &layout, &data);
-        self.ui_song_bar(ui, &layout, &data, pattern);
-        // Last of the widgets, so its own layer is created above every one of
-        // them and a click on a slider in it cannot fall through to the cell
-        // underneath.
-        self.ui_step_popover(ui, &data, pattern);
+        if self.view == View::Steps {
+            // Last of the widgets, so its own layer is created above every
+            // one of them and a click on a slider in it cannot fall through
+            // to the cell underneath.
+            self.ui_step_popover(ui, &data, pattern);
+        }
 
         // Last of the input handling, so every widget above has had its turn
         // at the wheel — see [`BitstepEditor::scroll_grid`].
@@ -3713,15 +3670,20 @@ mod tests {
         // nice-plug-egui hands `NiceEguiApp::ui`.
         let mut output = ctx.run_ui(input, |ui| {
             app.handle_history(ui);
+            app.follow_song_mode(data.song.is_on());
             let layout = test_layout(app, ui.max_rect());
-            let view = app.settle_scroll(&layout, &data, pattern);
-            if data.lane_count() == 0 {
-                paint_empty_hint(&ui.painter_at(layout.steps()), &layout);
+            match app.view {
+                View::Steps => {
+                    let view = app.settle_scroll(&layout, &data, pattern);
+                    if data.lane_count() == 0 {
+                        paint_empty_hint(&ui.painter_at(layout.steps()), &layout);
+                    }
+                    app.ui_lane_headers(ui, &layout, &view, &data, pattern);
+                    app.ui_param_panel(ui, &layout, &data, pattern);
+                }
+                View::Arrange => app.ui_arrange(ui, &layout, &data, pattern),
             }
-            app.ui_lane_headers(ui, &layout, &view, &data, pattern);
-            app.ui_param_panel(ui, &layout, &data, pattern);
             app.ui_top_bar(ui, &layout, &data);
-            app.ui_song_bar(ui, &layout, &data, pattern);
             app.scroll_grid(ui, &layout);
         });
         // Nobody is uploading the font atlas here, and epaint panics on a
@@ -3735,9 +3697,7 @@ mod tests {
     /// The layout `ui()` uses for `app`: the song row and the panel
     /// included when they are shown.
     fn test_layout(app: &BitstepEditor, window: egui::Rect) -> EditorLayout {
-        let panel = if app.panel_open { theme::PARAM_PANEL_HEIGHT } else { 0.0 };
-        let song = if app.model.shared().song.is_on() { theme::SONG_BAR_HEIGHT } else { 0.0 };
-        EditorLayout::from_theme(window).with_song_bar(song).with_panel(panel)
+        app.layout(window)
     }
 
     /// Drawing in the parameter panel sets the selected lane's steps to the
@@ -4243,7 +4203,8 @@ mod tests {
         click_at(&mut app, &ctx, fields.name.center());
         click_at(&mut app, &ctx, fields.name.center());
         let lane_id = model.shared().lane(row).expect("lane 1").id;
-        assert!(app.name_edit.as_ref().is_some_and(|edit| edit.lane_id == lane_id));
+        let target = NameTarget::Lane(lane_id);
+        assert!(app.name_edit.as_ref().is_some_and(|edit| edit.target == target));
         assert!(ctx.text_edit_focused(), "the field has the keyboard");
 
         run_frame(&mut app, &ctx, vec![egui::Event::Text("Snare".into())]);
@@ -5195,60 +5156,370 @@ mod tests {
         model.collect();
     }
 
-    /// Song mode from the editor: the toggle turns it on and shows the row,
-    /// typing a pattern order writes the song as soon as it reads as one,
-    /// and clicking a bar shows its pattern in the grid.
-    #[test]
-    fn the_song_row_is_switched_on_typed_into_and_clicked() {
+    /// The arranger as the test window draws it this frame.
+    fn arrange_view(app: &BitstepEditor) -> arrange_math::ArrangeView {
+        let viewport = test_layout(app, test_window()).steps();
+        let columns = arrange_math::ArrangeView::columns(
+            app.model.shared().song.total_bars(),
+            viewport.width(),
+        );
+        arrange_math::ArrangeView::new(viewport, app.arrange_scroll, columns)
+    }
+
+    /// A fresh editor in song mode, showing the arranger, and its context.
+    fn arranger() -> (Arc<SeqModel>, BitstepEditor, egui::Context) {
         let model = Arc::new(SeqModel::new(state::default_data()));
+        model.set_song_on(true);
         let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
-        let mut app =
-            BitstepEditor::new(Arc::clone(&params), Arc::clone(&model), Arc::new(Playhead::new()));
+        let mut app = BitstepEditor::new(params, Arc::clone(&model), Arc::new(Playhead::new()));
+        // So selecting a pattern reaches `patsel`.
         let host = Arc::new(FakeHost::default());
-        app.gui_context = Some(GuiContext::new(Arc::clone(&host) as Arc<dyn GuiContextInner>));
+        app.gui_context = Some(GuiContext::new(host as Arc<dyn GuiContextInner>));
+        app.follow = false;
         let ctx = egui::Context::default();
         theme::apply(&ctx);
+        run_frame(&mut app, &ctx, Vec::new());
+        assert_eq!(app.view, View::Arrange, "song mode opens on the grid");
+        (model, app, ctx)
+    }
 
+    fn song_block(pattern: u8, start: u32, bars: u32) -> crate::model::SongBlock {
+        crate::model::SongBlock { pattern, start, bars }
+    }
+
+    /// The Song toggle switches song mode and shows the song grid with it
+    /// (and the steps again when it goes off); the Grid toggle, there in
+    /// song mode only, flips the view on its own, without touching what
+    /// plays.
+    #[test]
+    fn song_mode_and_the_grid_toggle_switch_the_view() {
+        let model = Arc::new(SeqModel::new(state::default_data()));
+        let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
+        let mut app = BitstepEditor::new(params, Arc::clone(&model), Arc::new(Playhead::new()));
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
         let off = test_layout(&app, test_window());
-        assert_eq!(off.song_bar().height(), 0.0, "no song row while song mode is off");
+        assert!(!off.arrange_button().is_positive(), "no grid toggle out of song mode");
+
         click_at(&mut app, &ctx, off.song_button().center());
-        assert!(model.shared().song.is_on(), "the toggle turns song mode on");
+        assert!(model.shared().song.is_on());
+        assert_eq!(app.view, View::Arrange, "song mode opens the grid");
+        assert!(test_layout(&app, test_window()).ruler().height() > 0.0);
+        let layout = test_layout(&app, test_window());
+        assert!(layout.arrange_button().is_positive());
 
-        let on = test_layout(&app, test_window());
-        assert_eq!(on.song_bar().height(), theme::SONG_BAR_HEIGHT);
-        click_at(&mut app, &ctx, on.song_text().center());
-        run_frame(&mut app, &ctx, vec![egui::Event::Text("1-3x2".into())]);
-        assert_eq!(model.shared().song.entries, [0, 2, 2]);
-        assert_eq!(model.shared().song.text, "1-3x2");
+        click_at(&mut app, &ctx, layout.arrange_button().center());
+        assert_eq!(app.view, View::Steps, "the steps, with the song still on");
+        assert!(model.shared().song.is_on());
+        click_at(&mut app, &ctx, layout.arrange_button().center());
+        assert_eq!(app.view, View::Arrange);
 
-        // Half-typed: "1-3x2-9" is a song, "1-3x2-99" is not, and is left
-        // unwritten.
-        run_frame(&mut app, &ctx, vec![egui::Event::Text("-9".into())]);
-        assert_eq!(model.shared().song.text, "1-3x2-9");
-        run_frame(&mut app, &ctx, vec![egui::Event::Text("9".into())]);
-        assert_eq!(model.shared().song.text, "1-3x2-9", "pattern 99 does not exist");
-        assert_eq!(app.song_edit.as_deref(), Some("1-3x2-99"), "but the field keeps it");
-
-        // The second bar plays pattern 3: clicking it shows pattern 3.
-        let strip = on.song_strip();
-        click_at(&mut app, &ctx, grid_math::song_cell(strip, 0.0, 1).center());
-        assert_eq!(params.pattern_select(), 3);
-        assert_eq!(host.calls()[1], "set 3");
-
-        // The cell after the last entry ("1-3x2-9" has four) is the switch
-        // between looping and stopping at the end.
-        assert!(model.shared().song.is_looped(), "looped to begin with");
-        let end = grid_math::song_cell(strip, 0.0, 4).center();
-        click_at(&mut app, &ctx, end);
-        assert!(!model.shared().song.is_looped());
-        click_at(&mut app, &ctx, end);
-        assert!(model.shared().song.is_looped());
-        assert_eq!(params.pattern_select(), 3, "and it picks no pattern");
-
-        // Off again, the row goes and `patsel` plays.
-        click_at(&mut app, &ctx, on.song_button().center());
+        click_at(&mut app, &ctx, layout.song_button().center());
         assert!(!model.shared().song.is_on());
-        model.collect();
+        assert_eq!(app.view, View::Steps, "song mode off goes back to the steps");
+        assert!(!test_layout(&app, test_window()).arrange_button().is_positive());
+    }
+
+    /// Song mode switched from outside the toggle — a project loaded with it
+    /// on, then one with it off — moves the view the same way.
+    #[test]
+    fn the_view_follows_song_mode_set_from_anywhere() {
+        let model = Arc::new(SeqModel::new(state::default_data()));
+        let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
+        let mut app = BitstepEditor::new(params, Arc::clone(&model), Arc::new(Playhead::new()));
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        run_frame(&mut app, &ctx, Vec::new());
+        assert_eq!(app.view, View::Steps);
+
+        model.set_song_on(true);
+        run_frame(&mut app, &ctx, Vec::new());
+        assert_eq!(app.view, View::Arrange);
+        // Picking the steps in song mode sticks from frame to frame.
+        app.show_view(View::Steps);
+        run_frame(&mut app, &ctx, Vec::new());
+        assert_eq!(app.view, View::Steps);
+
+        app.show_view(View::Arrange);
+        model.set_song_on(false);
+        run_frame(&mut app, &ctx, Vec::new());
+        assert_eq!(app.view, View::Steps, "no grid out of song mode");
+    }
+
+    /// The arranger's pattern column is much narrower than a lane header,
+    /// and the loop switch stays inside the ruler row: a click just under
+    /// it lands on the first pattern's row, not on the switch.
+    #[test]
+    fn the_arranger_has_a_narrow_name_column_and_a_loop_switch_in_its_ruler() {
+        let (model, mut app, ctx) = arranger();
+        let layout = test_layout(&app, test_window());
+        assert_eq!(layout.headers().width(), theme::ARRANGE_HEADER_WIDTH);
+        const { assert!(theme::ARRANGE_HEADER_WIDTH < theme::HEADER_WIDTH / 2.0) };
+
+        let corner = layout.ruler_corner();
+        assert!(corner.height() < theme::CONTROL_HEIGHT, "shorter than a control");
+        let mut drawn = None;
+        let input = egui::RawInput { screen_rect: Some(test_window()), ..Default::default() };
+        let mut output = ctx.run_ui(input, |ui| {
+            let button = egui::Button::new("Loop");
+            drawn = Some(arrange::put_short(ui, corner, button).rect);
+        });
+        output.textures_delta.clear();
+        let drawn = drawn.expect("the switch was drawn");
+        assert!(corner.contains_rect(drawn), "{drawn:?} spills out of {corner:?}");
+
+        app.set_pattern(3);
+        let under = egui::pos2(corner.min.x + 10.0, layout.ruler().max.y + 2.0);
+        click_at(&mut app, &ctx, under);
+        assert!(model.shared().song.is_looped(), "the switch was not hit");
+        assert_eq!(app.shown_pattern(), 0, "the first row's header was");
+    }
+
+    /// A double-click on a row's header types the pattern's name in place:
+    /// Enter saves it (one undo step) and the row shows it; Escape keeps the
+    /// old one; a blank name, or the "Pattern N" a pattern without a name
+    /// shows, saved as it was, leaves it without one.
+    #[test]
+    fn double_clicking_a_row_header_names_the_pattern() {
+        let (model, mut app, ctx) = arranger();
+        let none = egui::Modifiers::NONE;
+        let header = |app: &BitstepEditor, row: usize| {
+            let layout = test_layout(app, test_window());
+            egui::pos2(layout.headers().center().x, arrange_view(app).cell_rect(row, 0).center().y)
+        };
+        let name = |row| model.shared().pattern_name(row).to_owned();
+
+        let at = header(&app, 2);
+        click_at(&mut app, &ctx, at);
+        click_at(&mut app, &ctx, at);
+        let target = NameTarget::Pattern(2);
+        assert!(app.name_edit.as_ref().is_some_and(|edit| edit.target == target));
+        assert_eq!(app.name_edit.as_ref().map(|edit| edit.text.as_str()), Some("Pattern 3"));
+        assert!(ctx.text_edit_focused(), "the field has the keyboard");
+        assert_eq!(app.view, View::Arrange, "no trip to the steps");
+
+        run_frame(&mut app, &ctx, vec![egui::Event::Text("Chorus".into())]);
+        assert_eq!(name(2), "", "nothing is written while typing");
+        press_key(&mut app, &ctx, egui::Key::Enter, none);
+        assert_eq!(name(2), "Chorus");
+        assert!(app.name_edit.is_none(), "Enter closes the field");
+        run_frame(&mut app, &ctx, Vec::new());
+        press_key(&mut app, &ctx, egui::Key::Z, egui::Modifiers::COMMAND);
+        assert_eq!(name(2), "", "one undo step");
+        press_key(&mut app, &ctx, egui::Key::Z, egui::Modifiers::COMMAND | egui::Modifiers::SHIFT);
+        assert_eq!(name(2), "Chorus");
+
+        // Escape puts the old name back.
+        pause(&mut app, &ctx);
+        click_at(&mut app, &ctx, at);
+        click_at(&mut app, &ctx, at);
+        run_frame(&mut app, &ctx, vec![egui::Event::Text("Nope".into())]);
+        press_key(&mut app, &ctx, egui::Key::Escape, none);
+        assert_eq!(name(2), "Chorus");
+        assert!(app.name_edit.is_none());
+
+        // A blank name takes it away.
+        pause(&mut app, &ctx);
+        click_at(&mut app, &ctx, at);
+        click_at(&mut app, &ctx, at);
+        press_key(&mut app, &ctx, egui::Key::Backspace, none);
+        press_key(&mut app, &ctx, egui::Key::Enter, none);
+        assert_eq!(name(2), "");
+
+        // The default label, saved untouched, is no name either.
+        pause(&mut app, &ctx);
+        let other = header(&app, 6);
+        click_at(&mut app, &ctx, other);
+        click_at(&mut app, &ctx, other);
+        press_key(&mut app, &ctx, egui::Key::Enter, none);
+        assert_eq!(name(6), "");
+
+        // Clicking away saves, like Enter.
+        pause(&mut app, &ctx);
+        click_at(&mut app, &ctx, other);
+        click_at(&mut app, &ctx, other);
+        run_frame(&mut app, &ctx, vec![egui::Event::Text("Fill".into())]);
+        let away = test_layout(&app, test_window()).ruler_strip().center();
+        click_at(&mut app, &ctx, away);
+        assert_eq!(name(6), "Fill");
+        assert!(app.name_edit.is_none());
+    }
+
+    /// A click on an empty bar places that row's pattern there at its own
+    /// length (two bars for fresh 32-step lanes); a press dragged right
+    /// draws it longer; each is one undo step.
+    #[test]
+    fn clicking_a_row_places_its_pattern_and_dragging_draws_it_longer() {
+        let (model, mut app, ctx) = arranger();
+        let view = arrange_view(&app);
+        click_at(&mut app, &ctx, view.cell_rect(2, 3).center());
+        assert_eq!(model.shared().song.blocks(), [song_block(2, 3, 2)]);
+
+        pause(&mut app, &ctx);
+        let from = view.cell_rect(5, 0).center();
+        let pitch = theme::ARRANGE_BAR_PITCH;
+        drag_between(&mut app, &ctx, from, from + egui::vec2(pitch * 3.0, 0.0));
+        assert_eq!(model.shared().song.blocks(), [song_block(5, 0, 5), song_block(2, 3, 2)]);
+        assert!(app.arrange_gesture.is_none(), "the release ends the drag");
+
+        // A click inside a block places nothing new.
+        pause(&mut app, &ctx);
+        click_at(&mut app, &ctx, view.cell_rect(2, 4).center());
+        assert_eq!(model.shared().song.len(), 2);
+
+        run_frame(&mut app, &ctx, Vec::new());
+        press_key(&mut app, &ctx, egui::Key::Z, egui::Modifiers::COMMAND);
+        assert_eq!(model.shared().song.blocks(), [song_block(2, 3, 2)], "the drawn block, in one");
+    }
+
+    /// A double-click on an empty bar places one block with its first click
+    /// and leaves it at that: it does not also open the pattern.
+    #[test]
+    fn a_double_click_on_an_empty_bar_only_places() {
+        let (model, mut app, ctx) = arranger();
+        let at = arrange_view(&app).cell_rect(6, 1).center();
+        click_at(&mut app, &ctx, at);
+        click_at(&mut app, &ctx, at);
+        assert_eq!(model.shared().song.blocks(), [song_block(6, 1, 2)]);
+        assert_eq!(app.view, View::Arrange);
+        // A later double-click on it opens it as usual.
+        pause(&mut app, &ctx);
+        let other = arrange_view(&app).cell_rect(0, 0).center();
+        click_at(&mut app, &ctx, other);
+        pause(&mut app, &ctx);
+        click_at(&mut app, &ctx, at);
+        click_at(&mut app, &ctx, at);
+        assert_eq!(app.view, View::Steps);
+    }
+
+    /// A lane name being typed in place is saved when the view switches.
+    #[test]
+    fn switching_views_saves_a_rename_in_progress() {
+        let model = Arc::new(SeqModel::new(state::default_data()));
+        let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
+        let mut app = BitstepEditor::new(params, Arc::clone(&model), Arc::new(Playhead::new()));
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let name = test_header_fields(0).name.center();
+        click_at(&mut app, &ctx, name);
+        click_at(&mut app, &ctx, name);
+        run_frame(&mut app, &ctx, vec![egui::Event::Text("Kick".into())]);
+        assert!(app.name_edit.is_some());
+        model.set_song_on(true);
+        run_frame(&mut app, &ctx, Vec::new());
+        assert_eq!(app.view, View::Arrange);
+        assert_eq!(model.shared().lane(0).expect("lane 0").name, "Kick");
+        assert!(app.name_edit.is_none());
+    }
+
+    /// A block's body drags it — along its row and into another pattern's
+    /// row — its right edge resizes it, Escape puts a drag back, and a
+    /// right-click deletes it.
+    #[test]
+    fn blocks_are_moved_resized_and_deleted_on_the_grid() {
+        let (model, mut app, ctx) = arranger();
+        model.set_song_blocks(vec![song_block(1, 2, 2), song_block(4, 0, 1)]);
+        let view = arrange_view(&app);
+        let blocks = || model.shared().song.blocks().to_vec();
+
+        // Grabbed by its second bar, dropped with that bar on row 4, bar 8.
+        let grab = view.cell_rect(1, 3).center();
+        drag_between(&mut app, &ctx, grab, view.cell_rect(4, 8).center());
+        assert_eq!(blocks(), [song_block(4, 0, 1), song_block(4, 7, 2)]);
+
+        // Its right edge, two bars further out.
+        pause(&mut app, &ctx);
+        let edge = view.edge_rect(song_block(4, 7, 2)).center();
+        let pitch = theme::ARRANGE_BAR_PITCH;
+        drag_between(&mut app, &ctx, edge, edge + egui::vec2(pitch * 2.0, 0.0));
+        assert_eq!(blocks(), [song_block(4, 0, 1), song_block(4, 7, 4)]);
+
+        // Onto the other block of its row: refused, so it stays put.
+        pause(&mut app, &ctx);
+        let body = view.cell_rect(4, 7).center();
+        drag_between(&mut app, &ctx, body, view.cell_rect(4, 0).center());
+        assert_eq!(blocks(), [song_block(4, 0, 1), song_block(4, 7, 4)]);
+
+        // Escape mid-drag: back where the press found it.
+        pause(&mut app, &ctx);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let away = view.cell_rect(9, 20).center();
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(body)]);
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(body), button(body, true)]);
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(away)]);
+        assert_eq!(blocks()[1].pattern, 9, "carried along");
+        press_key(&mut app, &ctx, egui::Key::Escape, egui::Modifiers::NONE);
+        run_frame(&mut app, &ctx, vec![button(away, false)]);
+        assert_eq!(blocks(), [song_block(4, 0, 1), song_block(4, 7, 4)]);
+
+        // A right-click deletes.
+        pause(&mut app, &ctx);
+        let right = |pressed| egui::Event::PointerButton {
+            pos: body,
+            button: PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(body), right(true)]);
+        run_frame(&mut app, &ctx, vec![right(false)]);
+        assert_eq!(blocks(), [song_block(4, 0, 1)]);
+    }
+
+    /// A double-click on a block opens its pattern in the steps view; a
+    /// click on a row's header only selects the pattern; the ruler's corner
+    /// switches looping.
+    #[test]
+    fn blocks_open_their_pattern_row_headers_select_and_the_ruler_switches_looping() {
+        let (model, mut app, ctx) = arranger();
+        model.set_song_blocks(vec![song_block(3, 1, 2)]);
+        let view = arrange_view(&app);
+        let at = view.cell_rect(3, 2).center();
+        click_at(&mut app, &ctx, at);
+        assert_eq!(app.view, View::Arrange, "one click is not a double-click");
+        click_at(&mut app, &ctx, at);
+        assert_eq!(app.view, View::Steps);
+        assert_eq!(model.shared().song.blocks(), [song_block(3, 1, 2)], "nothing moved");
+
+        app.view = View::Arrange;
+        pause(&mut app, &ctx);
+        let layout = test_layout(&app, test_window());
+        let header = egui::pos2(layout.headers().center().x, view.cell_rect(5, 0).center().y);
+        click_at(&mut app, &ctx, header);
+        assert_eq!(app.view, View::Arrange, "a header click stays on the grid");
+        assert_eq!(app.shown_pattern(), 5, "and selects its pattern");
+        assert!(app.name_edit.is_none());
+
+        pause(&mut app, &ctx);
+        assert!(model.shared().song.is_looped());
+        let corner = test_layout(&app, test_window()).ruler_corner();
+        click_at(&mut app, &ctx, corner.left_center() + egui::vec2(10.0, 0.0));
+        assert!(!model.shared().song.is_looped());
+    }
+
+    /// The wheel over the arranger scrolls the arranger, not the steps.
+    #[test]
+    fn the_wheel_scrolls_the_arranger() {
+        let (_model, mut app, ctx) = arranger();
+        let over = arrange_view(&app).viewport().center();
+        let wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -120.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
+            modifiers: egui::Modifiers::default(),
+        };
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(over)]);
+        for _ in 0..10 {
+            run_frame(&mut app, &ctx, vec![wheel.clone()]);
+        }
+        run_frame(&mut app, &ctx, Vec::new());
+        assert!(app.arrange_scroll.y > 0.0, "scrolled down the patterns");
+        assert_eq!(app.scroll, Vec2::ZERO, "the step strip did not move");
     }
 
     /// The page arrows step through the patterns eight at a time, wrapping

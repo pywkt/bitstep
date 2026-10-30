@@ -43,7 +43,7 @@ pub const FOLLOW_MARGIN_STEPS: f32 = 2.0;
 /// `f32::clamp` would hand NaN straight back (and a NaN pitch turns every
 /// rect in the grid into nothing, silently); `max` then `min` cannot, because
 /// both discard a NaN operand in favour of the bound.
-fn sane(value: f32, min: f32, max: f32) -> f32 {
+pub(super) fn sane(value: f32, min: f32, max: f32) -> f32 {
     value.max(min).min(max)
 }
 
@@ -953,9 +953,9 @@ pub enum Zone {
 pub struct EditorLayout {
     full: Rect,
     top_bar: Rect,
-    /// The song row under the top bar. Zero-height until
-    /// [`Self::with_song_bar`].
-    song_bar: Rect,
+    /// The arranger's ruler row under the top bar. Zero-height until
+    /// [`Self::with_ruler`].
+    ruler: Rect,
     headers: Rect,
     steps: Rect,
     /// The parameter panel's left end, under the lane headers: what it edits
@@ -963,6 +963,9 @@ pub struct EditorLayout {
     panel_header: Rect,
     /// The parameter panel's bars, under the step strip and scrolled with it.
     panel_strip: Rect,
+    /// Whether the top bar has the grid/steps view toggle (song mode only).
+    /// Off until [`Self::with_view_toggle`].
+    view_toggle: bool,
 }
 
 impl EditorLayout {
@@ -986,21 +989,30 @@ impl EditorLayout {
         EditorLayout {
             full: Rect::from_min_max(full.min, pos2(right, bottom)),
             top_bar: Rect::from_min_max(full.min, pos2(right, split_y)),
-            song_bar: Rect::from_min_max(pos2(left, split_y), pos2(right, split_y)),
+            ruler: Rect::from_min_max(pos2(left, split_y), pos2(right, split_y)),
             headers: Rect::from_min_max(pos2(left, split_y), pos2(split_x, bottom)),
             steps: Rect::from_min_max(pos2(split_x, split_y), pos2(right, bottom)),
             panel_header: Rect::from_min_max(pos2(left, bottom), pos2(split_x, bottom)),
             panel_strip: Rect::from_min_max(pos2(split_x, bottom), pos2(right, bottom)),
+            view_toggle: false,
         }
     }
 
-    /// The same split with the song row taking `height` points off the top of
-    /// the lane headers and the step strip, right under the top bar. Call it
-    /// before [`Self::with_panel`], which shares out what is left.
-    pub fn with_song_bar(mut self, height: f32) -> EditorLayout {
+    /// The same split with the grid/steps view toggle in the top bar, right
+    /// after the song toggle, when `shown` (song mode is on). Without it the
+    /// undo/redo pair moves up into its place.
+    pub fn with_view_toggle(mut self, shown: bool) -> EditorLayout {
+        self.view_toggle = shown;
+        self
+    }
+
+    /// The same split with the arranger's ruler taking `height` points off
+    /// the top of the headers' column and the strip, right under the top bar.
+    /// Call it before [`Self::with_panel`], which shares out what is left.
+    pub fn with_ruler(mut self, height: f32) -> EditorLayout {
         let top = self.top_bar.max.y;
         let height = sane(height, 0.0, (self.full.max.y - top).max(0.0));
-        self.song_bar =
+        self.ruler =
             Rect::from_min_max(pos2(self.full.min.x, top), pos2(self.full.max.x, top + height));
         self.headers.min.y = top + height;
         self.steps.min.y = top + height;
@@ -1013,7 +1025,7 @@ impl EditorLayout {
     /// Never more than [`PANEL_MAX_SHARE`] of what is below the top bar, so a
     /// short window keeps some grid to select a lane in.
     pub fn with_panel(mut self, height: f32) -> EditorLayout {
-        let below_bar = (self.full.max.y - self.song_bar.max.y).max(0.0);
+        let below_bar = (self.full.max.y - self.ruler.max.y).max(0.0);
         let height = sane(height, 0.0, below_bar * PANEL_MAX_SHARE);
         let top = self.full.max.y - height;
         let bottom = self.full.max.y;
@@ -1040,33 +1052,27 @@ impl EditorLayout {
         self.top_bar
     }
 
-    /// The song row (empty when song mode is off).
-    pub fn song_bar(&self) -> Rect {
-        self.song_bar
+    /// The arranger's ruler row (empty in the steps view).
+    pub fn ruler(&self) -> Rect {
+        self.ruler
     }
 
-    /// The song order's text field: the left end of the song row, over the
-    /// lane headers' column.
-    pub fn song_text(&self) -> Rect {
-        let row = self.song_bar_inner();
-        let right = (self.headers.max.x - theme::PANEL_PADDING).clamp(row.min.x, row.max.x);
-        Rect::from_min_max(row.min, pos2(right, row.max.y))
+    /// The left end of the ruler row, over the headers' column: where the
+    /// song's loop switch and length go. Inset by the panel padding.
+    pub fn ruler_corner(&self) -> Rect {
+        let row = self.ruler;
+        let right = self.headers.max.x.clamp(row.min.x, row.max.x);
+        let corner = Rect::from_min_max(row.min, pos2(right, row.max.y));
+        let pad = sane(theme::PANEL_PADDING, 0.0, corner.width().max(0.0) * 0.5);
+        corner.shrink2(vec2(pad, 1.0))
     }
 
-    /// The song's bar cells: the rest of the song row, over the step strip.
-    pub fn song_strip(&self) -> Rect {
-        let row = self.song_bar_inner();
+    /// The rest of the ruler row, over the strip: the bar numbers. Not
+    /// inset, so its bars line up with the columns under it.
+    pub fn ruler_strip(&self) -> Rect {
+        let row = self.ruler;
         let left = self.steps.min.x.clamp(row.min.x, row.max.x);
         Rect::from_min_max(pos2(left, row.min.y), row.max)
-    }
-
-    /// The song row inset by its padding, giving way like
-    /// [`Self::bar_inner`] in a row too small to hold it.
-    fn song_bar_inner(&self) -> Rect {
-        let bar = self.song_bar;
-        let pad = sane(theme::PANEL_PADDING, 0.0, bar.width().max(0.0) * 0.5)
-            .min(bar.height().max(0.0) * 0.5);
-        bar.shrink(pad)
     }
 
     /// The lane headers' column — the viewport they scroll vertically in.
@@ -1108,7 +1114,7 @@ impl EditorLayout {
     pub fn zone(&self, pos: Pos2) -> Zone {
         if !self.full.contains(pos) {
             Zone::Outside
-        } else if pos.y < self.top_bar.max.y.max(self.song_bar.max.y) {
+        } else if pos.y < self.top_bar.max.y.max(self.ruler.max.y) {
             Zone::TopBar
         } else if self.panel_strip.height() > 0.0 && pos.y >= self.panel_strip.min.y {
             Zone::Panel
@@ -1289,14 +1295,42 @@ impl EditorLayout {
         Rect::from_min_max(pos2(left, room.min.y), pos2(right, room.max.y))
     }
 
-    /// The undo (0) and redo (1) buttons: right after the song toggle.
-    /// Empty when there is no room, like a squeezed mode button.
-    pub fn history_button(&self, index: usize) -> Rect {
+    /// The grid/steps view toggle: right after the song toggle, in song
+    /// mode only ([`Self::with_view_toggle`]). Empty when hidden or when
+    /// there is no room.
+    pub fn arrange_button(&self) -> Rect {
         let room = self.bar_status();
         let left = room.min.x
             + MODE_BUTTONS as f32 * (theme::MODE_WIDTH + theme::ITEM_SPACING)
             + theme::SONG_WIDTH
+            + theme::ITEM_SPACING;
+        let right = (left + theme::ARRANGE_WIDTH).min(room.max.x);
+        if !self.view_toggle || right <= left {
+            return Rect::from_min_max(room.min, room.min);
+        }
+        Rect::from_min_max(pos2(left, room.min.y), pos2(right, room.max.y))
+    }
+
+    /// How much of [`Self::bar_status`] the buttons before the undo/redo
+    /// pair take, spacing included: the mode buttons, the song toggle and,
+    /// in song mode, the view toggle.
+    fn toggles_width(&self) -> f32 {
+        let view = match self.view_toggle {
+            true => theme::ARRANGE_WIDTH + theme::ITEM_SPACING,
+            false => 0.0,
+        };
+        MODE_BUTTONS as f32 * (theme::MODE_WIDTH + theme::ITEM_SPACING)
+            + theme::SONG_WIDTH
             + theme::ITEM_SPACING
+            + view
+    }
+
+    /// The undo (0) and redo (1) buttons: right after the song and view
+    /// toggles. Empty when there is no room, like a squeezed mode button.
+    pub fn history_button(&self, index: usize) -> Rect {
+        let room = self.bar_status();
+        let left = room.min.x
+            + self.toggles_width()
             + index as f32 * (theme::HISTORY_WIDTH + theme::ITEM_SPACING);
         let right = (left + theme::HISTORY_WIDTH).min(room.max.x);
         if index >= HISTORY_BUTTONS || right <= left {
@@ -1306,13 +1340,11 @@ impl EditorLayout {
     }
 
     /// What is left of [`Self::bar_status`] after the edit-mode buttons, the
-    /// song toggle and the undo/redo pair — where the instance's status line
-    /// is drawn.
+    /// song and arranger toggles and the undo/redo pair — where the
+    /// instance's status line is drawn.
     pub fn status_line(&self) -> Rect {
         let room = self.bar_status();
-        let used = MODE_BUTTONS as f32 * (theme::MODE_WIDTH + theme::ITEM_SPACING)
-            + theme::SONG_WIDTH
-            + theme::ITEM_SPACING
+        let used = self.toggles_width()
             + HISTORY_BUTTONS as f32 * (theme::HISTORY_WIDTH + theme::ITEM_SPACING);
         let start = (room.min.x + used).min(room.max.x);
         Rect::from_min_max(pos2(start, room.min.y), room.max)
@@ -1409,69 +1441,6 @@ pub fn pattern_button_index(value: i32) -> Option<usize> {
 /// [p]: crate::model::Playhead::pattern
 pub fn pattern_index_button(index: u32) -> Option<usize> {
     usize::try_from(index).ok().filter(|index| *index < NUM_PATTERNS)
-}
-
-// ---- the song row ----
-
-/// Bars of margin follow mode keeps between the playing bar and the edge of
-/// the song row.
-pub const SONG_FOLLOW_MARGIN: f32 = 2.0;
-
-/// The distance from one song cell to the next.
-pub fn song_cell_pitch() -> f32 {
-    theme::SONG_CELL_WIDTH + theme::SONG_CELL_GAP
-}
-
-/// How far the song row scrolls at most: its cells, plus one for the end
-/// marker, less the room it has.
-pub fn song_max_scroll(strip_width: f32, bars: usize) -> f32 {
-    let content = (bars + 1) as f32 * song_cell_pitch() - theme::SONG_CELL_GAP;
-    sane(content - strip_width, 0.0, f32::MAX)
-}
-
-/// Cell `index` of the song row (`bars` is the end marker), scrolled by
-/// `scroll`. Not clipped: the caller paints through a clip to the strip.
-pub fn song_cell(strip: Rect, scroll: f32, index: usize) -> Rect {
-    let left = strip.min.x + index as f32 * song_cell_pitch() - scroll;
-    Rect::from_min_max(
-        pos2(left, strip.min.y),
-        pos2(left + theme::SONG_CELL_WIDTH, strip.max.y),
-    )
-}
-
-/// The song cell under `pos`, or `None` off the strip or in a gap.
-pub fn song_cell_at(strip: Rect, scroll: f32, pos: Pos2) -> Option<usize> {
-    if !strip.contains(pos) {
-        return None;
-    }
-    let offset = pos.x - strip.min.x + scroll;
-    let index = index_floor(offset, song_cell_pitch());
-    song_cell(strip, scroll, index).x_range().contains(pos.x).then_some(index)
-}
-
-/// The song cells that are at least partly in view.
-pub fn song_visible(strip_width: f32, scroll: f32, cells: usize) -> Range<usize> {
-    let pitch = song_cell_pitch();
-    let first = index_floor(scroll, pitch).min(cells);
-    let end = index_ceil(scroll + strip_width.max(0.0), pitch).min(cells);
-    first..end.max(first)
-}
-
-/// The scroll that brings bar `bar` into view with [`SONG_FOLLOW_MARGIN`]
-/// bars to spare, or `scroll` itself when the bar is already there.
-pub fn song_follow(scroll: f32, strip_width: f32, bars: usize, bar: usize) -> f32 {
-    let pitch = song_cell_pitch();
-    let margin = SONG_FOLLOW_MARGIN * pitch;
-    let left = bar as f32 * pitch;
-    let right = left + theme::SONG_CELL_WIDTH;
-    let wanted = if left - margin < scroll {
-        left - margin
-    } else if right + margin > scroll + strip_width {
-        right + margin - strip_width
-    } else {
-        scroll
-    };
-    sane(wanted, 0.0, song_max_scroll(strip_width, bars))
 }
 
 // ---- the lane header ----
@@ -3051,71 +3020,45 @@ mod tests {
         assert_eq!(step_page(PATTERN_PAGES - 1, 1), 0, "on from the last wraps");
     }
 
-    /// The song row's cells: placed a pitch apart from the strip's left
-    /// edge, found again under the pointer, and scrolled no further than the
-    /// last cell (the end marker) needs.
+    /// The arranger's ruler takes its height off the top of the headers and
+    /// the strip, its corner sits over the headers' column and its strip over
+    /// the steps (unpadded, so bars line up), and the whole row counts as top
+    /// bar. The song toggle, and in song mode the view toggle, sit between
+    /// the mode buttons and the status line.
     #[test]
-    fn song_cells_are_placed_hit_and_followed() {
-        let strip = Rect::from_min_size(pos2(100.0, 10.0), vec2(260.0, 30.0));
-        let pitch = song_cell_pitch();
-        assert_eq!(song_cell(strip, 0.0, 0).min, strip.min);
-        assert_eq!(song_cell(strip, 0.0, 3).min.x, strip.min.x + 3.0 * pitch);
-        assert_eq!(song_cell(strip, pitch, 3).min.x, strip.min.x + 2.0 * pitch, "scrolled");
-
-        let middle = |index: usize, scroll: f32| song_cell(strip, scroll, index).center();
-        assert_eq!(song_cell_at(strip, 0.0, middle(4, 0.0)), Some(4));
-        assert_eq!(song_cell_at(strip, 2.0 * pitch, middle(4, 2.0 * pitch)), Some(4));
-        let gap = pos2(strip.min.x + theme::SONG_CELL_WIDTH + 1.0, strip.center().y);
-        assert_eq!(song_cell_at(strip, 0.0, gap), None, "between two cells");
-        assert_eq!(song_cell_at(strip, 0.0, pos2(0.0, 0.0)), None, "off the strip");
-
-        // Ten cells fit in 260 points, so a 9-bar song (ten cells with the
-        // end marker) does not scroll and a 40-bar one does.
-        assert_eq!(song_max_scroll(strip.width(), 9), 0.0);
-        let max = song_max_scroll(strip.width(), 40);
-        assert_eq!(max, 41.0 * pitch - theme::SONG_CELL_GAP - strip.width());
-        assert_eq!(song_visible(strip.width(), 0.0, 41), 0..10);
-        assert_eq!(song_visible(strip.width(), 0.0, 3), 0..3, "no more than there are");
-
-        // Follow: a bar in view stays put, one past the right edge comes in
-        // with the margin, and the result never passes the ends.
-        assert_eq!(song_follow(0.0, strip.width(), 40, 3), 0.0);
-        let followed = song_follow(0.0, strip.width(), 40, 20);
-        let right = song_cell(strip, followed, 20).max.x;
-        assert!(right <= strip.max.x - SONG_FOLLOW_MARGIN * pitch + 0.01, "{right}");
-        assert_eq!(song_follow(max, strip.width(), 40, 0), 0.0, "back to the start");
-        assert_eq!(song_follow(0.0, strip.width(), 40, 40), max, "the end marker");
-    }
-
-    /// The song row takes its height off the top of the headers and the
-    /// strip, the text field sits over the headers' column and the cells
-    /// over the steps, and the whole row counts as top bar.
-    #[test]
-    fn the_song_row_sits_under_the_top_bar() {
+    fn the_ruler_sits_under_the_top_bar() {
         let window = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 500.0));
         let plain = EditorLayout::from_theme(window).with_panel(theme::PARAM_PANEL_HEIGHT);
         let layout = EditorLayout::from_theme(window)
-            .with_song_bar(theme::SONG_BAR_HEIGHT)
-            .with_panel(theme::PARAM_PANEL_HEIGHT);
-        let row = layout.song_bar();
+            .with_ruler(theme::ARRANGE_RULER_HEIGHT)
+            .with_view_toggle(true);
+        let row = layout.ruler();
 
-        assert_eq!(plain.song_bar().height(), 0.0, "no row until asked for");
+        assert_eq!(plain.ruler().height(), 0.0, "no ruler until asked for");
         assert_eq!(row.min.y, layout.top_bar().max.y);
-        assert_eq!(row.height(), theme::SONG_BAR_HEIGHT);
+        assert_eq!(row.height(), theme::ARRANGE_RULER_HEIGHT);
         assert_eq!(layout.steps().min.y, row.max.y);
         assert_eq!(layout.headers().min.y, row.max.y);
-        assert_eq!(layout.panel().max.y, window.max.y, "the panel stays at the bottom");
+        assert_eq!(layout.steps().max.y, window.max.y, "no panel under the arranger");
 
-        let (text, strip) = (layout.song_text(), layout.song_strip());
-        assert!(row.contains_rect(text) && row.contains_rect(strip));
-        assert!(text.max.x <= layout.headers().max.x);
-        assert_eq!(strip.min.x, layout.steps().min.x);
+        let (corner, strip) = (layout.ruler_corner(), layout.ruler_strip());
+        assert!(row.contains_rect(corner) && row.contains_rect(strip));
+        assert!(corner.max.x <= layout.headers().max.x);
+        assert_eq!((strip.min.x, strip.max.x), (layout.steps().min.x, layout.steps().max.x));
         assert_eq!(layout.zone(row.center()), Zone::TopBar);
         assert_eq!(layout.zone(pos2(strip.center().x, row.max.y + 1.0)), Zone::Steps);
 
-        let song = layout.song_button();
+        let (song, arrange) = (layout.song_button(), layout.arrange_button());
         assert!(song.min.x > layout.mode_button(1).max.x, "after the mode buttons");
-        assert!(layout.status_line().min.x > song.max.x, "before the status line");
+        assert!(arrange.min.x > song.max.x, "the arranger toggle after the song toggle");
+        assert_eq!(arrange.width(), theme::ARRANGE_WIDTH);
+        assert!(layout.status_line().min.x > arrange.max.x, "before the status line");
+
+        // Out of song mode there is no view toggle, and undo moves up.
+        let off = layout.with_view_toggle(false);
+        assert!(!off.arrange_button().is_positive(), "no view toggle");
+        assert!(off.history_button(0).min.x < layout.history_button(0).min.x);
+        assert!(off.history_button(0).min.x > song.max.x, "still after the song toggle");
     }
 
     /// Button index ↔ `patsel` value, both ways: the parameter is one-based
@@ -4464,11 +4407,12 @@ mod tests {
     }
 
     #[test]
-    fn undo_and_redo_sit_between_the_song_toggle_and_the_status_line() {
-        let layout = EditorLayout::from_theme(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 520.0)));
+    fn undo_and_redo_sit_between_the_view_toggle_and_the_status_line() {
+        let window = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 520.0));
+        let layout = EditorLayout::from_theme(window).with_view_toggle(true);
         let (undo, redo) = (layout.history_button(0), layout.history_button(1));
         assert!(undo.is_positive() && redo.is_positive());
-        assert!(undo.min.x > layout.song_button().max.x, "after the song toggle");
+        assert!(undo.min.x > layout.arrange_button().max.x, "after the view toggle");
         assert!(redo.min.x > undo.max.x, "in order");
         assert!(layout.status_line().min.x > redo.max.x, "the status line follows them");
         assert!(!layout.history_button(HISTORY_BUTTONS).is_positive(), "no third button");

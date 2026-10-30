@@ -274,6 +274,16 @@ pub const MAX_STEPS: usize = 4096;
 /// Pattern banks. Every lane has one [`LaneData`] per pattern.
 pub const NUM_PATTERNS: usize = 64;
 
+/// The longest name a pattern can have, in characters.
+pub const MAX_PATTERN_NAME_CHARS: usize = 64;
+
+/// A pattern name as stored: trimmed, without control characters, and at
+/// most [`MAX_PATTERN_NAME_CHARS`] long. Empty means "no name" (the GUI
+/// shows "Pattern N").
+pub fn clean_pattern_name(name: &str) -> String {
+    name.trim().chars().filter(|c| !c.is_control()).take(MAX_PATTERN_NAME_CHARS).collect()
+}
+
 /// Step capacity is allocated in multiples of this, so dragging a lane's
 /// length a few steps longer stays a value edit instead of reallocating
 /// (and republishing) the whole `SeqData`.
@@ -592,8 +602,13 @@ impl std::fmt::Debug for LaneData {
 
 // ---- song mode ----
 
-/// The most entries a song can list.
-pub const MAX_SONG_ENTRIES: usize = 1024;
+/// The most blocks a song grid can hold. Far past any real song; it bounds
+/// the per-block walk on the audio thread.
+pub const MAX_SONG_BLOCKS: usize = 4096;
+
+/// How many bars wide the song grid is: every block starts and ends inside
+/// it. At 120 BPM in 4/4 that is over two hours.
+pub const MAX_SONG_BARS: u32 = 4096;
 
 /// The longest a pattern counts as in song mode, in bars. Only a lane of
 /// thousands of whole notes gets near it; it keeps song positions small.
@@ -603,65 +618,98 @@ pub const MAX_PATTERN_BARS: u32 = 4096;
 /// signature: 4/4.
 pub const DEFAULT_BAR_BEATS: f64 = 4.0;
 
-/// Song mode: a list of patterns the user types (`1-2-1-3x2`), played one
-/// after another along the host's timeline from bar 1.
+/// One block on the song grid: pattern `pattern` (an index) playing from bar
+/// `start` (0 = the host's first bar) for `bars` bars.
 ///
-/// Each entry plays its whole pattern — as many bars as its longest lane
-/// needs, see [`PatternBars`] — and a rest (`0`) is one silent bar. After
-/// the last entry the song either starts again from the first (`looped`,
-/// the default) or goes silent.
-/// `entries` is always what [`parse_song`] makes of `text`. The text is kept
-/// as typed so the field shows what the user wrote, and it is what a save
-/// stores. Turning song mode or looping on or off is a value edit; changing
-/// the list is a shape edit, since it reallocates `entries`.
+/// The pattern starts from its first step at `start` and again every time
+/// its own length (see [`PatternBars`]) comes round inside the block, so a
+/// stretched block plays the pattern over and over, and a block shorter than
+/// its pattern cuts it off.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SongBlock {
+    pub pattern: u8,
+    pub start: u32,
+    pub bars: u32,
+}
+
+impl SongBlock {
+    /// The bar after its last one. Cannot overflow: a repaired block lies
+    /// inside [`MAX_SONG_BARS`].
+    pub const fn end(self) -> u32 {
+        self.start.saturating_add(self.bars)
+    }
+
+    /// The pattern it plays, as an index into `SeqData::patterns`.
+    pub const fn pattern(self) -> usize {
+        self.pattern as usize
+    }
+
+    /// Whether bar `bar` is one of its bars.
+    pub const fn contains(self, bar: u32) -> bool {
+        self.start <= bar && bar < self.end()
+    }
+
+    /// Whether it shares a bar with `start..end`.
+    pub const fn overlaps(self, start: u32, end: u32) -> bool {
+        self.start < end && start < self.end()
+    }
+}
+
+/// Song mode: pattern blocks placed on a grid of bars, played along the
+/// host's timeline from bar 1. One row per pattern, so a pattern's blocks
+/// never overlap each other; blocks of different patterns in the same bars
+/// play together.
+///
+/// After the last block ends the song either starts again from bar 1
+/// (`looped`, the default) or goes silent. Turning song mode or looping on
+/// or off is a value edit; changing the blocks is a shape edit, which
+/// builds a new `Song` through [`Song::from_blocks`] — the only way in, so
+/// the invariants below always hold.
 #[derive(Debug)]
 pub struct Song {
     pub on: AtomicBool,
     pub looped: AtomicBool,
-    pub text: String,
-    /// One entry per pattern played, in order: a pattern index, or
-    /// [`Song::REST`].
-    pub entries: Vec<u8>,
+    /// Sorted by `(start, pattern)`, no two blocks of one pattern
+    /// overlapping, every block inside [`MAX_SONG_BARS`], at most
+    /// [`MAX_SONG_BLOCKS`] of them.
+    blocks: Vec<SongBlock>,
+    /// One bit per pattern that has a block, so the audio thread works out
+    /// lengths only for the patterns the song uses.
+    used: u64,
+    /// The bar after the last block's last one: the song's length.
+    total: u32,
 }
 
-/// Where one song entry sits on the host's timeline.
+// `used` is one bit per pattern.
+const _: () = assert!(NUM_PATTERNS <= 64);
+
+/// Where a bar of the host's timeline falls in the song.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct SongPos {
-    /// Which entry (0 = the first).
-    pub entry: usize,
-    /// The bar it starts on (0 = the host's first bar).
-    pub start_bar: i64,
+pub struct SongBar {
     /// The bar this pass through the song started on: 0 the first time, a
     /// multiple of the song's length once a looped song has come round.
     pub lap_start: i64,
-    /// How many bars it lasts, at least 1.
-    pub bars: u32,
-    /// Its pattern, or `None` for a rest.
-    pub pattern: Option<usize>,
-}
-
-impl SongPos {
-    /// The bar after its last one.
-    pub fn end_bar(&self) -> i64 {
-        self.start_bar + i64::from(self.bars)
-    }
+    /// The bar within the song, `0..total_bars`.
+    pub bar: u32,
 }
 
 impl Song {
-    /// An entry that plays nothing for one bar (typed as `0`).
-    pub const REST: u8 = u8::MAX;
-
-    /// Off, looped, with an empty list.
+    /// Off, looped, with no blocks.
     pub fn new() -> Song {
-        Song::from_text(String::new(), false)
+        Song::from_blocks(Vec::new(), false)
     }
 
-    /// A song from typed text. Text that does not parse — only possible from
-    /// a hostile or hand-edited project file — keeps the text and plays
-    /// nothing, so the user sees what was there and can fix it.
-    pub fn from_text(text: String, on: bool) -> Song {
-        let entries = parse_song(&text).unwrap_or_default();
-        Song { on: AtomicBool::new(on), looped: AtomicBool::new(true), text, entries }
+    /// A song of `blocks`, repaired into shape: blocks of a pattern past the
+    /// last are dropped, every block is clamped inside [`MAX_SONG_BARS`] and
+    /// made at least one bar long, a block that overlaps an earlier one of
+    /// the same pattern is dropped, and only the first [`MAX_SONG_BLOCKS`]
+    /// are kept. A hostile project file therefore opens as a song that
+    /// plays, never as a panic.
+    pub fn from_blocks(blocks: Vec<SongBlock>, on: bool) -> Song {
+        let blocks = repair_blocks(blocks);
+        let used = blocks.iter().fold(0u64, |used, block| used | 1 << block.pattern);
+        let total = blocks.iter().map(|block| block.end()).max().unwrap_or(0);
+        Song { on: AtomicBool::new(on), looped: AtomicBool::new(true), blocks, used, total }
     }
 
     /// The same song, looped or not.
@@ -678,7 +726,7 @@ impl Song {
         self.on.store(on, Relaxed);
     }
 
-    /// Whether the song starts again after its last entry.
+    /// Whether the song starts again after its last block.
     pub fn is_looped(&self) -> bool {
         self.looped.load(Relaxed)
     }
@@ -687,81 +735,122 @@ impl Song {
         self.looped.store(looped, Relaxed);
     }
 
-    /// How many entries the song lists.
+    /// Every block, sorted by start bar and then pattern.
+    pub fn blocks(&self) -> &[SongBlock] {
+        &self.blocks
+    }
+
+    /// How many blocks the song holds.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.blocks.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.blocks.is_empty()
     }
 
-    /// The pattern an entry plays, or `None` for a rest.
-    pub fn pattern_of(entry: u8) -> Option<usize> {
-        let pattern = usize::from(entry);
-        (pattern < NUM_PATTERNS).then_some(pattern)
+    /// Whether pattern `pattern` has a block anywhere.
+    pub fn uses(&self, pattern: usize) -> bool {
+        pattern < NUM_PATTERNS && self.used & 1 << pattern != 0
     }
 
-    /// Every entry's place on the timeline, in order. Allocation-free, so
-    /// the audio thread can walk it.
-    pub fn positions<'a>(&'a self, lengths: &'a PatternBars) -> impl Iterator<Item = SongPos> + 'a {
-        let mut start_bar = 0i64;
-        self.entries.iter().enumerate().map(move |(entry, &value)| {
-            let bars = lengths.of(value);
-            let pattern = Song::pattern_of(value);
-            let pos = SongPos { entry, start_bar, lap_start: 0, bars, pattern };
-            start_bar = pos.end_bar();
-            pos
-        })
+    /// The song's length in bars: up to the end of its last block.
+    pub fn total_bars(&self) -> u32 {
+        self.total
     }
 
-    /// The entry playing at `bar`, or `None` before the start, or past the
-    /// end of a song that does not loop. A looped song's later passes come
-    /// back with their bars moved on by whole laps.
-    pub fn locate(&self, bar: i64, lengths: &PatternBars) -> Option<SongPos> {
-        if bar < 0 {
+    /// Pattern `pattern`'s block playing at song bar `bar`, if any.
+    pub fn block_at(&self, pattern: usize, bar: u32) -> Option<SongBlock> {
+        self.blocks.iter().copied().find(|block| block.pattern() == pattern && block.contains(bar))
+    }
+
+    /// How many bars a block of `pattern` starting at `start` could last
+    /// before it runs into the next block of that pattern (or the end of the
+    /// grid). 0 when `start` is inside one of its blocks already. `except`
+    /// is a block to leave out of the reckoning — the one being moved or
+    /// resized.
+    pub fn room(&self, pattern: usize, start: u32, except: Option<SongBlock>) -> u32 {
+        if pattern >= NUM_PATTERNS || start >= MAX_SONG_BARS {
+            return 0;
+        }
+        let mut room = MAX_SONG_BARS - start;
+        for block in self.blocks.iter().copied() {
+            if block.pattern() != pattern || Some(block) == except {
+                continue;
+            }
+            if block.contains(start) {
+                return 0;
+            }
+            if block.start > start {
+                room = room.min(block.start - start);
+            }
+        }
+        room
+    }
+
+    /// Where host bar `bar` falls in the song: `None` before bar 0, for an
+    /// empty song, and past the end of a song that does not loop. A looped
+    /// song's later passes come back with `lap_start` moved on by whole
+    /// laps.
+    pub fn locate(&self, bar: i64) -> Option<SongBar> {
+        let total = i64::from(self.total);
+        if bar < 0 || total == 0 {
             return None;
         }
         let lap_start = match self.is_looped() {
-            true => {
-                let total = self.total_bars(lengths);
-                (total > 0).then(|| bar - bar % total)?
-            }
-            false => 0,
+            true => bar - bar % total,
+            false if bar < total => 0,
+            false => return None,
         };
-        let local = bar - lap_start;
-        let pos = self.positions(lengths).find(|pos| local < pos.end_bar())?;
-        Some(SongPos { start_bar: pos.start_bar + lap_start, lap_start, ..pos })
-    }
-
-    /// The whole song's length in bars.
-    pub fn total_bars(&self, lengths: &PatternBars) -> i64 {
-        self.positions(lengths).last().map_or(0, |pos| pos.end_bar())
+        Some(SongBar { lap_start, bar: (bar - lap_start) as u32 })
     }
 }
 
+/// The repairs [`Song::from_blocks`] promises.
+fn repair_blocks(mut blocks: Vec<SongBlock>) -> Vec<SongBlock> {
+    blocks.retain(|block| block.pattern() < NUM_PATTERNS && block.start < MAX_SONG_BARS);
+    for block in &mut blocks {
+        block.bars = block.bars.clamp(1, MAX_SONG_BARS - block.start);
+    }
+    // Earliest first within each pattern, so of two that overlap the earlier
+    // one is kept — and the one the file listed first, among equals.
+    blocks.sort_by_key(|block| (block.pattern, block.start));
+    let mut kept: Vec<SongBlock> = Vec::with_capacity(blocks.len().min(MAX_SONG_BLOCKS));
+    for block in blocks {
+        let clashes = kept
+            .last()
+            .is_some_and(|last| last.pattern == block.pattern && last.end() > block.start);
+        if !clashes && kept.len() < MAX_SONG_BLOCKS {
+            kept.push(block);
+        }
+    }
+    kept.sort_by_key(|block| (block.start, block.pattern));
+    kept
+}
+
 /// How many bars each pattern lasts in song mode: its longest lane, rounded
-/// up to whole bars, and never less than one. Lanes shorter than that loop
-/// inside it, as they do outside song mode. Lengths are live (a lane's
-/// length and rate are value edits), so this is worked out afresh for each
-/// block, and only for the patterns the song uses.
+/// up to whole bars, and never less than one. It is what a block is placed
+/// at, and how often a block starts its pattern again. Lengths are live (a
+/// lane's length and rate are value edits), so the audio thread works this
+/// out afresh for each block, for the patterns the song uses.
 #[derive(Clone, Copy, Debug)]
 pub struct PatternBars {
     bars: [u32; NUM_PATTERNS],
 }
 
-// `used` below is one bit per pattern.
-const _: () = assert!(NUM_PATTERNS <= 64);
-
 impl PatternBars {
-    /// The lengths of the song's patterns in `bar_beats`-long bars.
+    /// The lengths of the patterns the song uses, in `bar_beats`-long bars;
+    /// every other pattern reads as one bar.
     pub fn new(data: &SeqData, bar_beats: f64) -> PatternBars {
-        let used = data
-            .song
-            .entries
-            .iter()
-            .filter_map(|&entry| Song::pattern_of(entry))
-            .fold(0u64, |used, pattern| used | 1 << pattern);
+        PatternBars::for_mask(data, bar_beats, data.song.used)
+    }
+
+    /// The lengths of every pattern — what the editor places blocks at.
+    pub fn all(data: &SeqData, bar_beats: f64) -> PatternBars {
+        PatternBars::for_mask(data, bar_beats, u64::MAX)
+    }
+
+    fn for_mask(data: &SeqData, bar_beats: f64, used: u64) -> PatternBars {
         let bars = std::array::from_fn(|pattern| match used & 1 << pattern {
             0 => 1,
             _ => pattern_bars(&data.patterns[pattern], bar_beats),
@@ -769,9 +858,9 @@ impl PatternBars {
         PatternBars { bars }
     }
 
-    /// How many bars an entry lasts: its pattern's length, or 1 for a rest.
-    pub fn of(&self, entry: u8) -> u32 {
-        self.bars.get(usize::from(entry)).copied().unwrap_or(1)
+    /// How many bars pattern `pattern` lasts; 1 for an index past the last.
+    pub fn of(&self, pattern: usize) -> u32 {
+        self.bars.get(pattern).copied().unwrap_or(1)
     }
 }
 
@@ -801,11 +890,20 @@ impl Clone for Song {
         Song {
             on: AtomicBool::new(self.is_on()),
             looped: AtomicBool::new(self.is_looped()),
-            text: self.text.clone(),
-            entries: self.entries.clone(),
+            blocks: self.blocks.clone(),
+            used: self.used,
+            total: self.total,
         }
     }
 }
+
+// ---- the typed song order of older saves ----
+
+/// The most entries a typed song order could list.
+pub const MAX_SONG_ENTRIES: usize = 1024;
+
+/// A typed order's silent bar (typed as `0`).
+pub const SONG_REST: u8 = u8::MAX;
 
 /// Why a typed song order was refused.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -833,7 +931,8 @@ impl std::fmt::Display for SongError {
     }
 }
 
-/// Reads a typed song order into its entries.
+/// Reads a typed song order — the song format before the grid — into its
+/// entries: a pattern index each, or [`SONG_REST`].
 ///
 /// Pattern numbers are one-based, as on the pattern buttons, and `0` is a
 /// silent bar. Pieces are separated by `-`, `,` or spaces, and `3x4` (or
@@ -856,7 +955,7 @@ pub fn parse_song(text: &str) -> Result<Vec<u8>, SongError> {
             return Err(SongError::ZeroRepeat(token.to_owned()));
         }
         let entry = match number {
-            0 => Song::REST,
+            0 => SONG_REST,
             n if n as usize <= NUM_PATTERNS => (n - 1) as u8,
             n => return Err(SongError::NoSuchPattern(n)),
         };
@@ -866,6 +965,29 @@ pub fn parse_song(text: &str) -> Result<Vec<u8>, SongError> {
         entries.extend(std::iter::repeat_n(entry, repeat));
     }
     Ok(entries)
+}
+
+/// Lays a typed order's entries out on the grid as the old song mode played
+/// them: one after another from bar 1, each its pattern's length, a rest
+/// one empty bar. Entries past the end of the grid are dropped.
+pub fn blocks_from_order(entries: &[u8], lengths: &PatternBars) -> Vec<SongBlock> {
+    let mut blocks = Vec::with_capacity(entries.len());
+    let mut start = 0u32;
+    for &entry in entries {
+        if start >= MAX_SONG_BARS {
+            break;
+        }
+        let pattern = usize::from(entry);
+        let bars = match pattern < NUM_PATTERNS {
+            true => lengths.of(pattern),
+            false => 1,
+        };
+        if pattern < NUM_PATTERNS {
+            blocks.push(SongBlock { pattern: entry, start, bars });
+        }
+        start = start.saturating_add(bars);
+    }
+    blocks
 }
 
 /// The whole sequence: the lane list plus, for each of the patterns, one
@@ -878,6 +1000,9 @@ pub fn parse_song(text: &str) -> Result<Vec<u8>, SongError> {
 pub struct SeqData {
     pub lanes: Vec<Lane>,
     pub patterns: [Vec<LaneData>; NUM_PATTERNS],
+    /// Each pattern's own name, as [`clean_pattern_name`] leaves it; empty
+    /// for a pattern that has none.
+    pub pattern_names: [String; NUM_PATTERNS],
     pub song: Song,
 }
 
@@ -888,6 +1013,7 @@ impl SeqData {
         SeqData {
             lanes: Vec::new(),
             patterns: std::array::from_fn(|_| Vec::new()),
+            pattern_names: std::array::from_fn(|_| String::new()),
             song: Song::new(),
         }
     }
@@ -914,7 +1040,8 @@ impl SeqData {
                 pattern.push(LaneData::empty());
             }
         }
-        SeqData { lanes, patterns, song: Song::new() }
+        let pattern_names = std::array::from_fn(|_| String::new());
+        SeqData { lanes, patterns, pattern_names, song: Song::new() }
     }
 
     /// The same sequence with `song` as its song.
@@ -944,6 +1071,12 @@ impl SeqData {
         self.patterns.get(pattern)?.get(pos)
     }
 
+    /// Pattern `pattern`'s own name, or `""` when it has none (or there is
+    /// no such pattern).
+    pub fn pattern_name(&self, pattern: usize) -> &str {
+        self.pattern_names.get(pattern).map_or("", String::as_str)
+    }
+
     /// The highest lane id present, for restoring `next_lane_id` after a state
     /// load so new lanes can't collide with loaded ones.
     pub fn max_lane_id(&self) -> Option<u32> {
@@ -964,6 +1097,7 @@ impl Clone for SeqData {
         SeqData {
             lanes: self.lanes.clone(),
             patterns: std::array::from_fn(|p| self.patterns[p].clone()),
+            pattern_names: self.pattern_names.clone(),
             song: self.song.clone(),
         }
     }
@@ -1160,7 +1294,7 @@ impl SeqModel {
         self.cell.get().song.set_on(on);
     }
 
-    /// Chooses whether the song starts again after its last entry.
+    /// Chooses whether the song starts again after its last block.
     pub fn set_song_looped(&self, looped: bool) {
         let _writer = self.edit_lock();
         self.cell.get().song.set_looped(looped);
@@ -1210,17 +1344,86 @@ impl SeqModel {
         .is_some()
     }
 
-    /// Replaces the song order with typed `text`. Text that does not parse
-    /// changes nothing and says why. Returns the number of entries.
-    pub fn set_song(&self, text: &str) -> Result<usize, SongError> {
-        let entries = parse_song(text)?;
-        let count = entries.len();
-        self.shape_edit(|data| {
-            data.song.text = text.to_owned();
-            data.song.entries = entries;
-            Some(())
-        });
-        Ok(count)
+    // ---- the song grid: shape edits on the song's blocks ----
+
+    /// Places a block of pattern `pattern` at bar `start`, `bars` long — cut
+    /// short where it would run into the next block of that pattern, and at
+    /// least one bar. Returns the block as placed, or `None` (and nothing
+    /// published) when `start` is inside a block of that pattern already,
+    /// off the grid, or the song is full.
+    pub fn add_block(&self, pattern: usize, start: u32, bars: u32) -> Option<SongBlock> {
+        self.song_edit(|song| {
+            let room = song.room(pattern, start, None);
+            if room == 0 || song.len() >= MAX_SONG_BLOCKS {
+                return None;
+            }
+            let block = SongBlock { pattern: pattern as u8, start, bars: bars.clamp(1, room) };
+            let mut blocks = song.blocks().to_vec();
+            blocks.push(block);
+            Some((Some(blocks), block))
+        })
+    }
+
+    /// Deletes the block of `pattern` that starts at bar `start`. `false`
+    /// if there is none.
+    pub fn remove_block(&self, pattern: usize, start: u32) -> bool {
+        self.song_edit(|song| {
+            let block = block_starting(song, pattern, start)?;
+            let blocks = song.blocks().iter().copied().filter(|&other| other != block).collect();
+            Some((Some(blocks), ()))
+        })
+        .is_some()
+    }
+
+    /// Makes the block of `pattern` that starts at bar `start` `bars` long:
+    /// at least one bar, and no further than the next block of that pattern.
+    /// Returns the length it got, or `None` if there is no such block.
+    pub fn resize_block(&self, pattern: usize, start: u32, bars: u32) -> Option<u32> {
+        self.song_edit(|song| {
+            let block = block_starting(song, pattern, start)?;
+            let room = song.room(pattern, start, Some(block)).max(1);
+            let bars = bars.clamp(1, room);
+            if bars == block.bars {
+                return Some((None, bars));
+            }
+            let blocks = song
+                .blocks()
+                .iter()
+                .map(|&other| if other == block { SongBlock { bars, ..block } } else { other })
+                .collect();
+            Some((Some(blocks), bars))
+        })
+    }
+
+    /// Moves the block of `pattern` that starts at bar `start` to start at
+    /// bar `to_start` in pattern `to_pattern`'s row, keeping its length.
+    /// `false` (nothing moved) if there is no such block or it does not fit
+    /// there: it would overlap a block of that pattern or run off the grid.
+    pub fn move_block(&self, pattern: usize, start: u32, to_pattern: usize, to_start: u32) -> bool {
+        self.song_edit(|song| {
+            let block = block_starting(song, pattern, start)?;
+            if (to_pattern, to_start) == (pattern, start) {
+                return Some((None, ()));
+            }
+            if song.room(to_pattern, to_start, Some(block)) < block.bars {
+                return None;
+            }
+            let moved = SongBlock { pattern: to_pattern as u8, start: to_start, ..block };
+            let blocks = song
+                .blocks()
+                .iter()
+                .map(|&other| if other == block { moved } else { other })
+                .collect();
+            Some((Some(blocks), ()))
+        })
+        .is_some()
+    }
+
+    /// Replaces every block of the song with `blocks` (repaired as
+    /// [`Song::from_blocks`] repairs them), keeping song mode and looping
+    /// as they are.
+    pub fn set_song_blocks(&self, blocks: Vec<SongBlock>) {
+        self.song_edit(|_| Some((Some(blocks), ())));
     }
 
     /// Drops a lane and its content in every pattern. `false` if the id is
@@ -1281,6 +1484,22 @@ impl SeqModel {
             }
             Some(id)
         })
+    }
+
+    /// Names a pattern, cleaned by [`clean_pattern_name`]; a blank name
+    /// takes its name away. `false` (and nothing published) for a pattern
+    /// that does not exist or a name that is already its name.
+    pub fn rename_pattern(&self, pattern: usize, name: &str) -> bool {
+        let name = clean_pattern_name(name);
+        self.shape_edit(|data| {
+            let slot = data.pattern_names.get_mut(pattern)?;
+            if *slot == name {
+                return None;
+            }
+            *slot = name;
+            Some(())
+        })
+        .is_some()
     }
 
     pub fn rename_lane(&self, lane_id: u32, name: impl Into<String>) -> bool {
@@ -1641,6 +1860,33 @@ impl SeqModel {
         Some(result)
     }
 
+    /// Runs a shape edit on the song's blocks: `f` reads the current song
+    /// and answers `None` to refuse (nothing published), `Some((None, r))`
+    /// for "nothing to change" (nothing published either), or
+    /// `Some((Some(blocks), r))` to publish a song of `blocks` with song mode
+    /// and looping carried over.
+    fn song_edit<R>(
+        &self,
+        f: impl FnOnce(&Song) -> Option<(Option<Vec<SongBlock>>, R)>,
+    ) -> Option<R> {
+        let _writer = self.edit_lock();
+        // Scoped as in `ensure_capacity`, so the current data's reference is
+        // gone before its replacement is published.
+        let (next, result) = {
+            let current = self.cell.get();
+            let (blocks, result) = f(&current.song)?;
+            let Some(blocks) = blocks else {
+                return Some(result);
+            };
+            let mut next = (*current).clone();
+            let song = &current.song;
+            next.song = Song::from_blocks(blocks, song.is_on()).with_looped(song.is_looped());
+            (next, result)
+        };
+        self.publish(next);
+        Some(result)
+    }
+
     /// Publishes a replacement `SeqData` and reclaims whatever that retired,
     /// so an instance whose editor is closed does not pile up old copies.
     /// Caller holds the writer lock.
@@ -1661,6 +1907,11 @@ impl SeqModel {
     pub fn live_allocs(&self) -> usize {
         self.collector_lock().as_ref().map_or(0, Collector::alloc_count)
     }
+}
+
+/// The block of `pattern` that starts at bar `start`, if there is one.
+fn block_starting(song: &Song, pattern: usize, start: u32) -> Option<SongBlock> {
+    song.blocks().iter().copied().find(|block| block.pattern() == pattern && block.start == start)
 }
 
 impl Default for SeqModel {
@@ -1701,8 +1952,11 @@ impl Drop for SeqModel {
 pub struct Playhead {
     steps: [AtomicU32; MAX_LANES],
     pattern: AtomicU32,
-    song_entry: AtomicU32,
-    song_bar: AtomicU32,
+    /// How far into the song playback is, in beats from the start of the
+    /// current pass, as `f64` bits; NaN when there is no song position.
+    song_beat: AtomicU64,
+    /// One bit per pattern with a block sounding.
+    song_patterns: AtomicU64,
     /// The host's bar length in beats, as `f64` bits.
     bar_beats: AtomicU64,
 }
@@ -1716,8 +1970,8 @@ impl Playhead {
         Playhead {
             steps: std::array::from_fn(|_| AtomicU32::new(Self::NONE)),
             pattern: AtomicU32::new(Self::NONE),
-            song_entry: AtomicU32::new(Self::NONE),
-            song_bar: AtomicU32::new(Self::NONE),
+            song_beat: AtomicU64::new(f64::NAN.to_bits()),
+            song_patterns: AtomicU64::new(0),
             bar_beats: AtomicU64::new(DEFAULT_BAR_BEATS.to_bits()),
         }
     }
@@ -1754,31 +2008,37 @@ impl Playhead {
         self.pattern.store(pattern, Relaxed);
     }
 
-    /// The song bar playing (0 = the first), or `None` when song mode is off
-    /// or the transport is stopped. Can be past the song's end.
+    /// How far into the song playback is, in beats from the start of this
+    /// pass through it, or `None` when song mode is off, the transport is
+    /// stopped, or it is before the song's first bar. Can be past the end
+    /// of a song that does not loop.
+    pub fn song_beat(&self) -> Option<f64> {
+        let beat = f64::from_bits(self.song_beat.load(Relaxed));
+        beat.is_finite().then_some(beat)
+    }
+
+    /// Publishes the song position; `None` (or a non-finite beat) for none.
+    pub fn set_song_beat(&self, beat: Option<f64>) {
+        self.song_beat.store(beat.unwrap_or(f64::NAN).to_bits(), Relaxed);
+    }
+
+    /// The song bar playing (0 = the first), from [`Playhead::song_beat`]
+    /// and [`Playhead::bar_beats`]: the bar the instant *before* that beat
+    /// falls in, as the engine counts it, so a block ending on a bar line
+    /// still reads as the bar it played.
     pub fn song_bar(&self) -> Option<u32> {
-        match self.song_bar.load(Relaxed) {
-            Self::NONE => None,
-            bar => Some(bar),
-        }
+        let bar = (self.song_beat()? / self.bar_beats()).ceil() - 1.0;
+        (bar.is_finite() && bar >= 0.0 && bar < f64::from(u32::MAX)).then_some(bar as u32)
     }
 
-    pub fn set_song_bar(&self, bar: u32) {
-        self.song_bar.store(bar, Relaxed);
+    /// Whether pattern `pattern` has a block sounding in the song.
+    pub fn song_plays(&self, pattern: usize) -> bool {
+        pattern < 64 && self.song_patterns.load(Relaxed) & 1 << pattern != 0
     }
 
-    /// The song entry playing (0 = the first), or `None` when song mode is
-    /// off, the transport is stopped, or the song is before its start or
-    /// past its end.
-    pub fn song_entry(&self) -> Option<u32> {
-        match self.song_entry.load(Relaxed) {
-            Self::NONE => None,
-            entry => Some(entry),
-        }
-    }
-
-    pub fn set_song_entry(&self, entry: u32) {
-        self.song_entry.store(entry, Relaxed);
+    /// Publishes which patterns have a block sounding, one bit each.
+    pub fn set_song_patterns(&self, patterns: u64) {
+        self.song_patterns.store(patterns, Relaxed);
     }
 
     /// The bar length the audio thread last saw, in beats: what the GUI
@@ -1799,8 +2059,8 @@ impl Playhead {
             cell.store(Self::NONE, Relaxed);
         }
         self.pattern.store(Self::NONE, Relaxed);
-        self.song_entry.store(Self::NONE, Relaxed);
-        self.song_bar.store(Self::NONE, Relaxed);
+        self.song_beat.store(f64::NAN.to_bits(), Relaxed);
+        self.song_patterns.store(0, Relaxed);
     }
 }
 
@@ -3039,7 +3299,7 @@ mod tests {
         assert_eq!(parse_song("1, 2  3"), Ok(vec![0, 1, 2]));
         assert_eq!(parse_song("4x3-1"), Ok(vec![3, 3, 3, 0]));
         assert_eq!(parse_song("2X2 5*1"), Ok(vec![1, 1, 4]));
-        assert_eq!(parse_song("1-0-64"), Ok(vec![0, Song::REST, 63]));
+        assert_eq!(parse_song("1-0-64"), Ok(vec![0, SONG_REST, 63]));
 
         assert_eq!(parse_song("1-a"), Err(SongError::NotANumber("a".into())));
         assert_eq!(parse_song("3x"), Err(SongError::NotANumber("3x".into())));
@@ -3054,15 +3314,15 @@ mod tests {
         assert!(SongError::NoSuchPattern(65).to_string().contains("1-64"));
     }
 
-    /// Each entry lasts its pattern's longest lane in whole bars: rests are
-    /// one bar, and bars before the start or past the end are in no entry.
+    /// A pattern lasts its longest lane in whole bars of the host's time
+    /// signature, never less than one; `new` works it out only for the
+    /// patterns the song uses.
     #[test]
-    fn a_song_places_each_entry_on_its_bars() {
+    fn pattern_bars_are_the_longest_lane_in_whole_bars() {
         let model = SeqModel::empty();
         model.add_lane("kick", 0, 36, 0).expect("room for a lane");
         model.add_lane("snare", 0, 38, 0).expect("room for a lane");
         let data = model.shared();
-        // Every lane starts as one bar of sixteenths.
         for pattern in &data.patterns[..3] {
             pattern.iter().for_each(|lane_data| lane_data.set_length(16));
         }
@@ -3071,73 +3331,154 @@ mod tests {
         // Pattern 3: 12 triplet eighths fill one bar exactly.
         data.patterns[2][1].set_rate(Rate::EighthTriplet);
         data.patterns[2][1].set_length(12);
-        let data = (*data).clone().with_song(Song::from_text("2-0-3-1".into(), true));
-        let lengths = PatternBars::new(&data, DEFAULT_BAR_BEATS);
-        let song = &data.song;
-        assert!(song.is_on());
-        assert_eq!(song.len(), 4);
-        assert_eq!(song.total_bars(&lengths), 7);
-        let pos = |entry, start_bar, bars, pattern| {
-            SongPos { entry, start_bar, lap_start: 0, bars, pattern }
-        };
-        assert_eq!(
-            song.positions(&lengths).collect::<Vec<_>>(),
-            [
-                pos(0, 0, 4, Some(1)),
-                pos(1, 4, 1, None),
-                pos(2, 5, 1, Some(2)),
-                pos(3, 6, 1, Some(0)),
-            ]
-        );
-        song.set_looped(false);
-        let entries = (-1..=7).map(|bar| song.locate(bar, &lengths).map(|pos| pos.entry));
-        assert_eq!(
-            entries.collect::<Vec<_>>(),
-            [None, Some(0), Some(0), Some(0), Some(0), Some(1), Some(2), Some(3), None]
-        );
-        // Looped, bar 7 is the first bar again, a lap of 7 bars on.
-        song.set_looped(true);
-        assert_eq!(song.locate(-1, &lengths), None, "the count-in stays silent");
-        let again = SongPos { entry: 0, start_bar: 7, lap_start: 7, bars: 4, pattern: Some(1) };
-        assert_eq!(song.locate(7, &lengths), Some(again));
-        assert_eq!(song.locate(10, &lengths), Some(again));
-        let far = song.locate(7 * 1000 + 5, &lengths).expect("looped forever");
-        assert_eq!((far.entry, far.start_bar, far.lap_start), (2, 7005, 7000));
-        assert_eq!(Song::new().locate(0, &lengths), None, "an empty song never plays");
-        // In 3/4 the same four-bar lane needs six bars.
-        assert_eq!(PatternBars::new(&data, 3.0).of(1), 6);
-        assert_eq!(PatternBars::new(&data, f64::NAN).of(1), 1, "nonsense bars");
-        assert_eq!(lengths.of(Song::REST), 1);
 
-        let hostile = Song::from_text("1-banana".into(), false);
-        assert!(hostile.is_empty(), "text that does not parse plays nothing");
-        assert_eq!(hostile.text, "1-banana", "but is kept for the user to fix");
-        assert!(!Song::default().is_on());
+        let all = PatternBars::all(&data, DEFAULT_BAR_BEATS);
+        assert_eq!((all.of(0), all.of(1), all.of(2)), (1, 4, 1));
+        assert_eq!(all.of(NUM_PATTERNS), 1, "past the last pattern");
+        // In 3/4 the same four-bar lane needs six bars.
+        assert_eq!(PatternBars::all(&data, 3.0).of(1), 6);
+        assert_eq!(PatternBars::all(&data, f64::NAN).of(1), 1, "nonsense bars");
+
+        // Only the song's patterns are worked out for the audio thread.
+        assert_eq!(PatternBars::new(&data, DEFAULT_BAR_BEATS).of(1), 1, "no song uses it");
+        let block = SongBlock { pattern: 1, start: 0, bars: 1 };
+        let data = (*data).clone().with_song(Song::from_blocks(vec![block], true));
+        assert_eq!(PatternBars::new(&data, DEFAULT_BAR_BEATS).of(1), 4);
     }
 
-    /// The song through the writer: text that parses is published, text
-    /// that does not changes nothing, and the switch is a value edit.
+    /// A song's blocks are kept sorted and in shape whatever they were made
+    /// from, and the song locates host bars in itself: silent before bar 1
+    /// and (unless looped) after the end, a lap of its length at a time when
+    /// looped.
     #[test]
-    fn the_song_is_set_through_the_model() {
+    fn a_song_is_repaired_into_shape_and_located() {
+        let block = |pattern, start, bars| SongBlock { pattern, start, bars };
+        let song = Song::from_blocks(
+            vec![
+                block(2, 4, 2),
+                block(0, 0, 4),
+                block(0, 2, 2), // overlaps the earlier block of pattern 1
+                block(64, 0, 1), // no such pattern
+                block(1, 0, 0), // made one bar long
+            ],
+            false,
+        );
+        assert!(!song.is_on() && song.is_looped(), "off and looped unless told");
+        assert_eq!(song.blocks(), [block(0, 0, 4), block(1, 0, 1), block(2, 4, 2)]);
+        assert_eq!(song.total_bars(), 6);
+        assert!(song.uses(2) && !song.uses(3) && !song.uses(NUM_PATTERNS));
+        assert_eq!(song.block_at(0, 3), Some(block(0, 0, 4)));
+        assert_eq!(song.block_at(0, 4), None);
+
+        // Room for a block: up to the next block of its pattern, or the grid's end.
+        assert_eq!(song.room(0, 2, None), 0, "inside a block");
+        assert_eq!(song.room(2, 1, None), 3);
+        assert_eq!(song.room(2, 6, None), MAX_SONG_BARS - 6);
+        assert_eq!(song.room(0, 1, Some(block(0, 0, 4))), MAX_SONG_BARS - 1, "itself left out");
+        assert_eq!(song.room(NUM_PATTERNS, 0, None), 0);
+        assert_eq!(song.room(0, MAX_SONG_BARS, None), 0);
+
+        let at = |bar| song.locate(bar).map(|pos| (pos.lap_start, pos.bar));
+        assert_eq!(at(-1), None, "the count-in stays silent");
+        assert_eq!(at(0), Some((0, 0)));
+        assert_eq!(at(5), Some((0, 5)));
+        assert_eq!(at(6), Some((6, 0)), "looped: bar 7 is bar 1 again");
+        assert_eq!(at(6 * 1000 + 5), Some((6000, 5)));
+        song.set_looped(false);
+        assert_eq!(at(6), None, "an ended song is silent");
+        assert_eq!(Song::new().locate(0), None, "an empty song never plays");
+
+        let crowd = (0..MAX_SONG_BLOCKS as u32 + 5).map(|n| block(0, n, 1)).collect();
+        let crowd = Song::from_blocks(crowd, true);
+        assert_eq!(crowd.len(), MAX_SONG_BLOCKS, "capped");
+    }
+
+    /// An old typed order laid out on the grid: in turn from bar 1, each
+    /// entry its pattern's length, a rest one empty bar.
+    #[test]
+    fn a_typed_order_lays_out_in_turn() {
+        let data = SeqData::empty();
+        let lengths = PatternBars::all(&data, DEFAULT_BAR_BEATS);
+        let block = |pattern, start, bars| SongBlock { pattern, start, bars };
+        let entries = parse_song("2-0-3x2").expect("parses");
+        assert_eq!(
+            blocks_from_order(&entries, &lengths),
+            [block(1, 0, 1), block(2, 2, 1), block(2, 3, 1)]
+        );
+        let long = vec![0u8; MAX_SONG_BARS as usize + 10];
+        let laid = blocks_from_order(&long, &lengths);
+        assert_eq!(laid.len(), MAX_SONG_BARS as usize, "up to the grid's end");
+    }
+
+    /// Block edits through the writer: placed at most into the room before
+    /// the next block of the pattern, moved only where they fit, resized
+    /// within the room, deleted; the switches are value edits, and a shape
+    /// edit elsewhere carries the song along.
+    #[test]
+    fn patterns_are_named_through_the_model_and_undone() {
         let model = SeqModel::empty();
-        assert_eq!(model.set_song("1-2x2"), Ok(3));
-        assert_eq!(model.shared().song.entries, [0, 1, 1]);
-        assert_eq!(model.shared().song.text, "1-2x2");
-        assert_eq!(model.set_song("1-99"), Err(SongError::NoSuchPattern(99)));
-        assert_eq!(model.shared().song.text, "1-2x2", "a bad order leaves the song alone");
+        assert_eq!(model.shared().pattern_name(2), "");
+        assert!(model.rename_pattern(2, "  Chorus\n "));
+        assert_eq!(model.shared().pattern_name(2), "Chorus", "trimmed, no control chars");
+        assert!(!model.rename_pattern(2, "Chorus"), "unchanged: nothing published");
+        assert!(!model.rename_pattern(NUM_PATTERNS, "x"), "no such pattern");
+        assert_eq!(model.shared().pattern_name(NUM_PATTERNS), "");
+        let long = "x".repeat(MAX_PATTERN_NAME_CHARS + 10);
+        assert!(model.rename_pattern(3, &long));
+        assert_eq!(model.shared().pattern_name(3).chars().count(), MAX_PATTERN_NAME_CHARS);
+
+        model.commit_edits();
+        assert!(model.rename_pattern(2, ""), "a blank name takes it away");
+        assert_eq!(model.shared().pattern_name(2), "");
+        model.commit_edits();
+        assert!(model.undo());
+        assert_eq!(model.shared().pattern_name(2), "Chorus");
+    }
+
+    #[test]
+    fn song_blocks_are_edited_through_the_model() {
+        let model = SeqModel::empty();
+        let block = |pattern, start, bars| SongBlock { pattern, start, bars };
+        let blocks = || model.shared().song.blocks().to_vec();
+
+        assert_eq!(model.add_block(0, 4, 2), Some(block(0, 4, 2)));
+        assert_eq!(model.add_block(0, 0, 8), Some(block(0, 0, 4)), "cut short before bar 5");
+        assert_eq!(model.add_block(0, 5, 1), None, "inside a block");
+        assert_eq!(model.add_block(NUM_PATTERNS, 0, 1), None, "no such pattern");
+        assert_eq!(model.add_block(1, 0, 0), Some(block(1, 0, 1)), "at least a bar");
+        assert_eq!(blocks(), [block(0, 0, 4), block(1, 0, 1), block(0, 4, 2)]);
+
+        assert_eq!(model.resize_block(0, 0, 9), Some(4), "the next block is in the way");
+        assert_eq!(model.resize_block(0, 4, 9), Some(9));
+        assert_eq!(model.resize_block(0, 4, 0), Some(1));
+        assert_eq!(model.resize_block(0, 3, 2), None, "no block starts there");
+
+        assert!(!model.move_block(0, 0, 0, 2), "would overlap pattern 1's next block");
+        assert!(model.move_block(0, 0, 3, 2), "to pattern 4's row");
+        assert!(model.move_block(0, 4, 0, 0));
+        assert!(!model.move_block(1, 0, 1, MAX_SONG_BARS), "off the grid");
+        assert!(model.move_block(1, 0, 1, 0), "nowhere is a move");
+        assert_eq!(blocks(), [block(0, 0, 1), block(1, 0, 1), block(3, 2, 4)]);
+
+        assert!(model.remove_block(3, 2));
+        assert!(!model.remove_block(3, 2), "already gone");
+        assert_eq!(blocks(), [block(0, 0, 1), block(1, 0, 1)]);
 
         let before = model.shared();
         model.set_song_on(true);
         assert!(before.song.is_on(), "switched on in place, no republish");
-        assert!(before.song.is_looped(), "a song loops unless told not to");
         model.set_song_looped(false);
         assert!(!before.song.is_looped(), "also in place");
-        // A shape edit carries the song and the switch along.
+        // Block edits and other shape edits carry the switches along.
+        assert!(model.add_block(5, 5, 1).is_some());
         let id = model.add_lane("kick", 0, 36, 0).expect("room for a lane");
-        assert!(model.shared().song.is_on());
-        assert!(!model.shared().song.is_looped());
-        assert_eq!(model.shared().song.entries, [0, 1, 1]);
+        assert!(model.shared().song.is_on() && !model.shared().song.is_looped());
+        assert_eq!(model.shared().song.len(), 3);
         assert!(model.remove_lane(id));
+
+        model.set_song_blocks(vec![block(7, 1, 2), block(7, 2, 2)]);
+        assert_eq!(blocks(), [block(7, 1, 2)], "repaired");
+        assert!(model.shared().song.is_on(), "kept on");
     }
 
     /// Only exactly what a new lane starts with counts as pristine.
@@ -3415,7 +3756,7 @@ mod tests {
                 LaneSnapshot { id: 0, key: 200, channel: 99, ..Default::default() };
                 300
             ],
-            patterns: vec![PatternSnapshot { lanes: Vec::new() }; 20],
+            patterns: vec![PatternSnapshot { lanes: Vec::new(), name: String::new() }; 20],
             song: Default::default(),
         };
 
@@ -3585,11 +3926,13 @@ mod tests {
         assert!(model.copy_pattern(0, 3));
         model.commit_edits();
         model.set_song_on(true);
-        assert!(model.set_song("1-4").is_ok());
+        assert!(model.add_block(3, 0, 2).is_some());
+        assert!(model.resize_block(3, 0, 4).is_some());
         model.commit_edits();
 
         assert!(model.undo());
-        assert!(!model.shared().song.is_on(), "song switch and text were one step");
+        assert!(!model.shared().song.is_on(), "the switch and the block edits were one step");
+        assert!(model.shared().song.is_empty());
         assert!(step_on(&model, 3, id, 0));
         assert!(model.undo());
         assert!(!step_on(&model, 3, id, 0), "the copy is undone");

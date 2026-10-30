@@ -17,9 +17,10 @@ and program beats on a grid, like Bitwig's Stepwise, but with:
 - **Pitched samples:** a *Sample pad* lane setting, so Drum Machine samples
   follow the pitch without setting a root key on every pad.
 - **64 patterns**, switchable from an automatable *Pattern Select* parameter.
-- **Song mode:** type the pattern order (`1-2-1-3x2`) and bitstep plays the
-  patterns one after another along Bitwig's timeline, so changing a pattern
-  changes the whole song without re-recording.
+- **Song mode:** place patterns on a song grid (one row per pattern, one
+  column per bar) and bitstep plays them along Bitwig's timeline. Patterns in
+  the same bars play together, and changing a pattern changes the whole song
+  without re-recording.
 - **Undo and redo** for everything you edit in bitstep (Ctrl+Z / Ctrl+Shift+Z).
 - Edit while the transport runs; everything is saved with your project.
 
