@@ -14,6 +14,8 @@ and program beats on a grid, like Bitwig's Stepwise, but with:
   ratchet with the mouse (Shift for straight lines).
 - **A pitch mode** for drawing pitch curves right on the grid.
 - **A volume per lane** (−36 to +12 dB).
+- **Edit several lanes at once:** Ctrl+ or Shift+click lane names, then
+  change rate, length, volume, mute/solo or use the lane menu on all of them.
 - **Pitched samples:** a *Sample pad* lane setting, so Drum Machine samples
   follow the pitch without setting a root key on every pad.
 - **64 patterns**, switchable from an automatable *Pattern Select* parameter.

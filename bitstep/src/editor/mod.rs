@@ -17,9 +17,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use egui::{
-    Align, Align2, Button, ComboBox, CornerRadius, CursorIcon, DragValue, FontId, Label, Layout,
+    Align, Align2, Button, CornerRadius, CursorIcon, DragValue, FontId, Label, Layout,
     Modifiers, Painter, PointerButton, Popup, PopupCloseBehavior, Pos2, Rect, RichText, Sense,
-    Slider, StrokeKind, TextEdit, TextWrapMode, UiBuilder, Vec2,
+    Slider, StrokeKind, TextEdit, UiBuilder, Vec2,
 };
 use nice_plug::context::gui::GuiContext;
 use nice_plug::editor::dpi::LogicalSize;
@@ -40,7 +40,7 @@ use crate::engine::BlockCtx;
 use crate::model::{
     Lane, LaneData, MAX_LANES, NUM_PATTERNS, Playhead, SeqData, SeqModel, Step,
 };
-use crate::sequencer::{Prng, Rate, lane_is_audible};
+use crate::sequencer::{Modifier, NoteValue, Prng, Rate, lane_is_audible};
 use crate::state;
 
 use grid_math::{
@@ -91,7 +91,15 @@ const LANE_HEADER_ID: &str = "bitstep:lane-header";
 
 /// What a lane's rate dropdown salts its id with, inside its row's own
 /// [`LANE_HEADER_ID`] scope.
-const RATE_COMBO_ID: &str = "bitstep:lane-rate";
+const RATE_PICKER_ID: &str = "bitstep:lane-rate";
+
+/// The rate picker's rows: a row label and its modifier, straight first
+/// because that is what is picked most.
+const RATE_ROWS: [(&str, Modifier); 3] = [
+    ("Straight", Modifier::Straight),
+    ("Triplet", Modifier::Triplet),
+    ("Dotted", Modifier::Dotted),
+];
 
 /// What a lane's drag handle — the grip, dot and name as one region
 /// ([`HeaderFields::handle`]) — salts its id with, inside the same scope.
@@ -310,9 +318,11 @@ pub struct BitstepEditor {
     /// What a press on the grid edits: steps (on/off and velocity) or pitch.
     /// GUI-only, chosen with the top bar's mode buttons.
     mode: EditMode,
-    /// The lane the parameter panel edits, by id. `None` (or a lane that has
-    /// gone) means the first lane. Set by clicking a lane's name or a step.
-    selected_lane: Option<u32>,
+    /// The selected lanes ([`grid_math::LaneSelection`]): the one the
+    /// parameter panel edits (none, or one that has gone, means the first
+    /// lane), and with Ctrl/Shift+click more, which header and menu edits
+    /// then go to together. Set by clicking a lane's name or a step.
+    selection: grid_math::LaneSelection,
     /// Whether the parameter panel under the grid is shown.
     panel_open: bool,
     /// What the parameter panel shows and draws.
@@ -568,6 +578,39 @@ struct HeaderPlace {
     selected: bool,
 }
 
+/// The whole lane list, as a lane header needs it for edits that go to
+/// several selected lanes: the lanes top to bottom by id, the data to look
+/// each one up in, and the pattern on screen, which the edits go to.
+#[derive(Clone, Copy)]
+struct HeaderLanes<'a> {
+    data: &'a SeqData,
+    order: &'a [u32],
+    pattern: usize,
+}
+
+impl HeaderLanes<'_> {
+    /// Lane `id`'s step capacity in `pattern`, or `None` if it has gone.
+    fn capacity(&self, pattern: usize, id: u32) -> Option<usize> {
+        let pos = self.data.position_of(id)?;
+        Some(self.data.lane_data(pattern, pos)?.capacity())
+    }
+}
+
+/// Moves each of `lanes`' volumes by `delta` dB, clamped to the lane's
+/// range, so selected lanes keep their differences.
+fn nudge_volumes(model: &SeqModel, data: &SeqData, lanes: &[u32], delta: i32) {
+    if delta == 0 {
+        return;
+    }
+    for &id in lanes {
+        let Some(lane) = data.position_of(id).and_then(|pos| data.lane(pos)) else {
+            continue;
+        };
+        let wanted = i32::from(lane.volume_db()) + delta;
+        model.set_volume(id, grid_math::widget_volume(f64::from(wanted)));
+    }
+}
+
 /// What the primary button being down on the step strip currently means.
 ///
 /// The step strip puts three gestures on one button — "click toggles;
@@ -692,7 +735,7 @@ impl BitstepEditor {
             scroll: Vec2::ZERO,
             follow: true,
             mode: EditMode::Steps,
-            selected_lane: None,
+            selection: grid_math::LaneSelection::default(),
             panel_open: true,
             param: ParamKind::Velocity,
             param_draw: None,
@@ -923,7 +966,7 @@ impl BitstepEditor {
             return;
         };
 
-        self.selected_lane = Some(lane.id);
+        self.selection.press(lane.id);
         let current = lane_data.step(step);
         if self.mode == EditMode::Pitch {
             // Nothing written yet: a press that comes up without moving is the
@@ -1208,7 +1251,7 @@ impl BitstepEditor {
         let (Some(lane), Some(lane_data)) = (data.lane(row), data.lane_data(pattern, row)) else {
             return;
         };
-        self.selected_lane = Some(lane.id);
+        self.selection.press(lane.id);
         if !lane_data.step(step).is_on() {
             return;
         }
@@ -1501,6 +1544,14 @@ impl BitstepEditor {
             return;
         }
         let any_solo = data.any_solo();
+        let order: Vec<u32> = data.lanes.iter().map(|lane| lane.id).collect();
+        self.selection.retain(&order);
+        // Escape with nothing else to cancel goes back to one lane.
+        let idle = self.lane_drag.is_none() && self.gesture.is_none() && self.popover.is_none();
+        let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
+        if escape && idle && !ui.ctx().text_edit_focused() {
+            self.selection.collapse();
+        }
         let selected_row = self.selected_row(data);
         if let Some(edit) = self.name_edit.as_mut() {
             edit.shown = !matches!(edit.target, NameTarget::Lane(_));
@@ -1524,10 +1575,12 @@ impl BitstepEditor {
                     row,
                     pitch: view.metrics().row_pitch(),
                     content_top: view.origin().y,
-                    selected: self.panel_open && selected_row == Some(row),
+                    selected: self.selection.in_multi(lane.id)
+                        || (self.panel_open && selected_row == Some(row)),
                 };
                 let audible = lane_is_audible(lane, any_solo);
-                self.ui_lane_header(ui, place, lane, lane_data, pattern, audible);
+                let lanes = HeaderLanes { data, order: &order, pattern };
+                self.ui_lane_header(ui, place, lane, lane_data, audible, lanes);
             }
         });
         // A name field whose row was not drawn has lost the keyboard without
@@ -1603,9 +1656,10 @@ impl BitstepEditor {
         place: HeaderPlace,
         lane: &Lane,
         lane_data: &LaneData,
-        pattern: usize,
         audible: bool,
+        lanes: HeaderLanes<'_>,
     ) {
+        let pattern = lanes.pattern;
         // Field borrows rather than `self.…` inside the closures below: the
         // key field writes through the model while banking its scroll in
         // `key_scroll`, and either a method call or a `self` capture would
@@ -1617,7 +1671,10 @@ impl BitstepEditor {
         let name_edit = &mut self.name_edit;
         let confirm = &mut self.confirm;
         let rng = &mut self.rng;
-        let selected_lane = &mut self.selected_lane;
+        let selection = &mut self.selection;
+        // Where an edit in this row goes: every selected lane when this one
+        // is among several selected, otherwise this lane alone.
+        let targets = selection.targets(lane.id, lanes.order);
 
         let band = place.band;
         let fields = HeaderFields::split(band.shrink2(egui::vec2(theme::PANEL_PADDING, 0.0)));
@@ -1645,8 +1702,16 @@ impl BitstepEditor {
             );
             let dragging = reorder_lane(ui, &handle, lane_drag, lane, place);
             if handle.clicked() {
-                // The lane the parameter panel edits.
-                *selected_lane = Some(lane.id);
+                // The lane the parameter panel edits; Ctrl adds or removes
+                // it, Shift selects the run from the last click to it.
+                let modifiers = ui.input(|input| input.modifiers);
+                if modifiers.command {
+                    selection.toggle(lane.id);
+                } else if modifiers.shift {
+                    selection.extend(lane.id, lanes.order);
+                } else {
+                    selection.select(lane.id);
+                }
             }
             // A double-click on the name (not the grip or the dot) types a
             // new one in place ([`NameEdit`]).
@@ -1676,7 +1741,7 @@ impl BitstepEditor {
                 let icon = if dragging { CursorIcon::Grabbing } else { CursorIcon::Grab };
                 ui.ctx().set_cursor_icon(icon);
             }
-            let target = MenuLane { lane, pattern, step_beats: lane_data.rate().rate_beats() };
+            let target = MenuLane { lane, pattern, targets: &targets, data: lanes.data };
             lane_menu(&handle, model, rename, confirm, rng, target);
 
             // The grip's dots, painted rather than a glyph — see
@@ -1746,14 +1811,19 @@ impl BitstepEditor {
             // for what was asked; growing it is a shape edit, so it goes first
             // and the length lands in the republished data.
             let set_length = |value: f64| {
-                let edit = LengthEdit::resolve(value, lane_data.capacity());
-                // A failed grow means the lane is gone (a state load between
-                // frames), and then the length has nowhere to go either —
-                // `set_length` would answer `false` as well.
-                let grown =
-                    edit.grow().is_none_or(|steps| model.ensure_capacity(pattern, lane.id, steps));
-                if grown {
-                    model.set_length(pattern, lane.id, edit.length());
+                for &id in &targets {
+                    let Some(capacity) = lanes.capacity(pattern, id) else {
+                        continue;
+                    };
+                    let edit = LengthEdit::resolve(value, capacity);
+                    // A failed grow means the lane is gone (a state load
+                    // between frames), and then the length has nowhere to go
+                    // either — `set_length` would answer `false` as well.
+                    let grown =
+                        edit.grow().is_none_or(|steps| model.ensure_capacity(pattern, id, steps));
+                    if grown {
+                        model.set_length(pattern, id, edit.length());
+                    }
                 }
             };
             let (length, steps) = put_stepped(
@@ -1780,26 +1850,13 @@ impl BitstepEditor {
             }
             length.on_hover_text(LENGTH_HOVER);
 
-            // The rate: every `Rate`, labelled by its own `Display` (21 of them,
-            // so a list rather than a cycle button).
-            let rate = lane_data.rate();
-            ui.scope_builder(
-                UiBuilder::new().max_rect(fields.rate).layout(Layout::left_to_right(Align::Center)),
-                |ui| {
-                    ComboBox::from_id_salt(RATE_COMBO_ID)
-                        .selected_text(rate.to_string())
-                        .width(fields.rate.width())
-                        .wrap_mode(TextWrapMode::Truncate)
-                        .show_ui(ui, |ui| {
-                            for option in Rate::ALL {
-                                let item = ui.selectable_label(option == rate, option.to_string());
-                                if item.clicked() {
-                                    model.set_rate(pattern, lane.id, option);
-                                }
-                            }
-                        });
-                },
-            );
+            // The rate: a button that opens every `Rate` at once
+            // ([`rate_picker`]).
+            if let Some(picked) = rate_picker(ui, fields.rate, lane_data.rate()) {
+                for &id in &targets {
+                    model.set_rate(pattern, id, picked);
+                }
+            }
 
             // The lane's volume, sent with every note as a per-note volume.
             // Drag, click to type, right-click for 0 dB.
@@ -1808,7 +1865,9 @@ impl BitstepEditor {
                 fields.volume,
                 DragValue::from_get_set(|value| {
                     if let Some(value) = value {
-                        model.set_volume(lane.id, grid_math::widget_volume(value));
+                        let delta = i32::from(grid_math::widget_volume(value))
+                            - i32::from(lane.volume_db());
+                        nudge_volumes(model, lanes.data, &targets, delta);
                     }
                     f64::from(lane.volume_db())
                 })
@@ -1820,11 +1879,12 @@ impl BitstepEditor {
                 .custom_parser(|text| grid_math::parse_volume(text).map(f64::from)),
             );
             if steps != 0 {
-                let wanted = f64::from(lane.volume_db()) + f64::from(steps);
-                model.set_volume(lane.id, grid_math::widget_volume(wanted));
+                nudge_volumes(model, lanes.data, &targets, steps);
             }
             if volume.secondary_clicked() {
-                model.set_volume(lane.id, 0);
+                for &id in &targets {
+                    model.set_volume(id, 0);
+                }
             }
             volume.on_hover_text(
                 "Lane volume. Drag up or down, or click to type. Right-click for 0 dB.",
@@ -1832,11 +1892,18 @@ impl BitstepEditor {
 
             // Mute and solo. Read back off the lane rather than toggled from a
             // copy, so a click lands on whatever the state is now.
+            // Every selected lane follows the clicked one's new state.
             if ui.put(fields.mute, Button::new("M").selected(lane.is_muted())).clicked() {
-                model.set_mute(lane.id, !lane.is_muted());
+                let mute = !lane.is_muted();
+                for &id in &targets {
+                    model.set_mute(id, mute);
+                }
             }
             if ui.put(fields.solo, Button::new("S").selected(lane.is_soloed())).clicked() {
-                model.set_solo(lane.id, !lane.is_soloed());
+                let solo = !lane.is_soloed();
+                for &id in &targets {
+                    model.set_solo(id, solo);
+                }
             }
         });
     }
@@ -2039,7 +2106,8 @@ impl BitstepEditor {
     /// The row of the lane the parameter panel edits: the selected lane, or
     /// the first one when none is selected or the selected one has gone.
     fn selected_row(&self, data: &SeqData) -> Option<usize> {
-        self.selected_lane
+        self.selection
+            .primary()
             .and_then(|id| data.position_of(id))
             .or_else(|| (data.lane_count() > 0).then_some(0))
     }
@@ -2745,6 +2813,50 @@ fn put_stepped(ui: &mut egui::Ui, rect: Rect, drag: DragValue<'_>) -> (egui::Res
 /// egui's own handling adds the drag `speed` per press — a fraction of a
 /// step for every field here — and the whole-number setters round that
 /// straight back, so the keys did nothing at all.
+/// A lane's rate field: a button showing `rate` that opens all 21 rates at
+/// once, one row per kind (straight, triplet, dotted) and one column per
+/// note value, with `rate` lit. Answers the rate clicked, if one was; the
+/// popover closes on it.
+///
+/// A grid rather than a dropdown: a list of 21 scrolls, and the one wanted
+/// is easy to scroll past.
+fn rate_picker(ui: &mut egui::Ui, rect: Rect, rate: Rate) -> Option<Rate> {
+    let id = ui.make_persistent_id(RATE_PICKER_ID);
+    let open = egui::Popup::is_id_open(ui.ctx(), id);
+    let button = ui
+        .put(rect, Button::new(rate.to_string()).selected(open))
+        .on_hover_text("Step length. Click to pick from every rate.");
+    // The little arrow a dropdown has, so the field still reads as one.
+    let size = theme::PITCH_LABEL_SIZE * 0.5;
+    let right = rect.max.x - theme::CONTROL_PADDING.x - size;
+    let tip = egui::pos2(right, rect.center().y + size * 0.5);
+    let arrow = vec![tip + egui::vec2(-size, -size), tip + egui::vec2(size, -size), tip];
+    ui.painter().add(egui::Shape::convex_polygon(arrow, theme::TEXT_DIM, egui::Stroke::NONE));
+
+    let mut picked = None;
+    Popup::menu(&button)
+        .id(id)
+        .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            let spacing = Vec2::splat(theme::ITEM_SPACING);
+            egui::Grid::new(RATE_PICKER_ID).spacing(spacing).show(ui, |ui| {
+                for (label, modifier) in RATE_ROWS {
+                    ui.label(RichText::new(label).color(theme::TEXT_DIM));
+                    for note in NoteValue::ALL {
+                        let option = Rate::from_parts(note, modifier);
+                        let item = Button::new(option.to_string()).selected(option == rate);
+                        if ui.add(item).clicked() {
+                            picked = Some(option);
+                            ui.close();
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+    picked
+}
+
 fn arrow_steps(ui: &egui::Ui, id: egui::Id) -> i32 {
     if !ui.memory(|memory| memory.has_focus(id)) {
         return 0;
@@ -2759,11 +2871,29 @@ fn arrow_steps(ui: &egui::Ui, id: egui::Id) -> i32 {
 /// The lane a context menu is for, and what it needs to know about it.
 #[derive(Clone, Copy)]
 struct MenuLane<'a> {
+    /// The lane right-clicked.
     lane: &'a Lane,
     /// The pattern on screen, which the bulk edits and fills apply to.
     pattern: usize,
-    /// The lane's step length in beats in that pattern, for the fills.
-    step_beats: f64,
+    /// The lanes the menu acts on, top to bottom: every selected lane when
+    /// `lane` is among several selected, otherwise `lane` alone.
+    targets: &'a [u32],
+    /// The sequence, for each target's rate in `pattern` (the fills).
+    data: &'a SeqData,
+}
+
+impl MenuLane<'_> {
+    /// Each target with its step length in beats in the pattern on screen,
+    /// for the fills. Lanes that have gone are left out.
+    fn step_beats(&self) -> Vec<(u32, f64)> {
+        self.targets
+            .iter()
+            .filter_map(|&id| {
+                let pos = self.data.position_of(id)?;
+                Some((id, self.data.lane_data(self.pattern, pos)?.rate().rate_beats()))
+            })
+            .collect()
+    }
 }
 
 /// One lane's context menu: rename, colour, channel, duplicate, delete, the
@@ -2792,7 +2922,8 @@ fn lane_menu(
     rng: &mut Prng,
     target: MenuLane<'_>,
 ) {
-    let MenuLane { lane, pattern, step_beats } = target;
+    let MenuLane { lane, pattern, targets, .. } = target;
+    let several = targets.len() > 1;
     // `CloseOnClickOutside`, not the context-menu default `CloseOnClick`:
     // the default closes the menu on *any* click, inside it too, which would
     // close it as soon as the rename field is clicked and disarm `delete` /
@@ -2803,6 +2934,12 @@ fn lane_menu(
         .show(|ui| {
         ui.set_width(LANE_MENU_WIDTH);
 
+        // Several lanes: everything below goes to all of them, and a name
+        // for all of them at once makes no sense.
+        if several {
+            ui.label(RichText::new(format!("{} lanes", targets.len())).strong())
+                .on_hover_text("Everything in this menu applies to all the selected lanes.");
+        } else {
         // The rename field's buffer, refilled whenever the menu in front of
         // the user belongs to another lane than the last one typed into.
         let held = match rename {
@@ -2827,6 +2964,7 @@ fn lane_menu(
             // re-imposing a stale name on the next keystroke.
             held.text = lane.name.clone();
         }
+        }
 
         ui.separator();
 
@@ -2844,7 +2982,9 @@ fn lane_menu(
                     .min_size(Vec2::splat(theme::SWATCH_SIZE))
                     .selected(chosen);
                 if ui.add(swatch).clicked() {
-                    model.set_colour(lane.id, colour);
+                    for &id in targets {
+                        model.set_colour(id, colour);
+                    }
                 }
             }
         });
@@ -2860,7 +3000,9 @@ fn lane_menu(
             ui.add(
                 DragValue::from_get_set(|value| {
                     if let Some(value) = value {
-                        model.set_channel(lane.id, grid_math::widget_channel(value));
+                        for &id in targets {
+                            model.set_channel(id, grid_math::widget_channel(value));
+                        }
                     }
                     grid_math::channel_widget(lane.channel())
                 })
@@ -2870,7 +3012,9 @@ fn lane_menu(
             );
             if steps != 0 {
                 let wanted = grid_math::channel_widget(lane.channel()) + f64::from(steps);
-                model.set_channel(lane.id, grid_math::widget_channel(wanted));
+                for &id in targets {
+                    model.set_channel(id, grid_math::widget_channel(wanted));
+                }
             }
         });
 
@@ -2882,7 +3026,9 @@ fn lane_menu(
              on this lane's note, so the pad needs no root key. Leave off for synth drums.",
         );
         if toggle.changed() {
-            model.set_sample_pad(lane.id, sample_pad);
+            for &id in targets {
+                model.set_sample_pad(id, sample_pad);
+            }
         }
 
         ui.separator();
@@ -2891,11 +3037,15 @@ fn lane_menu(
         // a GUI that wants to select it; nothing here does yet.
         if ui.button("duplicate").clicked() {
             *confirm = None;
-            let _ = model.duplicate_lane(lane.id);
+            for &id in targets {
+                let _ = model.duplicate_lane(id);
+            }
             ui.close();
         }
         if confirm_item(ui, confirm, lane, LaneAction::Delete) {
-            model.remove_lane(lane.id);
+            for &id in targets {
+                model.remove_lane(id);
+            }
             ui.close();
         }
 
@@ -2904,12 +3054,16 @@ fn lane_menu(
         // The bulk edits, all four on the pattern *on screen* only: the grid
         // is what they are aimed at.
         if confirm_item(ui, confirm, lane, LaneAction::Clear) {
-            model.clear_lane(pattern, lane.id);
+            for &id in targets {
+                model.clear_lane(pattern, id);
+            }
             ui.close();
         }
         if ui.button("invert").clicked() {
             *confirm = None;
-            model.invert_lane(pattern, lane.id);
+            for &id in targets {
+                model.invert_lane(pattern, id);
+            }
             ui.close();
         }
         // One click, and no undo either — but a roll of the dice is meant to
@@ -2918,7 +3072,9 @@ fn lane_menu(
         let roll = ui.button("randomise");
         if roll.clicked() {
             *confirm = None;
-            model.randomise_lane(pattern, lane.id, RANDOMISE_DENSITY, rng);
+            for &id in targets {
+                model.randomise_lane(pattern, id, RANDOMISE_DENSITY, rng);
+            }
             ui.close();
         }
         roll.on_hover_text("Rolls every step of this lane in the pattern on screen.");
@@ -2926,12 +3082,16 @@ fn lane_menu(
             ui.label("nudge");
             if ui.button("-1").clicked() {
                 *confirm = None;
-                model.nudge_lane(pattern, lane.id, -1);
+                for &id in targets {
+                    model.nudge_lane(pattern, id, -1);
+                }
                 ui.close();
             }
             if ui.button("+1").clicked() {
                 *confirm = None;
-                model.nudge_lane(pattern, lane.id, 1);
+                for &id in targets {
+                    model.nudge_lane(pattern, id, 1);
+                }
                 ui.close();
             }
         });
@@ -2942,15 +3102,23 @@ fn lane_menu(
         // pattern on screen in one click, keeping the steps' values. A fill
         // that does not line up with this lane's rate is greyed out.
         ui.label("Fill");
+        let rates = target.step_beats();
+        let misfit = match several {
+            true => "Doesn't line up with the rate of every selected lane",
+            false => "Doesn't line up with this lane's rate",
+        };
         ui.horizontal_wrapped(|ui| {
             for fill in Fill::ALL {
+                let fits = rates.iter().all(|&(_, beats)| fill.fits(beats));
                 let button = ui
-                    .add_enabled(fill.fits(step_beats), Button::new(fill.label()))
+                    .add_enabled(fits, Button::new(fill.label()))
                     .on_hover_text(fill.hint())
-                    .on_disabled_hover_text("Doesn't line up with this lane's rate");
+                    .on_disabled_hover_text(misfit);
                 if button.clicked() {
                     *confirm = None;
-                    model.fill_lane(pattern, lane.id, |index| fill.hits(index, step_beats));
+                    for &(id, beats) in &rates {
+                        model.fill_lane(pattern, id, |index| fill.hits(index, beats));
+                    }
                     ui.close();
                 }
             }
@@ -3658,8 +3826,20 @@ mod tests {
     /// hint is: it is the one text the editor lays out itself instead of
     /// through a widget, so a frame with no lanes is worth running through it.
     fn run_frame(app: &mut BitstepEditor, ctx: &egui::Context, events: Vec<egui::Event>) {
+        run_frame_held(app, ctx, events, egui::Modifiers::NONE);
+    }
+
+    /// [`run_frame`] with `modifiers` held down.
+    fn run_frame_held(
+        app: &mut BitstepEditor,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        modifiers: egui::Modifiers,
+    ) {
         let data = app.model.shared();
         let pattern = app.shown_pattern();
+        let mut events = events;
+        events.insert(0, egui::Event::ModifiersChanged(modifiers));
         let input = egui::RawInput {
             screen_rect: Some(test_window()),
             events,
@@ -3721,7 +3901,7 @@ mod tests {
         for index in 0..4 {
             assert!(model.set_step(pattern, lane_id, index, Step::default_on()));
         }
-        app.selected_lane = Some(lane_id);
+        app.selection.select(lane_id);
 
         let layout = test_layout(&app, test_window());
         let view = layout.panel_view(CellMetrics::from_theme(), 0.0);
@@ -3804,13 +3984,13 @@ mod tests {
 
         assert_eq!(app.selected_row(&model.shared()), Some(0), "the first lane by default");
         click_at(&mut app, &ctx, test_header_fields(3).name.center());
-        assert_eq!(app.selected_lane, Some(id(3)));
+        assert_eq!(app.selection.primary(), Some(id(3)));
 
         let layout = test_layout(&app, test_window());
         let view = layout.grid_view(CellMetrics::from_theme(), egui::Vec2::ZERO);
         app.begin_gesture(&view, &model.shared(), 0, view.cell_rect(5, 0).center());
         app.end_gesture(0);
-        assert_eq!(app.selected_lane, Some(id(5)), "a press on a step selects its lane");
+        assert_eq!(app.selection.primary(), Some(id(5)), "a press on a step selects its lane");
 
         // A selected lane that is deleted falls back to the first.
         assert!(model.remove_lane(id(5)));
@@ -3818,19 +3998,197 @@ mod tests {
         assert_eq!(app.selected_row(&model.shared()), Some(0));
     }
 
+    /// Where the widget labelled `label` was drawn last frame. Needs egui's
+    /// `show_interactive_widgets` debug option on, which is what makes it
+    /// keep the labels (debug builds only).
+    fn widget_labelled(ctx: &egui::Context, label: &str) -> Option<Rect> {
+        ctx.viewport(|viewport| {
+            let widgets = &viewport.prev_pass.widgets;
+            let layers: Vec<_> = widgets.layer_ids().collect();
+            layers.into_iter().flat_map(|layer| widgets.get_layer(layer)).find_map(|widget| {
+                let info = widgets.info(widget.id)?;
+                (info.label.as_deref() == Some(label)).then_some(widget.rect)
+            })
+        })
+    }
+
+    /// Ctrl+click and Shift+click select several lanes; a rate picked on
+    /// one of them, mute and the volume go to all of them in the pattern on
+    /// screen and nowhere else; a lane outside the selection still acts
+    /// alone; a step press keeps the selection and Escape ends it.
+    #[test]
+    fn edits_on_a_selected_lane_go_to_every_selected_lane() {
+        let model = Arc::new(SeqModel::new(state::default_data()));
+        let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
+        let mut app = BitstepEditor::new(params, Arc::clone(&model), Arc::new(Playhead::new()));
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let ctrl = egui::Modifiers::COMMAND;
+        let shift = egui::Modifiers::SHIFT;
+        let data = || model.shared();
+        let id = |row: usize| model.shared().lane(row).expect("lane").id;
+        let lane = |row: usize| data().lane(row).cloned().expect("lane");
+        let rate = |pattern: usize, row: usize| {
+            model.shared().lane_data(pattern, row).expect("lane").rate()
+        };
+
+        click_at(&mut app, &ctx, test_header_fields(0).name.center());
+        click_held(&mut app, &ctx, test_header_fields(2).name.center(), ctrl);
+        assert!(app.selection.in_multi(id(0)) && app.selection.in_multi(id(2)));
+        assert!(!app.selection.in_multi(id(1)));
+        assert_eq!(app.selection.primary(), Some(id(2)), "the panel edits the last one");
+
+        // 1/32 picked in lane 0's rate picker: lanes 0 and 2, this pattern
+        // only. Every rate is on screen at once, nothing to scroll.
+        pause(&mut app, &ctx);
+        ctx.global_style_mut(|style| style.debug.show_interactive_widgets = true);
+        click_at(&mut app, &ctx, test_header_fields(0).rate.center());
+        run_frame(&mut app, &ctx, Vec::new());
+        for option in Rate::ALL {
+            let item = widget_labelled(&ctx, &option.to_string()).expect("every rate is shown");
+            assert!(test_window().contains_rect(item), "{option} is on screen: {item:?}");
+        }
+        let item = widget_labelled(&ctx, "1/32").expect("1/32");
+        click_at(&mut app, &ctx, item.center());
+        assert_eq!(rate(0, 0), Rate::ThirtySecond);
+        assert_eq!(rate(0, 2), Rate::ThirtySecond);
+        run_frame(&mut app, &ctx, Vec::new());
+        assert!(widget_labelled(&ctx, "1/64D").is_none(), "picking closes it");
+        assert_eq!(rate(0, 1), Rate::DEFAULT, "not selected");
+        assert_eq!(rate(1, 0), Rate::DEFAULT, "another pattern");
+
+        // One undo step puts both back.
+        run_frame(&mut app, &ctx, Vec::new());
+        press_key(&mut app, &ctx, egui::Key::Z, egui::Modifiers::COMMAND);
+        assert_eq!((rate(0, 0), rate(0, 2)), (Rate::DEFAULT, Rate::DEFAULT));
+
+        // Shift+click: the run from the last click.
+        pause(&mut app, &ctx);
+        click_held(&mut app, &ctx, test_header_fields(4).name.center(), shift);
+        let picked: Vec<u32> = (2..=4).map(id).collect();
+        let order: Vec<u32> = data().lanes.iter().map(|lane| lane.id).collect();
+        assert_eq!(app.selection.targets(id(3), &order), picked);
+
+        click_at(&mut app, &ctx, test_header_fields(3).mute.center());
+        let muted: Vec<bool> = (0..6).map(|row| lane(row).is_muted()).collect();
+        assert_eq!(muted, [false, false, true, true, true, false]);
+
+        // Volume: right-click resets every selected lane.
+        assert!(model.set_volume(id(2), -6));
+        let at = test_header_fields(3).volume.center();
+        let secondary = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(at)]);
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(at), secondary(true)]);
+        run_frame(&mut app, &ctx, vec![secondary(false)]);
+        let volumes: Vec<i8> = (2..=4).map(|row| lane(row).volume_db()).collect();
+        assert_eq!(volumes, [0, 0, 0], "right-click resets every selected lane");
+
+        // A drag moves each by the same amount, keeping their differences.
+        assert!(model.set_volume(id(2), -6));
+        pause(&mut app, &ctx);
+        let at = test_header_fields(3).volume.center();
+        drag_between(&mut app, &ctx, at, at - egui::vec2(0.0, 40.0));
+        let volumes: Vec<i32> = (2..=4).map(|row| i32::from(lane(row).volume_db())).collect();
+        let moved = volumes[1];
+        assert_ne!(moved, 0, "the drag moved the volume: {volumes:?}");
+        assert_eq!(volumes, [moved - 6, moved, moved]);
+
+        // A lane outside the selection acts alone.
+        click_at(&mut app, &ctx, test_header_fields(0).solo.center());
+        let soloed: Vec<bool> = (0..6).map(|row| lane(row).is_soloed()).collect();
+        assert_eq!(soloed, [true, false, false, false, false, false]);
+
+        // A step press inside the selection keeps it; Escape ends it.
+        let layout = test_layout(&app, test_window());
+        let view = layout.grid_view(CellMetrics::from_theme(), egui::Vec2::ZERO);
+        app.begin_gesture(&view, &data(), 0, view.cell_rect(3, 0).center());
+        app.end_gesture(0);
+        assert_eq!((app.selection.primary(), app.selection.len()), (Some(id(3)), 3));
+        press_key(&mut app, &ctx, egui::Key::Escape, egui::Modifiers::NONE);
+        assert_eq!((app.selection.primary(), app.selection.len()), (Some(id(3)), 1));
+    }
+
+    /// With several lanes selected, the menu of one of them says how many
+    /// and acts on all of them; a lane outside the selection gets its own
+    /// menu for itself alone.
+    #[test]
+    fn the_lane_menu_acts_on_every_selected_lane() {
+        let model = Arc::new(SeqModel::new(state::default_data()));
+        let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
+        let mut app = BitstepEditor::new(params, Arc::clone(&model), Arc::new(Playhead::new()));
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        ctx.global_style_mut(|style| style.debug.show_interactive_widgets = true);
+        let on_steps = |row: usize| {
+            let lane_data = model.shared().lane_data(0, row).cloned().expect("lane");
+            (0..lane_data.length() as usize).filter(|&step| lane_data.step(step).is_on()).count()
+        };
+        let right_click = |app: &mut BitstepEditor, row: usize| {
+            let at = test_header_fields(row).name.center();
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            run_frame(app, &ctx, vec![egui::Event::PointerMoved(at)]);
+            run_frame(app, &ctx, vec![egui::Event::PointerMoved(at), button(true)]);
+            run_frame(app, &ctx, vec![button(false)]);
+            run_frame(app, &ctx, Vec::new());
+        };
+        let before: Vec<usize> = (0..4).map(on_steps).collect();
+
+        click_at(&mut app, &ctx, test_header_fields(0).name.center());
+        click_held(&mut app, &ctx, test_header_fields(2).name.center(), egui::Modifiers::COMMAND);
+        right_click(&mut app, 2);
+        assert!(widget_labelled(&ctx, "2 lanes").is_some(), "the menu says how many");
+        let invert = widget_labelled(&ctx, "invert").expect("the menu is open");
+        click_at(&mut app, &ctx, invert.center());
+        let after: Vec<usize> = (0..4).map(on_steps).collect();
+        let length = |row: usize| model.shared().lane_data(0, row).expect("lane").length() as usize;
+        assert_eq!(after[0], length(0) - before[0], "lane 0 inverted");
+        assert_eq!(after[2], length(2) - before[2], "lane 2 inverted");
+        assert_eq!((after[1], after[3]), (before[1], before[3]), "the others untouched");
+
+        // Lane 1 is not selected: its menu is its own.
+        pause(&mut app, &ctx);
+        right_click(&mut app, 1);
+        assert!(widget_labelled(&ctx, "2 lanes").is_none());
+        let invert = widget_labelled(&ctx, "invert").expect("the menu is open");
+        click_at(&mut app, &ctx, invert.center());
+        assert_eq!(on_steps(1), length(1) - before[1]);
+        assert_eq!(on_steps(0), after[0], "the selection was not touched");
+    }
+
     /// A pointer click at `pos`, as the three frames egui needs to see one:
     /// the widget has to exist before the press, and the release is the
     /// click.
     fn click_at(app: &mut BitstepEditor, ctx: &egui::Context, pos: Pos2) {
+        click_held(app, ctx, pos, egui::Modifiers::NONE);
+    }
+
+    /// [`click_at`] with `modifiers` held down (Ctrl, Shift).
+    fn click_held(
+        app: &mut BitstepEditor,
+        ctx: &egui::Context,
+        pos: Pos2,
+        modifiers: egui::Modifiers,
+    ) {
         let button = |pressed| egui::Event::PointerButton {
             pos,
             button: PointerButton::Primary,
             pressed,
-            modifiers: egui::Modifiers::default(),
+            modifiers,
         };
-        run_frame(app, ctx, vec![egui::Event::PointerMoved(pos)]);
-        run_frame(app, ctx, vec![egui::Event::PointerMoved(pos), button(true)]);
-        run_frame(app, ctx, vec![button(false)]);
+        let moved = egui::Event::PointerMoved(pos);
+        run_frame_held(app, ctx, vec![moved.clone()], modifiers);
+        run_frame_held(app, ctx, vec![moved, button(true)], modifiers);
+        run_frame_held(app, ctx, vec![button(false)], modifiers);
     }
 
     /// A frame of the step strip alone, with the pattern on screen given

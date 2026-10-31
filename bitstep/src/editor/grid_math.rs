@@ -2592,6 +2592,137 @@ pub fn playhead_cell(
     (step < length).then_some(step as usize)
 }
 
+/// Which lanes are selected in the steps view, by lane id.
+///
+/// `primary` is the lane the parameter panel edits (the last one clicked).
+/// `lanes` is the whole selection; when it holds more than one lane, a
+/// change made on any of them in its header or its menu goes to all of
+/// them. `anchor` is where a Shift+click range starts.
+///
+/// Pure bookkeeping: the caller passes the lane order (`order`, ids top to
+/// bottom) whenever it matters, and lanes that have gone are dropped by
+/// [`Self::retain`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LaneSelection {
+    primary: Option<u32>,
+    lanes: Vec<u32>,
+    anchor: Option<u32>,
+}
+
+impl LaneSelection {
+    /// The lane the parameter panel edits, if one was picked.
+    pub fn primary(&self) -> Option<u32> {
+        self.primary
+    }
+
+    /// Whether more than one lane is selected: the case where edits fan out.
+    pub fn is_multi(&self) -> bool {
+        self.lanes.len() > 1
+    }
+
+    /// Whether `lane` is part of a selection of several lanes.
+    pub fn in_multi(&self, lane: u32) -> bool {
+        self.is_multi() && self.lanes.contains(&lane)
+    }
+
+    /// How many lanes are selected.
+    pub fn len(&self) -> usize {
+        self.lanes.len()
+    }
+
+    /// Whether no lane has been picked yet (the panel then edits the first).
+    pub fn is_empty(&self) -> bool {
+        self.lanes.is_empty()
+    }
+
+    /// A plain click: just this lane.
+    pub fn select(&mut self, lane: u32) {
+        self.primary = Some(lane);
+        self.lanes = vec![lane];
+        self.anchor = Some(lane);
+    }
+
+    /// Ctrl+click: adds the lane, or takes it out again. The last lane is
+    /// never taken out, so something always stays selected.
+    pub fn toggle(&mut self, lane: u32) {
+        self.anchor = Some(lane);
+        match self.lanes.iter().position(|&id| id == lane) {
+            Some(at) if self.lanes.len() > 1 => {
+                self.lanes.remove(at);
+                if self.primary == Some(lane) {
+                    self.primary = self.lanes.last().copied();
+                }
+            }
+            Some(_) => self.primary = Some(lane),
+            None => {
+                // A selection never made by a click (a fresh editor, whose
+                // panel shows the first lane) starts from that lane.
+                if self.lanes.is_empty()
+                    && let Some(primary) = self.primary
+                    && primary != lane
+                {
+                    self.lanes.push(primary);
+                }
+                self.lanes.push(lane);
+                self.primary = Some(lane);
+            }
+        }
+    }
+
+    /// Shift+click: every lane from the anchor to this one, in `order`.
+    /// Without an anchor (or one that has gone) it is a plain click.
+    pub fn extend(&mut self, lane: u32, order: &[u32]) {
+        let from = self.anchor.or(self.primary).and_then(|id| order.iter().position(|&o| o == id));
+        let to = order.iter().position(|&o| o == lane);
+        let (Some(from), Some(to)) = (from, to) else {
+            self.select(lane);
+            return;
+        };
+        let (low, high) = (from.min(to), from.max(to));
+        self.lanes = order[low..=high].to_vec();
+        self.primary = Some(lane);
+    }
+
+    /// A press on one of `lane`'s steps: the panel follows it, and a
+    /// selection it is part of stays as it is.
+    pub fn press(&mut self, lane: u32) {
+        if self.in_multi(lane) {
+            self.primary = Some(lane);
+        } else {
+            self.select(lane);
+        }
+    }
+
+    /// Escape: back to the one lane the panel edits.
+    pub fn collapse(&mut self) {
+        match self.primary {
+            Some(lane) => self.select(lane),
+            None => *self = LaneSelection::default(),
+        }
+    }
+
+    /// Drops lanes that are no longer in `order`.
+    pub fn retain(&mut self, order: &[u32]) {
+        self.lanes.retain(|id| order.contains(id));
+        if self.primary.is_some_and(|id| !order.contains(&id)) {
+            self.primary = self.lanes.last().copied();
+        }
+        if self.anchor.is_some_and(|id| !order.contains(&id)) {
+            self.anchor = self.primary;
+        }
+    }
+
+    /// The lanes an edit made on `lane` goes to, top to bottom: the whole
+    /// selection when `lane` is part of a selection of several, otherwise
+    /// `lane` alone.
+    pub fn targets(&self, lane: u32, order: &[u32]) -> Vec<u32> {
+        if !self.in_multi(lane) {
+            return vec![lane];
+        }
+        order.iter().copied().filter(|id| self.lanes.contains(id)).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4648,5 +4779,64 @@ mod tests {
         let whole = Rate::Whole.rate_beats();
         assert!(Fill::Bars.fits(whole));
         assert!(!Fill::Halves.fits(whole));
+    }
+
+    #[test]
+    fn lanes_are_selected_by_click_ctrl_click_and_shift_click() {
+        let order = [10, 11, 12, 13, 14];
+        let mut sel = LaneSelection::default();
+        assert_eq!(sel.primary(), None);
+        assert_eq!(sel.targets(12, &order), [12], "nothing selected: just the lane");
+
+        sel.select(11);
+        assert!(!sel.is_multi());
+        assert_eq!(sel.targets(11, &order), [11]);
+
+        sel.toggle(13);
+        assert_eq!((sel.primary(), sel.len()), (Some(13), 2));
+        assert_eq!(sel.targets(11, &order), [11, 13]);
+        assert_eq!(sel.targets(12, &order), [12], "a lane outside it acts alone");
+
+        sel.toggle(11);
+        assert_eq!(sel.targets(13, &order), [13], "taken out again");
+        sel.toggle(13);
+        assert_eq!(sel.len(), 1, "the last lane stays");
+
+        // Shift: a range from the last click, in screen order, either way.
+        sel.select(14);
+        sel.extend(11, &order);
+        assert_eq!(sel.targets(12, &order), [11, 12, 13, 14]);
+        assert_eq!(sel.primary(), Some(11));
+        sel.extend(12, &order);
+        assert_eq!(sel.targets(12, &order), [12, 13, 14], "the anchor stays put");
+
+        // A step press inside keeps it; outside starts again.
+        sel.press(13);
+        assert_eq!((sel.primary(), sel.len()), (Some(13), 3));
+        sel.press(10);
+        assert_eq!(sel.targets(10, &order), [10]);
+
+        sel.toggle(12);
+        sel.collapse();
+        assert_eq!((sel.primary(), sel.len()), (Some(12), 1));
+    }
+
+    #[test]
+    fn a_lane_selection_forgets_lanes_that_have_gone() {
+        let mut sel = LaneSelection::default();
+        sel.select(1);
+        sel.toggle(2);
+        sel.toggle(3);
+        sel.retain(&[1, 2]);
+        assert_eq!((sel.primary(), sel.len()), (Some(2), 2));
+        sel.retain(&[]);
+        assert_eq!((sel.primary(), sel.len()), (None, 0));
+        sel.extend(5, &[4, 5]);
+        assert_eq!(sel.targets(5, &[4, 5]), [5], "no anchor: a plain click");
+
+        // Ctrl+click with nothing clicked yet keeps the lane the panel shows.
+        let mut fresh = LaneSelection::default();
+        fresh.toggle(4);
+        assert_eq!(fresh.len(), 1);
     }
 }

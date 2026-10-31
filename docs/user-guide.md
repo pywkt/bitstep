@@ -156,7 +156,8 @@ chance, ratchet) at once.
 
 1. **Pick the lane:** click its name in the lane headers, or click any of its
    steps. The selected lane is marked with a blue edge, and its name is shown
-   at the left of the panel.
+   at the left of the panel. With [several lanes selected](#editing-several-lanes-at-once),
+   the panel shows the last one you clicked.
 2. **Pick the setting:** click **Velocity**, **Pan**, **Pitch**, **Chance**
    or **Ratchet** at the left of the panel.
 3. **Draw:**
@@ -192,7 +193,7 @@ pads.
 | **Name and colour dot** | Drag to move the lane up or down; drag to the top or bottom edge of the list to scroll it. Press Escape while dragging to put it back. Double-click the name to rename the lane: the whole name is selected, so just type. Press Enter or click anywhere else to keep the new name, or Escape to keep the old one. Right-click for the [lane menu](#lane-menu). |
 | **Note** (e.g. `C1`) | The note the lane plays. Drag up/right to raise it, or use the mouse wheel over it. Hold Shift while dragging for finer control. Click to type a note name such as `F#1` or `Bb2`; while typing, Up/Down step it by a semitone. |
 | **Length** | How many steps the lane has, from 1 to 4096. Drag or click to type; while typing, Up/Down add or remove a step. A new length takes effect at once, so a playing lane may jump to a different step. |
-| **Rate** | How long each step is: 1/1 down to 1/64, each also in triplet (T) and dotted (D) versions. |
+| **Rate** | How long each step is: 1/1 down to 1/64, each also in triplet (T) and dotted (D) versions. Click it to see every rate at once: straight notes on the top row, triplets and dotted notes below. Click one to pick it. |
 | **Volume** (e.g. `0 dB`) | Turns the whole lane up or down, from −36 dB to +12 dB. Drag up or down, or click to type (Up/Down step 1 dB). Right-click to reset to 0 dB. See [Lane volume](#lane-volume). |
 | **M** | Mute the lane. |
 | **S** | Solo the lane. When any lane is soloed, only soloed lanes play. Mute wins over solo. |
@@ -202,6 +203,39 @@ bar just after its last step.
 
 Making a lane shorter hides the steps past the end rather than deleting them.
 Make it longer again and they come back.
+
+### Editing several lanes at once
+
+Select several lanes to change them together, for example to set every lane
+to 1/32 in one go:
+
+| To do this | Do this |
+|---|---|
+| Select one lane | Click its name. |
+| Add or remove a lane | **Ctrl+click** its name. |
+| Select a run of lanes | Click the first name, then **Shift+click** the last. |
+| Go back to one lane | Press **Escape**, or click a name without Ctrl or Shift. |
+
+Selected lanes are highlighted. While several are selected, a change you
+make in the header of any of them goes to all of them:
+
+- **Rate** and **Length** are set to what you pick, in the pattern on
+  screen only. Other patterns and unselected lanes aren't touched.
+- **Volume** moves every selected lane by the same amount, so the
+  differences between them stay. Right-click resets them all to 0 dB.
+- **M** and **S** mute or solo all of them (or turn it off for all of
+  them).
+- The **Note** is still set one lane at a time.
+
+Right-click the name of a selected lane and the [lane menu](#lane-menu) acts
+on all of them: it says how many lanes at the top, and colour, channel,
+sample pad, duplicate, delete, clear, invert, randomise, nudge and the fills
+apply to each. Renaming is one lane at a time. A fill that doesn't line up
+with every selected lane's rate is greyed out.
+
+Changing a lane that isn't selected only changes that lane, and clicking a
+step keeps the selection. Each change to several lanes is one
+[undo](#undo) step. Dragging a name still moves one lane.
 
 ### Lane volume
 
@@ -460,7 +494,9 @@ While bitstep's window is in front, **Ctrl+Z** and **Ctrl+Shift+Z** / **Ctrl+Y**
 are bitstep's [undo and redo](#undo). **Space** (play/stop), **F1–F12** and
 other shortcuts held with **Ctrl** (save and so on) are passed on to Bitwig,
 so you don't have to click back into Bitwig to start the transport. To use
-Bitwig's undo, click into Bitwig first. Other keys stay with bitstep, and
+Bitwig's undo, click into Bitwig first. **Escape** cancels a drag, closes a
+name you're typing without saving it, or goes back to one selected lane.
+Other keys stay with bitstep, and
 nothing is passed on while you're typing a lane name (there, Ctrl+Z undoes
 your typing).
 
