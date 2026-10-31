@@ -30,7 +30,7 @@ running. Its output can be recorded into clips like any other notes.
 ## Status
 
 - **CLAP** plugin, **Linux** (x86_64) only for now.
-- Version 0.1.0. No prebuilt downloads yet: you build it from source, which
+- Version 0.2.0. No prebuilt downloads yet: you build it from source, which
   [takes a few minutes](docs/install.md).
 
 ## Getting started
