@@ -1,4 +1,5 @@
-//! Passing the keys the editor does not use on to the host's window.
+//! The host's window around the editor: passing it the keys the editor does
+//! not use, and keeping it from being pinned above the host's main window.
 //!
 //! On Linux the plugin window takes the keyboard focus when it is clicked
 //! (egui-baseview asks for it), and baseview's X11 backend drops every key the
@@ -14,6 +15,17 @@
 //! key meant for a popover cannot delete something in the host. So do undo
 //! and redo ([`history_key`]): with the editor focused they step through
 //! bitstep's own edits, as in any plugin with an undo of its own.
+//!
+//! Bitwig shows a plugin's editor in a desktop window of its own, which it
+//! marks as belonging to its main window (`WM_TRANSIENT_FOR`). Window
+//! managers keep such a window above its main window, so bitstep stayed on
+//! top of Bitwig and came back up whenever Bitwig was focused. When the
+//! editor's parent is that kind of window, the mark is taken off once the
+//! window manager is showing it, and again whenever the host puts it back, so
+//! the two windows stack like any others and Alt+Tab moves between them. The
+//! first time, the window is also brought to the front and focused: Bitwig
+//! opens it without the focus, which only its dialog mark had kept it in
+//! front of the main window.
 
 use egui::{Key, Modifiers};
 
@@ -88,18 +100,20 @@ pub fn x11_state(modifiers: Modifiers) -> u16 {
     state
 }
 
-/// Sends keys to the window the editor is embedded in. One per open window.
-pub struct KeyForwarder {
+/// The window the editor is embedded in: sends it keys and keeps it unpinned.
+/// One per open window.
+pub struct HostWindow {
     #[cfg(target_os = "linux")]
     target: x11::Target,
 }
 
-impl KeyForwarder {
-    /// Connects for the editor window behind `frame`. `None` when there is no
-    /// X11 host window to send to — a standalone window, or not Linux — in
-    /// which case keys simply stay with the editor, as before.
+impl HostWindow {
+    /// Connects for the editor window behind `frame`. The host's window is
+    /// found when the editor window is put into it, which can be after the
+    /// first frame (see [`x11::Target`]). `None` when there is no X11 display
+    /// — not Linux, say — in which case keys simply stay with the editor.
     #[cfg(target_os = "linux")]
-    pub fn connect(frame: &nice_plug_egui::Frame) -> Option<KeyForwarder> {
+    pub fn connect(frame: &nice_plug_egui::Frame) -> Option<HostWindow> {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
         let handle = frame.baseview_window().window_handle().ok()?;
@@ -108,13 +122,31 @@ impl KeyForwarder {
             RawWindowHandle::Xcb(handle) => handle.window.get(),
             _ => return None,
         };
-        x11::Target::connect(own).map(|target| KeyForwarder { target })
+        x11::Target::connect(own).map(|target| HostWindow { target })
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub fn connect(_frame: &nice_plug_egui::Frame) -> Option<KeyForwarder> {
+    pub fn connect(_frame: &nice_plug_egui::Frame) -> Option<HostWindow> {
         // Elsewhere baseview already hands unused keys to the host.
         None
+    }
+
+    /// Catches up with what happened to the windows since the last frame:
+    /// the editor being put into the host's window, and the host pinning
+    /// that window above its main window. Call once a frame. Cheap: it reads
+    /// only events already waiting, and asks the server something only when
+    /// one of them calls for it.
+    pub fn update(&mut self) {
+        #[cfg(target_os = "linux")]
+        self.target.update();
+    }
+
+    /// Whether there is a host window to send keys to yet.
+    pub fn has_host(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.target.has_host();
+        #[cfg(not(target_os = "linux"))]
+        false
     }
 
     /// Sends one key press or release.
@@ -127,86 +159,7 @@ impl KeyForwarder {
 }
 
 #[cfg(target_os = "linux")]
-mod x11 {
-    use std::collections::HashMap;
-
-    use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::{
-        ConnectionExt, EventMask, KEY_PRESS_EVENT, KEY_RELEASE_EVENT, KeyPressEvent,
-    };
-    use x11rb::rust_connection::RustConnection;
-
-    /// The host's window and a connection of our own to reach it with.
-    pub struct Target {
-        conn: RustConnection,
-        root: u32,
-        window: u32,
-        /// Keysym → the keycode that types it, from the server's keymap.
-        keycodes: HashMap<u32, u8>,
-    }
-
-    impl Target {
-        /// Finds the window `own` is embedded in. `None` if it is a top-level
-        /// window (nothing to forward to) or the server cannot be reached.
-        pub fn connect(own: u32) -> Option<Target> {
-            let (conn, screen) = x11rb::connect(None).ok()?;
-            let root = conn.setup().roots.get(screen)?.root;
-            let tree = conn.query_tree(own).ok()?.reply().ok()?;
-            if tree.parent == x11rb::NONE || tree.parent == root {
-                return None;
-            }
-
-            let (min, max) = (conn.setup().min_keycode, conn.setup().max_keycode);
-            let count = max.checked_sub(min)?.checked_add(1)?;
-            let map = conn.get_keyboard_mapping(min, count).ok()?.reply().ok()?;
-            let per = usize::from(map.keysyms_per_keycode).max(1);
-            let mut keycodes = HashMap::new();
-            for (index, keysyms) in map.keysyms.chunks(per).enumerate() {
-                let Ok(code) = u8::try_from(usize::from(min) + index) else {
-                    break;
-                };
-                // The plain and shifted symbols; the first key that has one
-                // wins, which is the main keyboard's rather than the keypad's.
-                for &keysym in keysyms.iter().take(2) {
-                    keycodes.entry(keysym).or_insert(code);
-                }
-            }
-            Some(Target { conn, root, window: tree.parent, keycodes })
-        }
-
-        /// Sends one key event to the host window. Propagated, so it reaches
-        /// whichever of the host's windows above ours listens for keys.
-        /// Failures are ignored: a key that does not arrive is all it costs.
-        pub fn send(&self, keysym: u32, pressed: bool, state: u16) {
-            let Some(&detail) = self.keycodes.get(&keysym) else {
-                return;
-            };
-            let (response_type, mask) = match pressed {
-                true => (KEY_PRESS_EVENT, EventMask::KEY_PRESS),
-                false => (KEY_RELEASE_EVENT, EventMask::KEY_RELEASE),
-            };
-            let event = KeyPressEvent {
-                response_type,
-                detail,
-                sequence: 0,
-                time: x11rb::CURRENT_TIME,
-                root: self.root,
-                event: self.window,
-                child: x11rb::NONE,
-                root_x: 0,
-                root_y: 0,
-                event_x: 0,
-                event_y: 0,
-                state: state.into(),
-                same_screen: true,
-            };
-            if let Ok(cookie) = self.conn.send_event(true, self.window, mask, event) {
-                cookie.ignore_error();
-            }
-            let _ = self.conn.flush();
-        }
-    }
-}
+mod x11;
 
 #[cfg(test)]
 mod tests {

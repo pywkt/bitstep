@@ -47,7 +47,7 @@ use grid_math::{
     CellMetrics, DragAxis, EditorLayout, EndHandleDrag, Fill, GridHit, GridView, HeaderFields,
     LaneReorder, LengthEdit, LevelDraw, PaintDrag, ParamKind, PitchDraw, VelocityDrag, Zone,
 };
-use keys::KeyForwarder;
+use keys::HostWindow;
 
 /// The window a fresh instance opens at, in logical points: wide enough for
 /// the pinned lane header plus a whole fresh lane — every step of
@@ -329,12 +329,13 @@ pub struct BitstepEditor {
     param: ParamKind,
     /// A drawing gesture in the parameter panel, while the button is down.
     param_draw: Option<ParamStroke>,
-    /// Sends Space and shortcut keys on to the host's window
-    /// ([`keys`]). Connected on the first frame of each open window.
-    key_forwarder: Option<KeyForwarder>,
-    /// Whether this window has tried to connect [`Self::key_forwarder`], so
-    /// a window with nothing to forward to does not retry every frame.
-    key_forwarder_tried: bool,
+    /// The host's window around the editor ([`keys`]): Space and shortcut
+    /// keys are sent on to it, and it is kept from being pinned above the
+    /// host's main window. Connected on the first frame of each open window.
+    host_window: Option<HostWindow>,
+    /// Whether this window has tried to connect [`Self::host_window`], so
+    /// a window with no X11 display does not retry every frame.
+    host_window_tried: bool,
     /// The adapter's repaint flag, raised every frame (see
     /// [`REPAINT_INTERVAL`]). A fresh one until [`create`] hands over the
     /// instance's, which is all a test needs.
@@ -739,8 +740,8 @@ impl BitstepEditor {
             panel_open: true,
             param: ParamKind::Velocity,
             param_draw: None,
-            key_forwarder: None,
-            key_forwarder_tried: false,
+            host_window: None,
+            host_window_tried: false,
             repaint: RepaintNotifier::new(),
         }
     }
@@ -2371,16 +2372,18 @@ impl BitstepEditor {
 
     /// Passes Space and shortcut keys on to the host's window ([`keys`]),
     /// and takes them out of this frame's input so no widget acts on them
-    /// too. Not while a text field is being typed in.
+    /// too. Not while a text field is being typed in. Also keeps the host's
+    /// window unpinned.
     fn forward_host_keys(&mut self, ui: &egui::Ui, frame: &Frame) {
-        if !self.key_forwarder_tried {
-            self.key_forwarder_tried = true;
-            self.key_forwarder = KeyForwarder::connect(frame);
+        if !self.host_window_tried {
+            self.host_window_tried = true;
+            self.host_window = HostWindow::connect(frame);
         }
-        let Some(forwarder) = &self.key_forwarder else {
+        let Some(forwarder) = &mut self.host_window else {
             return;
         };
-        if ui.ctx().text_edit_focused() {
+        forwarder.update();
+        if !forwarder.has_host() || ui.ctx().text_edit_focused() {
             return;
         }
         ui.input_mut(|input| {
@@ -3467,6 +3470,12 @@ impl NiceEguiApp for BitstepEditor {
         // rest of the editor adds inherits it.
         theme::apply(&egui_ctx);
         self.gui_context = Some(nice_gui_ctx);
+        // A new X window, so the last window's host window is gone. Reset
+        // here rather than in `editor_closed`, which nice-plug-egui 0.6 never
+        // calls: a window closed and opened again (Bitwig does this on its
+        // own) kept the dead connection, and its host window stayed pinned.
+        self.host_window = None;
+        self.host_window_tried = false;
         Ok(())
     }
 
@@ -3520,13 +3529,14 @@ impl NiceEguiApp for BitstepEditor {
     }
 
     /// Window closed. The handles stay — the next open gets a fresh context.
+    /// Note nice-plug-egui 0.6 declares this hook but never calls it, so
+    /// nothing a new window depends on may be reset only here (see `build`).
     fn editor_closed(&mut self) {
         // The last gesture of the session is a step like any other.
         self.model.commit_edits();
         self.gui_context = None;
-        // The next window is a new X window with a parent of its own.
-        self.key_forwarder = None;
-        self.key_forwarder_tried = false;
+        self.host_window = None;
+        self.host_window_tried = false;
     }
 }
 

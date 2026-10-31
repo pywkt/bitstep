@@ -56,6 +56,11 @@ beat of the bar.
 The window can be resized. It reopens at the size you left it until you close
 the project.
 
+bitstep's window doesn't stay on top of Bitwig: it stacks like any other
+window, with its own entry in the taskbar, so you can **Alt+Tab** between it
+and Bitwig. If it's hidden behind Bitwig, Alt+Tab back to it, or click the
+plugin-window icon on bitstep's device in Bitwig to close it and open it again.
+
 ## Steps
 
 | To do this | Do this |
