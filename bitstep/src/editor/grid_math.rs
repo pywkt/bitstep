@@ -2099,18 +2099,31 @@ impl PitchDraw {
 
 // ---- lane fills ----
 
-/// A preset rhythm the lane menu can fill a lane with, measured in beats
-/// from the lane's first step, so it means the same thing at any lane rate:
-/// quarter notes are every 4th step at 1/16 and every 2nd at 1/8.
+/// A preset rhythm the lane menu can fill a lane with.
+///
+/// The "every N" fills count steps from the lane's first step, so they do
+/// the same thing at any rate: every 2nd step is eighth notes on a 1/16
+/// lane and sixteenths on a 1/32 one. The two named after the bar —
+/// off-beats and 2 & 4 — are measured in beats instead, so they stay on the
+/// off-beats and the backbeat at any rate that can spell them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fill {
-    Every,
-    Eighths,
-    Quarters,
-    Halves,
-    Bars,
+    All,
+    Every2,
+    Every3,
+    Every4,
+    Every8,
+    Every16,
     OffBeats,
     Backbeat,
+}
+
+/// Where a fill puts its steps.
+enum FillGrid {
+    /// Every this many steps, from the first.
+    Steps(usize),
+    /// On `offset` plus a whole number of `period`s, in beats.
+    Beats { period: f64, offset: f64 },
 }
 
 /// How close a step's start has to be to a fill's grid to count as on it.
@@ -2119,12 +2132,13 @@ const FILL_TOLERANCE: f64 = 1e-6;
 
 impl Fill {
     /// Every fill, in menu order.
-    pub const ALL: [Fill; 7] = [
-        Fill::Every,
-        Fill::Eighths,
-        Fill::Quarters,
-        Fill::Halves,
-        Fill::Bars,
+    pub const ALL: [Fill; 8] = [
+        Fill::All,
+        Fill::Every2,
+        Fill::Every3,
+        Fill::Every4,
+        Fill::Every8,
+        Fill::Every16,
         Fill::OffBeats,
         Fill::Backbeat,
     ];
@@ -2132,11 +2146,12 @@ impl Fill {
     /// The button text.
     pub const fn label(self) -> &'static str {
         match self {
-            Fill::Every => "All",
-            Fill::Eighths => "1/8",
-            Fill::Quarters => "1/4",
-            Fill::Halves => "1/2",
-            Fill::Bars => "1/1",
+            Fill::All => "All",
+            Fill::Every2 => "Every 2",
+            Fill::Every3 => "Every 3",
+            Fill::Every4 => "Every 4",
+            Fill::Every8 => "Every 8",
+            Fill::Every16 => "Every 16",
             Fill::OffBeats => "Off-beats",
             Fill::Backbeat => "2 & 4",
         }
@@ -2145,39 +2160,38 @@ impl Fill {
     /// The button's hover text.
     pub const fn hint(self) -> &'static str {
         match self {
-            Fill::Every => "Every step on",
-            Fill::Eighths => "Eighth notes",
-            Fill::Quarters => "Quarter notes (four on the floor)",
-            Fill::Halves => "Half notes",
-            Fill::Bars => "The first beat of every bar",
+            Fill::All => "Every step on",
+            Fill::Every2 => "Every other step (eighth notes on a 1/16 lane)",
+            Fill::Every3 => "Every 3rd step",
+            Fill::Every4 => "Every 4th step (four on the floor on a 1/16 lane)",
+            Fill::Every8 => "Every 8th step (half notes on a 1/16 lane)",
+            Fill::Every16 => "Every 16th step (once a bar on a 1/16 lane)",
             Fill::OffBeats => "The eighth notes between the beats",
             Fill::Backbeat => "Beats 2 and 4 of every bar",
         }
     }
 
-    /// The fill's grid as (period, offset) in beats: a step is on when its
-    /// start is `offset` plus a whole number of periods. `None` for
-    /// [`Fill::Every`], which needs no grid.
-    const fn grid(self) -> Option<(f64, f64)> {
+    const fn grid(self) -> FillGrid {
         match self {
-            Fill::Every => None,
-            Fill::Eighths => Some((0.5, 0.0)),
-            Fill::Quarters => Some((1.0, 0.0)),
-            Fill::Halves => Some((2.0, 0.0)),
-            Fill::Bars => Some((4.0, 0.0)),
-            Fill::OffBeats => Some((1.0, 0.5)),
-            Fill::Backbeat => Some((2.0, 1.0)),
+            Fill::All => FillGrid::Steps(1),
+            Fill::Every2 => FillGrid::Steps(2),
+            Fill::Every3 => FillGrid::Steps(3),
+            Fill::Every4 => FillGrid::Steps(4),
+            Fill::Every8 => FillGrid::Steps(8),
+            Fill::Every16 => FillGrid::Steps(16),
+            Fill::OffBeats => FillGrid::Beats { period: 1.0, offset: 0.5 },
+            Fill::Backbeat => FillGrid::Beats { period: 2.0, offset: 1.0 },
         }
     }
 
     /// Whether this fill makes sense on a lane whose steps are `step_beats`
-    /// long: its grid has to fall on steps at a steady spacing. Eighths on a
-    /// 1/4 lane, off-beats on a 1/4 lane, or quarters on a dotted lane would
-    /// all come out as something else, so the menu greys them out.
+    /// long. A step count always does. A beat grid has to fall on steps at a
+    /// steady spacing: off-beats on a 1/4 lane, or 2 & 4 on a dotted lane,
+    /// would come out as something else, so the menu greys them out.
     pub fn fits(self, step_beats: f64) -> bool {
         match self.grid() {
-            None => true,
-            Some((period, offset)) => {
+            FillGrid::Steps(_) => true,
+            FillGrid::Beats { period, offset } => {
                 is_whole(period / step_beats) && period >= step_beats * (1.0 - FILL_TOLERANCE)
                     && is_whole(offset / step_beats)
             }
@@ -2188,8 +2202,8 @@ impl Fill {
     /// on in this fill.
     pub fn hits(self, index: usize, step_beats: f64) -> bool {
         match self.grid() {
-            None => true,
-            Some((period, offset)) => {
+            FillGrid::Steps(every) => index.is_multiple_of(every),
+            FillGrid::Beats { period, offset } => {
                 let from_offset = index as f64 * step_beats - offset;
                 from_offset > -FILL_TOLERANCE * period && is_whole(from_offset / period)
             }
@@ -4731,54 +4745,52 @@ mod tests {
     }
 
     #[test]
-    fn fills_land_on_the_beats_at_sixteenths() {
+    fn every_n_fills_count_steps_at_any_rate() {
+        use crate::sequencer::Rate;
+        for rate in [Rate::Sixteenth, Rate::ThirtySecond, Rate::Quarter, Rate::SixteenthDotted] {
+            assert_eq!(fill_steps(Fill::All, rate, 4), vec![0, 1, 2, 3]);
+            assert_eq!(fill_steps(Fill::Every2, rate, 8), vec![0, 2, 4, 6], "{rate:?}");
+            assert_eq!(fill_steps(Fill::Every3, rate, 9), vec![0, 3, 6]);
+            assert_eq!(fill_steps(Fill::Every4, rate, 16), vec![0, 4, 8, 12]);
+            assert_eq!(fill_steps(Fill::Every8, rate, 16), vec![0, 8]);
+            assert_eq!(fill_steps(Fill::Every16, rate, 32), vec![0, 16]);
+            for fill in &Fill::ALL[..6] {
+                assert!(fill.fits(rate.rate_beats()), "{fill:?} never greyed out");
+            }
+        }
+        // Longer than the lane: just its first step.
+        assert_eq!(fill_steps(Fill::Every16, Rate::Sixteenth, 8), vec![0]);
+    }
+
+    #[test]
+    fn off_beats_and_backbeat_follow_the_beat() {
         use crate::sequencer::Rate;
         let r = Rate::Sixteenth;
-        assert_eq!(fill_steps(Fill::Every, r, 4), vec![0, 1, 2, 3]);
-        assert_eq!(fill_steps(Fill::Eighths, r, 8), vec![0, 2, 4, 6]);
-        assert_eq!(fill_steps(Fill::Quarters, r, 16), vec![0, 4, 8, 12]);
-        assert_eq!(fill_steps(Fill::Halves, r, 16), vec![0, 8]);
-        assert_eq!(fill_steps(Fill::Bars, r, 32), vec![0, 16]);
         assert_eq!(fill_steps(Fill::OffBeats, r, 16), vec![2, 6, 10, 14]);
         assert_eq!(fill_steps(Fill::Backbeat, r, 32), vec![4, 12, 20, 28]);
-        assert!(Fill::ALL.iter().all(|fill| fill.fits(r.rate_beats())));
-    }
-
-    #[test]
-    fn fills_follow_the_lane_rate() {
-        use crate::sequencer::Rate;
-        // Quarter notes are every 2nd step at 1/8 and every 3rd at 1/8T.
-        assert_eq!(fill_steps(Fill::Quarters, Rate::Eighth, 8), vec![0, 2, 4, 6]);
-        assert_eq!(fill_steps(Fill::Quarters, Rate::EighthTriplet, 12), vec![0, 3, 6, 9]);
         assert_eq!(fill_steps(Fill::OffBeats, Rate::Eighth, 8), vec![1, 3, 5, 7]);
-        assert_eq!(fill_steps(Fill::Eighths, Rate::Eighth, 4), vec![0, 1, 2, 3]);
+        assert_eq!(fill_steps(Fill::OffBeats, Rate::ThirtySecond, 16), vec![4, 12]);
         // A long lane far from step 0 still lands exactly.
-        let far = fill_steps(Fill::Quarters, Rate::SixtyFourthTriplet, 4096);
-        assert_eq!(far.len(), 4095 / 24 + 1);
-        assert!(far.iter().all(|index| index % 24 == 0));
+        let far = fill_steps(Fill::Backbeat, Rate::SixtyFourthTriplet, 4096);
+        assert_eq!(far.len(), (4095 - 24) / 48 + 1);
+        assert!(far.iter().all(|index| index % 48 == 24));
     }
 
     #[test]
-    fn fills_that_miss_the_lane_steps_do_not_fit() {
+    fn beat_fills_that_miss_the_lane_steps_do_not_fit() {
         use crate::sequencer::Rate;
         let quarter = Rate::Quarter.rate_beats();
-        assert!(!Fill::Eighths.fits(quarter), "finer than the steps");
         assert!(!Fill::OffBeats.fits(quarter), "between the steps");
-        assert!(Fill::Quarters.fits(quarter));
         assert!(Fill::Backbeat.fits(quarter));
-        // Triplet eighths cannot spell straight eighths or off-beats.
+        // Triplet eighths cannot spell straight off-beats.
         let triplet = Rate::EighthTriplet.rate_beats();
-        assert!(!Fill::Eighths.fits(triplet));
         assert!(!Fill::OffBeats.fits(triplet));
-        assert!(Fill::Quarters.fits(triplet));
-        // A dotted lane fits only every step.
+        assert!(Fill::Backbeat.fits(triplet));
         let dotted = Rate::SixteenthDotted.rate_beats();
-        assert!(Fill::Every.fits(dotted));
-        assert!(!Fill::Quarters.fits(dotted));
-        // Whole-note steps: only a bar per step fits.
-        let whole = Rate::Whole.rate_beats();
-        assert!(Fill::Bars.fits(whole));
-        assert!(!Fill::Halves.fits(whole));
+        assert!(!Fill::OffBeats.fits(dotted));
+        assert!(!Fill::Backbeat.fits(dotted));
+        // Whole-note steps: beats 2 and 4 fall inside them.
+        assert!(!Fill::Backbeat.fits(Rate::Whole.rate_beats()));
     }
 
     #[test]

@@ -235,8 +235,8 @@ make in the header of any of them goes to all of them:
 Right-click the name of a selected lane and the [lane menu](#lane-menu) acts
 on all of them: it says how many lanes at the top, and colour, channel,
 sample pad, duplicate, delete, clear, invert, randomise, nudge and the fills
-apply to each. Renaming is one lane at a time. A fill that doesn't line up
-with every selected lane's rate is greyed out.
+apply to each. Renaming is one lane at a time. **Off-beats** and **2 & 4**
+are greyed out unless they line up with every selected lane's rate.
 
 Changing a lane that isn't selected only changes that lane, and clicking a
 step keeps the selection. Each change to several lanes is one
@@ -304,18 +304,18 @@ Right-click a lane's name to open its menu:
 - **Fill:** replaces the lane's on/off pattern in the current pattern with a
   preset rhythm, keeping each step's settings:
   - **All:** every step.
-  - **1/8, 1/4, 1/2:** eighth, quarter or half notes. **1/4** is four on the
-    floor.
-  - **1/1:** the first beat of every bar.
+  - **Every 2, 3, 4, 8, 16:** every 2nd, 3rd, 4th, 8th or 16th step, starting
+    on the first. These count steps, so they do the same thing at any rate.
+    On a 1/16 lane, **Every 4** is four on the floor, and on a 1/32 lane,
+    **Every 2** is sixteenth notes.
   - **Off-beats:** the eighth notes between the beats, the classic open
     hi-hat.
   - **2 & 4:** beats 2 and 4 of every bar, the usual snare or clap.
 
-  Fills are counted in beats from the lane's first step, so they work at any
-  rate: at 1/16, **1/4** turns on every 4th step, and at 1/8 every 2nd. A fill
-  that doesn't line up with the lane's rate, such as **1/8** on a 1/4 lane or
-  anything on a dotted rate except **All**, is greyed out. Bars are counted
-  as 4/4.
+  **Off-beats** and **2 & 4** follow the beat rather than counting steps, so
+  they land in the same place in the bar at any rate. When they can't line up
+  with the lane's rate, such as **Off-beats** on a 1/4 lane or either of them
+  on a dotted rate, they're greyed out. Bars are counted as 4/4.
 
 ### Adding lanes
 
