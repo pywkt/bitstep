@@ -2351,12 +2351,7 @@ impl BitstepEditor {
             });
         });
 
-        let busy = ui.input(|input| input.pointer.any_down())
-            || self.gesture.is_some()
-            || self.lane_drag.is_some()
-            || self.param_draw.is_some()
-            || self.arrange_gesture.is_some();
-        if busy {
+        if self.busy(ui) {
             // Mid-gesture the shortcut is dropped: undoing under a drag would
             // have the drag's next write land on the restored sequence.
             return;
@@ -2367,6 +2362,59 @@ impl BitstepEditor {
         }
         for _ in 0..redo {
             self.model.redo();
+        }
+    }
+
+    /// Whether a button is down or a gesture is under way, so a shortcut
+    /// must not change what the gesture is working on.
+    fn busy(&self, ui: &egui::Ui) -> bool {
+        ui.input(|input| input.pointer.any_down())
+            || self.gesture.is_some()
+            || self.lane_drag.is_some()
+            || self.param_draw.is_some()
+            || self.arrange_gesture.is_some()
+    }
+
+    /// Tab switches song mode on and off, as the Song button does
+    /// ([`keys::is_song_toggle`]). `on` is whether song mode is on now.
+    ///
+    /// Left alone while a name is being typed, or a menu or the step
+    /// popover is open, so Tab still does what it does there. Otherwise
+    /// the key is taken out of the frame's input, and egui's own use of Tab
+    /// — moving the keyboard focus to the next widget, which it reads
+    /// before the frame starts — is cancelled, so no button is left
+    /// focused for Enter to press. Held down, it switches once; pressed
+    /// mid-gesture, it is dropped, as undo is.
+    fn handle_song_key(&mut self, ui: &egui::Ui, on: bool) {
+        if ui.ctx().text_edit_focused()
+            || Popup::is_any_open(ui.ctx())
+            || self.popover.is_some()
+        {
+            return;
+        }
+        let mut presses = 0;
+        let mut seen = false;
+        ui.input_mut(|input| {
+            input.events.retain(|event| {
+                let egui::Event::Key { key, pressed, repeat, modifiers, .. } = event else {
+                    return true;
+                };
+                if !keys::is_song_toggle(*key, *modifiers) {
+                    return true;
+                }
+                seen = true;
+                if *pressed && !*repeat {
+                    presses += 1;
+                }
+                false
+            });
+        });
+        if seen {
+            ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+        }
+        if presses % 2 == 1 && !self.busy(ui) {
+            self.model.set_song_on(!on);
+            self.follow_song_mode(!on);
         }
     }
 
@@ -2450,7 +2498,7 @@ impl BitstepEditor {
             }
             toggle.on_hover_text(
                 "Song mode: play the patterns placed on the song grid, \
-                 following Bitwig's timeline",
+                 following Bitwig's timeline (Tab)",
             );
         }
 
@@ -3499,6 +3547,9 @@ impl NiceEguiApp for BitstepEditor {
         let data = self.model.shared();
         let pattern = self.shown_pattern();
         self.follow_song_mode(data.song.is_on());
+        // After the view has caught up with the song, and before the layout,
+        // which has a Grid button only in song mode.
+        self.handle_song_key(ui, data.song.is_on());
         let layout = self.layout(ui.max_rect());
         match self.view {
             View::Steps => self.ui_steps(ui, &layout, &data, pattern),
@@ -3861,6 +3912,7 @@ mod tests {
         let mut output = ctx.run_ui(input, |ui| {
             app.handle_history(ui);
             app.follow_song_mode(data.song.is_on());
+            app.handle_song_key(ui, data.song.is_on());
             let layout = test_layout(app, ui.max_rect());
             match app.view {
                 View::Steps => {
@@ -5586,6 +5638,43 @@ mod tests {
         assert!(!model.shared().song.is_on());
         assert_eq!(app.view, View::Steps, "song mode off goes back to the steps");
         assert!(!test_layout(&app, test_window()).arrange_button().is_positive());
+    }
+
+    /// Tab switches song mode as the Song button does, takes no widget's
+    /// focus with it, and leaves Shift+Tab and a held repeat alone.
+    #[test]
+    fn tab_switches_song_mode() {
+        let model = Arc::new(SeqModel::new(state::default_data()));
+        let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
+        let mut app = BitstepEditor::new(params, Arc::clone(&model), Arc::new(Playhead::new()));
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let none = egui::Modifiers::NONE;
+        run_frame(&mut app, &ctx, Vec::new());
+
+        press_key(&mut app, &ctx, egui::Key::Tab, none);
+        assert!(model.shared().song.is_on());
+        assert_eq!(app.view, View::Arrange, "song mode opens the grid");
+        assert_eq!(ctx.memory(|memory| memory.focused()), None, "no widget took the focus");
+
+        // egui marks a press of a key that is still down as a repeat.
+        let tab = |pressed| egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: none,
+        };
+        run_frame(&mut app, &ctx, vec![tab(true)]);
+        assert!(!model.shared().song.is_on());
+        assert_eq!(app.view, View::Steps, "song mode off goes back to the steps");
+        assert_eq!(ctx.memory(|memory| memory.focused()), None);
+        run_frame(&mut app, &ctx, vec![tab(true)]);
+        run_frame(&mut app, &ctx, vec![tab(true), tab(false)]);
+        assert!(!model.shared().song.is_on(), "a held Tab switches once");
+
+        press_key(&mut app, &ctx, egui::Key::Tab, egui::Modifiers::SHIFT);
+        assert!(!model.shared().song.is_on(), "Shift+Tab is not the shortcut");
     }
 
     /// Song mode switched from outside the toggle — a project loaded with it

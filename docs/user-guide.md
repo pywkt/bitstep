@@ -375,8 +375,9 @@ place a pattern by clicking in its row, and anything placed in the same bars
 on different rows plays together. Nothing is recorded, so when you change a
 pattern, every part of the song that uses it changes too.
 
-1. Click **Song** in the top bar. Song mode turns on, the song grid takes the
-   place of the steps, and a **Grid** button appears next to **Song**.
+1. Click **Song** in the top bar, or press **Tab**. Song mode turns on, the
+   song grid takes the place of the steps, and a **Grid** button appears next
+   to **Song**.
 2. Click in a pattern's row at the bar where it should start. The pattern is
    placed there as a block, as long as the pattern itself (see below).
 3. Press play in Bitwig. The song starts at bar 1 of Bitwig's arranger.
@@ -459,7 +460,8 @@ What else to know:
   open with that order laid out on the grid, one block after another from
   bar 1. A silent bar (`0`) at the very end of an old order is dropped, since
   the song now ends with its last block.
-- Click **Song** again to go back to playing one pattern at a time.
+- Click **Song** again, or press **Tab**, to go back to playing one pattern
+  at a time.
 
 ## Scrolling and follow
 
@@ -496,7 +498,9 @@ undo doesn't reach changes made in Bitwig.
 ## Keyboard shortcuts
 
 While bitstep's window is in front, **Ctrl+Z** and **Ctrl+Shift+Z** / **Ctrl+Y**
-are bitstep's [undo and redo](#undo). **Space** (play/stop), **F1–F12** and
+are bitstep's [undo and redo](#undo), and **Tab** turns
+[song mode](#song-mode) on and off (not while a menu or a step's settings are
+open). **Space** (play/stop), **F1–F12** and
 other shortcuts held with **Ctrl** (save and so on) are passed on to Bitwig,
 so you don't have to click back into Bitwig to start the transport. To use
 Bitwig's undo, click into Bitwig first. **Escape** cancels a drag, closes a

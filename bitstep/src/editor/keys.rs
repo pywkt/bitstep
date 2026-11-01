@@ -14,7 +14,9 @@
 //! editor uses itself (Escape, Enter, Tab, the arrows, Delete) stay here, so a
 //! key meant for a popover cannot delete something in the host. So do undo
 //! and redo ([`history_key`]): with the editor focused they step through
-//! bitstep's own edits, as in any plugin with an undo of its own.
+//! bitstep's own edits, as in any plugin with an undo of its own. So does
+//! Tab, which switches song mode on and off ([`is_song_toggle`]); Bitwig
+//! never sees it, so it cannot clash with a Bitwig shortcut.
 //!
 //! Bitwig shows a plugin's editor in a desktop window of its own, which it
 //! marks as belonging to its main window (`WM_TRANSIENT_FOR`). Window
@@ -58,6 +60,12 @@ pub fn history_key(key: Key, modifiers: Modifiers) -> Option<HistoryKey> {
         (Key::Z, true) | (Key::Y, false) => Some(HistoryKey::Redo),
         _ => None,
     }
+}
+
+/// Whether `key` held with `modifiers` switches song mode: Tab on its own.
+/// Shift+Tab and the rest are left alone.
+pub fn is_song_toggle(key: Key, modifiers: Modifiers) -> bool {
+    key == Key::Tab && !modifiers.any()
 }
 
 /// The X keysym to pass `key` on to the host as, when it is held with
@@ -204,6 +212,16 @@ mod tests {
         assert_eq!(history_key(Key::Z, ctrl | Modifiers::ALT), None);
         assert_eq!(history_key(Key::Y, ctrl | Modifiers::SHIFT), None);
         assert_eq!(history_key(Key::S, ctrl), None, "save still goes to the host");
+    }
+
+    #[test]
+    fn plain_tab_alone_switches_song_mode() {
+        assert!(is_song_toggle(Key::Tab, NONE));
+        assert!(!is_song_toggle(Key::Tab, Modifiers::SHIFT));
+        assert!(!is_song_toggle(Key::Tab, Modifiers::CTRL | Modifiers::COMMAND));
+        assert!(!is_song_toggle(Key::Tab, Modifiers::ALT), "Alt+Tab is the desktop's");
+        assert!(!is_song_toggle(Key::S, NONE));
+        assert_eq!(forwarded_keysym(Key::Tab, NONE), None, "never passed to the host");
     }
 
     #[test]
