@@ -386,7 +386,8 @@ impl EditMode {
     fn hover(self) -> &'static str {
         match self {
             EditMode::Steps => {
-                "Click and drag to turn steps on and off; drag up or down for velocity"
+                "Click and drag to turn steps on and off; drag up or down for velocity \
+                 (all the way down for a silent step)"
             }
             EditMode::Pitch => {
                 "Drag up or down to set pitch and sideways to draw across steps. \
@@ -1344,6 +1345,8 @@ impl BitstepEditor {
                         },
                     )
                     .integer()
+                    .custom_formatter(|value, _| grid_math::velocity_label(value as u8))
+                    .custom_parser(|text| grid_math::parse_velocity(text).map(f64::from))
                     .text("Velocity"),
                 );
 
@@ -3404,7 +3407,18 @@ fn paint_steps(
                 paint_pitch_cell(painter, cell, index, step, colour, audible, lit);
                 continue;
             }
-            if step.is_on() {
+            if step.is_on() && step.is_silent() {
+                // A silent step: on, but nothing to fill. Outlined and
+                // slashed in the full lane colour, so it reads as a step
+                // that plays, unlike an off step's dim outline.
+                let lit = playing == Some(index);
+                let stroke = theme::silent_step_stroke(colour, audible, lit);
+                let background = theme::cell_background(index);
+                painter.rect(cell, theme::CELL_CORNER, background, stroke, StrokeKind::Inside);
+                let slash = cell.shrink(theme::SILENT_SLASH_INSET);
+                painter.line_segment([slash.left_bottom(), slash.right_top()], stroke);
+                paint_markers(painter, cell, step);
+            } else if step.is_on() {
                 // Background first, then the velocity's share of the cell on
                 // top of it, so the unfilled part still reads as a cell.
                 painter.rect_filled(cell, theme::CELL_CORNER, theme::cell_background(index));
@@ -5447,14 +5461,21 @@ mod tests {
         // Down is quieter, and wandering sideways mid-gesture changes neither
         // the step being edited nor the ones the pointer crosses.
         app.continue_gesture(&view, &model.shared(), pattern, at(0.0, 40.0), false);
-        assert_eq!(step(3).velocity(), 33);
+        assert_eq!(step(3).velocity(), 32);
         let across = view.cell_rect(row, 6).center().x - centre.x;
         app.continue_gesture(&view, &model.shared(), pattern, at(across, 40.0), false);
-        assert_eq!(step(3).velocity(), 33, "a velocity drag reads the pointer's height only");
+        assert_eq!(step(3).velocity(), 32, "a velocity drag reads the pointer's height only");
         assert_eq!(step(4), Step::default_on(), "the step next door is untouched");
         for index in [2usize, 5, 6] {
             assert!(!step(index).is_on(), "step {index} was never painted");
         }
+
+        // All the way down is a silent step: still on, velocity 0. Back up
+        // from there is a velocity again.
+        app.continue_gesture(&view, &model.shared(), pattern, at(0.0, 1_000.0), false);
+        assert!(step(3).is_on() && step(3).is_silent(), "the bottom is silent, not off");
+        app.continue_gesture(&view, &model.shared(), pattern, at(0.0, 40.0), false);
+        assert_eq!(step(3).velocity(), 32);
 
         // The button coming up on a velocity drag is not also a toggle.
         app.end_gesture(pattern);
@@ -5466,7 +5487,7 @@ mod tests {
         assert!(step(3).is_on(), "nothing is written until the button comes up");
         app.end_gesture(pattern);
         assert!(!step(3).is_on(), "a click on an on step erases it");
-        assert_eq!(step(3).velocity(), 33, "an erased step keeps its velocity");
+        assert_eq!(step(3).velocity(), 32, "an erased step keeps its velocity");
 
         model.collect();
     }

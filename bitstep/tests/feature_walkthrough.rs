@@ -725,12 +725,12 @@ fn ratchets_probability_and_pan_reach_every_note() {
         length: 4,
         steps: &[(0, Step::pack(true, 100, Step::PAN_MAX, 4, 100))],
     };
-    // A plain step, panned hard left at the lowest velocity there is.
+    // A plain step, panned hard left at the lowest velocity that sounds.
     let left_patch = Patch {
         key: 38,
         rate: Rate::Quarter,
         length: 2,
-        steps: &[(1, Step::pack(true, Step::VELOCITY_MIN, Step::PAN_MIN, 1, 100))],
+        steps: &[(1, Step::pack(true, Step::VELOCITY_LOWEST_SOUNDING, Step::PAN_MIN, 1, 100))],
     };
     // On, but at probability 0: never heard, and no randomness consumed.
     let never_patch = Patch {

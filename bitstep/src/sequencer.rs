@@ -754,6 +754,10 @@ pub enum SeqEvent {
         /// Whether the lane is a sample pad ([`Lane::sample_pad`]), which
         /// adds the gap to [`Lane::SAMPLE_ROOT`] to the tuning sent.
         sample_pad: bool,
+        /// A silent step ([`Step::is_silent`]): `velocity` is the lowest a
+        /// note can have, and the shell sends the note at no volume, whatever
+        /// `volume_db` says.
+        silent: bool,
         voice_id: i32,
     },
     NoteOff {
@@ -767,7 +771,7 @@ pub enum SeqEvent {
 impl SeqEvent {
     /// A note-on from a step's **packed** velocity and pan, i.e. the fields
     /// exactly as [`Step`] stores them; the mapping to `f32` happens here so
-    /// that it happens in only one place.
+    /// that it happens in only one place. Velocity 0 makes a silent note.
     pub const fn note_on(
         beat: f64,
         lane_pos: usize,
@@ -787,6 +791,7 @@ impl SeqEvent {
             pitch: 0,
             volume_db: 0,
             sample_pad: false,
+            silent: velocity == Step::VELOCITY_SILENT,
             voice_id,
         }
     }
@@ -889,6 +894,11 @@ impl SeqEvent {
         }
     }
 
+    /// Whether this is a silent step's note-on (see [`Step::is_silent`]).
+    pub const fn is_silent(self) -> bool {
+        matches!(self, SeqEvent::NoteOn { silent: true, .. })
+    }
+
     pub const fn is_note_on(self) -> bool {
         matches!(self, SeqEvent::NoteOn { .. })
     }
@@ -910,11 +920,12 @@ impl SeqEvent {
 /// Maps a step's packed velocity (`1..=127`) to the `0.0..=1.0` payload CLAP
 /// uses: `v as f32 / 127.0`.
 ///
-/// Out-of-range input is clamped exactly as [`Step::velocity`] clamps it, so
-/// no snapshot or GUI slip can put a velocity outside the unit range — note
-/// that 0 clamps *up* to 1, because velocity 0 means note-off on the wire.
+/// Out-of-range input is clamped, so no snapshot or GUI slip can put a
+/// velocity outside the unit range. A silent step's 0 clamps *up* to 1,
+/// because velocity 0 means note-off on the wire: the silence comes from the
+/// note's volume instead ([`SeqEvent::NoteOn::silent`]).
 pub const fn velocity_to_f32(velocity: u8) -> f32 {
-    let velocity = clamp_u8(velocity, Step::VELOCITY_MIN, Step::VELOCITY_MAX);
+    let velocity = clamp_u8(velocity, Step::VELOCITY_LOWEST_SOUNDING, Step::VELOCITY_MAX);
     velocity as f32 / Step::VELOCITY_MAX as f32
 }
 
@@ -2516,8 +2527,9 @@ mod tests {
         assert_eq!(velocity_to_f32(127), 1.0);
         assert_eq!(velocity_to_f32(1), 1.0 / 127.0);
         assert_eq!(velocity_to_f32(100), 100.0 / 127.0);
-        // Velocity 0 is a note-off on the wire, so it clamps up, not down.
-        assert_eq!(velocity_to_f32(0), velocity_to_f32(Step::VELOCITY_MIN));
+        // Velocity 0 is a note-off on the wire, so a silent step's 0 clamps
+        // up, not down.
+        assert_eq!(velocity_to_f32(0), velocity_to_f32(Step::VELOCITY_LOWEST_SOUNDING));
         assert_eq!(velocity_to_f32(255), 1.0);
         for velocity in Step::VELOCITY_MIN..=Step::VELOCITY_MAX {
             let mapped = velocity_to_f32(velocity);
@@ -2599,6 +2611,21 @@ mod tests {
         assert_eq!(off.tuning(), 0);
     }
 
+    /// A silent step still fires a note, so it retriggers its pad, but the
+    /// note goes out at the lowest real velocity and marked silent.
+    #[test]
+    fn a_silent_step_fires_the_quietest_note_marked_silent() {
+        let step = Step::default_on().with_velocity(Step::VELOCITY_SILENT);
+        let on = SeqEvent::from_step(0.5, 0, 36, 0, step, 1 << 20);
+        assert!(on.is_note_on() && on.is_silent());
+        let SeqEvent::NoteOn { velocity, .. } = on else { unreachable!() };
+        assert_eq!(velocity, 1.0 / 127.0);
+
+        let loud = SeqEvent::from_step(0.5, 0, 36, 0, Step::default_on(), 1 << 20);
+        assert!(!loud.is_silent());
+        assert!(!SeqEvent::note_off(0.5, 36, 0, 1 << 20).is_silent());
+    }
+
     #[test]
     fn events_carry_mapped_step_values() {
         let step = Step::pack(true, 100, Step::PAN_CENTRE, 4, 100);
@@ -2616,6 +2643,7 @@ mod tests {
                 pitch: 0,
                 volume_db: 0,
                 sample_pad: false,
+                silent: false,
                 voice_id: (1 << 20) + 7,
             }
         );
@@ -3157,6 +3185,7 @@ mod tests {
                 pitch: 0,
                 volume_db: 0,
                 sample_pad: false,
+                silent: false,
                 voice_id,
             }
         );

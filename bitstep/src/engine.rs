@@ -730,9 +730,14 @@ fn strike_hits(
     // (beat, lane) is unique per hit within one pattern; across layered
     // blocks the key and the step break the remaining ties, so the order
     // never depends on how the hits were collected.
+    //
+    // Silent steps sort after audible ones at the same beat: when two strikes
+    // of one note merge, the first one's velocity and volume are kept, and a
+    // hit that sounds should not be swallowed by a silent one beside it.
     hits.sort_unstable_by(|a, b| {
         a.beat
             .total_cmp(&b.beat)
+            .then_with(|| a.step.is_silent().cmp(&b.step.is_silent()))
             .then_with(|| a.lane_pos.cmp(&b.lane_pos))
             .then_with(|| a.end_beat.total_cmp(&b.end_beat))
             .then_with(|| a.step.bits().cmp(&b.step.bits()))
@@ -1317,6 +1322,51 @@ mod tests {
 
         assert_eq!(beats_of(&events, true), [0.0, 1.0]);
         assert_eq!(beats_of(&events, false), [0.5, 1.5]);
+        assert_well_formed(&engine, &events);
+    }
+
+    /// When a silent step and an audible one strike the same note at the same
+    /// moment, the merged note is the audible one, whichever lane is on top.
+    #[test]
+    fn a_silent_strike_never_swallows_an_audible_one_on_the_same_beat() {
+        for silent_lane in [0, 1] {
+            let data = seq_data(&[
+                spec(60, 4, Rate::Quarter, &[0]),
+                spec(60, 4, Rate::Quarter, &[0]),
+            ]);
+            let silent = Step::default_on().with_velocity(Step::VELOCITY_SILENT);
+            for pattern in 0..NUM_PATTERNS {
+                data.lane_data(pattern, silent_lane).unwrap().set_step(0, silent);
+            }
+            let mut engine = Engine::new();
+            let ctx = BlockCtx::new(0.0, TEMPO, SAMPLE_RATE, SAMPLES_PER_BEAT);
+            let events = run_one(&mut engine, &data, &ctx);
+            let ons: Vec<_> = events.iter().filter(|e| e.event.is_note_on()).collect();
+            assert_eq!(ons.len(), 1, "silent lane {silent_lane}: one merged note");
+            assert!(!ons[0].event.is_silent(), "silent lane {silent_lane}: the audible one");
+            assert_well_formed(&engine, &events);
+        }
+    }
+
+    /// A silent step on a sounding note retriggers it like any other strike:
+    /// the old note is released at the silent step's beat.
+    #[test]
+    fn a_silent_strike_retriggers_the_sounding_note() {
+        let data =
+            seq_data(&[spec(60, 4, Rate::Quarter, &[0]), spec(60, 16, Rate::Sixteenth, &[1])]);
+        let silent = Step::default_on().with_velocity(Step::VELOCITY_SILENT);
+        data.lane_data(0, 1).unwrap().set_step(1, silent);
+        let mut engine = Engine::new();
+        let ctx = BlockCtx::new(0.0, TEMPO, SAMPLE_RATE, SAMPLES_PER_BEAT);
+        let events = run_one(&mut engine, &data, &ctx);
+        assert_eq!(beats_of(&events, true), [0.0, 0.25]);
+        assert_eq!(beats_of(&events, false), [0.25, 0.375]);
+        let silent_ons: Vec<f64> = events
+            .iter()
+            .filter(|e| e.event.is_silent())
+            .map(|e| e.event.beat())
+            .collect();
+        assert_eq!(silent_ons, [0.25]);
         assert_well_formed(&engine, &events);
     }
 

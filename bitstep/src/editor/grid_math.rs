@@ -604,8 +604,8 @@ pub fn resolve_axis(delta: Vec2) -> DragAxis {
 /// Absolute, not incremental — the whole gesture is measured from its origin,
 /// so dragging back to where the press was restores the velocity it started
 /// with even after the drag has run into an end of the range. Clamped to
-/// `Step::VELOCITY_MIN..=Step::VELOCITY_MAX`: a velocity of 0 is a note-off on
-/// the wire, so the drag's floor is 1, not silence.
+/// `Step::VELOCITY_MIN..=Step::VELOCITY_MAX`, so the drag's floor is 0, a
+/// silent step ([`Step::is_silent`]).
 pub fn drag_velocity(start: u8, dy: f32) -> u8 {
     let start = start.clamp(Step::VELOCITY_MIN, Step::VELOCITY_MAX);
     if !dy.is_finite() {
@@ -1875,17 +1875,42 @@ pub fn widget_probability(value: f64) -> u8 {
 }
 
 /// The ends of the velocity slider in the step popover — the packed field's
-/// own scale, 1..=127.
+/// own scale, 0..=127, where 0 is a silent step.
 pub const VELOCITY_WIDGET_MIN: f64 = Step::VELOCITY_MIN as f64;
 
 /// The other end of the velocity slider — see [`VELOCITY_WIDGET_MIN`].
 pub const VELOCITY_WIDGET_MAX: f64 = Step::VELOCITY_MAX as f64;
 
-/// A raw widget value as a step velocity, 1..=127.
+/// A raw widget value as a step velocity, 0..=127.
 // Not `clamp`: `max` then `min` folds a NaN onto the low end.
 #[allow(clippy::manual_clamp)]
 pub fn widget_velocity(value: f64) -> u8 {
     value.round().max(VELOCITY_WIDGET_MIN).min(VELOCITY_WIDGET_MAX) as u8
+}
+
+/// How a velocity reads: its number, or `Silent` for 0.
+pub fn velocity_label(velocity: u8) -> String {
+    match velocity {
+        Step::VELOCITY_SILENT => SILENT_LABEL.to_owned(),
+        velocity => velocity.min(Step::VELOCITY_MAX).to_string(),
+    }
+}
+
+/// What a silent step's velocity reads as.
+pub const SILENT_LABEL: &str = "Silent";
+
+/// A typed velocity: a number (clamped into range), or `silent` (any case,
+/// or just its first letters) for 0. `None` for anything else.
+pub fn parse_velocity(text: &str) -> Option<u8> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if SILENT_LABEL.to_ascii_lowercase().starts_with(&text.to_ascii_lowercase()) {
+        return Some(Step::VELOCITY_SILENT);
+    }
+    let value: f64 = text.parse().ok()?;
+    value.is_finite().then(|| widget_velocity(value))
 }
 
 /// The ends of the pitch slider, in semitones.
@@ -2250,7 +2275,8 @@ impl ParamKind {
     }
 
     /// The lowest and highest value, inclusive, in the units [`Self::read`]
-    /// gives: velocity 1..=127, packed pan, semitones, percent, repeats.
+    /// gives: velocity 0..=127 (0 = silent), packed pan, semitones, percent,
+    /// repeats.
     pub fn range(self) -> (i32, i32) {
         match self {
             ParamKind::Velocity => (i32::from(Step::VELOCITY_MIN), i32::from(Step::VELOCITY_MAX)),
@@ -2307,12 +2333,13 @@ impl ParamKind {
         }
     }
 
-    /// How a value reads in the panel: `100`, `L50`, `+5`, `50%`, `3x`.
+    /// How a value reads in the panel: `100`, `Silent`, `L50`, `+5`, `50%`,
+    /// `3x`.
     pub fn value_label(self, value: i32) -> String {
         let (min, max) = self.range();
         let value = value.clamp(min, max);
         match self {
-            ParamKind::Velocity => value.to_string(),
+            ParamKind::Velocity => velocity_label(value as u8),
             ParamKind::Pan => pan_label(value as u8),
             ParamKind::Pitch => pitch_label(value as i8),
             ParamKind::Chance => format!("{value}%"),
@@ -3556,24 +3583,28 @@ mod tests {
     /// press and clamped to the MIDI range the sequencer can send.
     #[test]
     fn a_vertical_drag_maps_onto_the_velocity_range() {
-        // Half the span is half the range, in both directions: 126 velocities
-        // over 160 points.
+        // Half the span is half the range, in both directions: 127 velocities
+        // (silent included) over 160 points.
         assert_eq!(drag_velocity(64, 0.0), 64, "a drag that has not moved changes nothing");
         assert_eq!(drag_velocity(64, -VELOCITY_DRAG_SPAN / 2.0), 127, "up is louder");
+        // 64 - 63.5 rounds up to 1; a little further down is silent.
         assert_eq!(drag_velocity(64, VELOCITY_DRAG_SPAN / 2.0), 1, "down is quieter");
+        assert_eq!(drag_velocity(64, VELOCITY_DRAG_SPAN / 2.0 + 1.0), 0, "the bottom is silent");
         assert_eq!(drag_velocity(64, -40.0), 96, "a quarter of the span is a quarter of it");
-        // 64 - 31.5 rounds away from zero, as `f32::round` does.
-        assert_eq!(drag_velocity(64, 40.0), 33);
+        // 64 - 31.75 rounds to the nearest whole velocity.
+        assert_eq!(drag_velocity(64, 40.0), 32);
 
-        // Clamped at both ends, and never to the 0 that would be a note-off.
+        // Clamped at both ends; the bottom is a silent step.
         assert_eq!(drag_velocity(64, -1_000.0), Step::VELOCITY_MAX);
-        assert_eq!(drag_velocity(64, 1_000.0), Step::VELOCITY_MIN);
-        assert_eq!(drag_velocity(1, 10.0), Step::VELOCITY_MIN);
+        assert_eq!(drag_velocity(64, 1_000.0), Step::VELOCITY_SILENT);
+        assert_eq!(drag_velocity(1, 10.0), Step::VELOCITY_SILENT);
+        // And back up from silent, as from any other velocity.
+        assert_eq!(drag_velocity(0, -VELOCITY_DRAG_SPAN), Step::VELOCITY_MAX);
         assert_eq!(drag_velocity(127, -10.0), Step::VELOCITY_MAX);
 
         // A start outside the range (a hostile snapshot's step reads back
         // clamped, but nothing here depends on that) is clamped first.
-        assert_eq!(drag_velocity(0, 0.0), Step::VELOCITY_MIN);
+        assert_eq!(drag_velocity(0, 0.0), Step::VELOCITY_SILENT);
         assert_eq!(drag_velocity(255, 0.0), Step::VELOCITY_MAX);
 
         // Monotonic over the whole screen's worth of travel.
@@ -3606,7 +3637,7 @@ mod tests {
         // Screen heights, not deltas: the origin is 300.
         assert_eq!(drag.velocity_at(300.0), 64);
         assert_eq!(drag.velocity_at(260.0), 96);
-        assert_eq!(drag.velocity_at(340.0), 33);
+        assert_eq!(drag.velocity_at(340.0), 32);
 
         // Returning to the origin restores the velocity even after the drag
         // has run into an end of the range — the gesture is absolute.
@@ -3634,8 +3665,13 @@ mod tests {
 
         // The start is clamped on the way in, so a drag can begin on a step
         // whose bits came from somewhere else.
-        drag = VelocityDrag::begin(0, 0, 0, 0.0);
-        assert_eq!(drag.start_velocity(), Step::VELOCITY_MIN);
+        drag = VelocityDrag::begin(0, 0, 255, 0.0);
+        assert_eq!(drag.start_velocity(), Step::VELOCITY_MAX);
+
+        // A silent step drags up out of silence like any other.
+        drag = VelocityDrag::begin(0, 0, Step::VELOCITY_SILENT, 0.0);
+        assert_eq!(drag.start_velocity(), Step::VELOCITY_SILENT);
+        assert_eq!(drag.enter(-40.0), Some(32));
     }
 
     /// The three regions cover the window exactly once, and the pointer in
@@ -4152,10 +4188,11 @@ mod tests {
         }
 
         // The theme's own mapping stays inside the cell at both ends.
-        assert!(cell.contains_rect(fill_rect(cell, theme::fill_fraction(Step::VELOCITY_MIN))));
+        let quietest = theme::fill_fraction(Step::VELOCITY_LOWEST_SOUNDING);
+        assert!(cell.contains_rect(fill_rect(cell, quietest)));
         assert!(cell.contains_rect(fill_rect(cell, theme::fill_fraction(Step::VELOCITY_MAX))));
         assert!(
-            fill_rect(cell, theme::fill_fraction(Step::VELOCITY_MIN)).height() > 0.0,
+            fill_rect(cell, quietest).height() > 0.0,
             "the quietest note must still be visible"
         );
 
@@ -4519,7 +4556,8 @@ mod tests {
         assert_eq!(pitch_label(5), "+5");
         assert_eq!(pitch_label(0), "0");
         assert_eq!(pitch_label(-3), "-3");
-        assert_eq!(widget_velocity(0.0), Step::VELOCITY_MIN);
+        assert_eq!(widget_velocity(0.0), Step::VELOCITY_SILENT);
+        assert_eq!(widget_velocity(-3.0), Step::VELOCITY_SILENT);
         assert_eq!(widget_velocity(126.6), 127);
     }
 
@@ -4627,9 +4665,46 @@ mod tests {
         assert_eq!(drawn.turned_on().velocity(), 40, "kept when switched on");
     }
 
+    /// The bottom of the velocity panel is a silent step, and drawing it on
+    /// an empty step leaves the other defaults under it.
+    #[test]
+    fn the_bottom_of_the_velocity_panel_draws_a_silent_step() {
+        let plot = Rect::from_min_size(pos2(0.0, 10.0), vec2(30.0, 100.0));
+        assert_eq!(ParamKind::Velocity.range().0, i32::from(Step::VELOCITY_SILENT));
+        assert_eq!(ParamKind::Velocity.value_at(plot, plot.max.y), 0);
+        assert_eq!(ParamKind::Velocity.value_at(plot, plot.max.y + 50.0), 0);
+        let silent = ParamKind::Velocity.write(Step::OFF, 0);
+        assert!(silent.is_silent());
+        assert_eq!(silent.probability(), Step::PROBABILITY_MAX);
+        assert!(silent.turned_on().is_silent(), "still silent once switched on");
+        assert_eq!(ParamKind::Velocity.read(silent), 0);
+        // A silent bar is still drawn, at the thinnest.
+        let bar = ParamKind::Velocity.bar(plot, egui::Rangef::new(0.0, 30.0), 0);
+        assert_eq!(bar.height(), PARAM_MIN_BAR);
+    }
+
+    #[test]
+    fn velocities_label_and_parse_with_silent_for_0() {
+        assert_eq!(velocity_label(0), "Silent");
+        assert_eq!(velocity_label(1), "1");
+        assert_eq!(velocity_label(127), "127");
+        assert_eq!(parse_velocity("Silent"), Some(0));
+        assert_eq!(parse_velocity(" s "), Some(0));
+        assert_eq!(parse_velocity("SIL"), Some(0));
+        assert_eq!(parse_velocity("0"), Some(0));
+        assert_eq!(parse_velocity("64"), Some(64));
+        assert_eq!(parse_velocity("200"), Some(127));
+        assert_eq!(parse_velocity("-5"), Some(0));
+        assert_eq!(parse_velocity(""), None);
+        assert_eq!(parse_velocity("loud"), None);
+        assert_eq!(parse_velocity("nan"), None);
+    }
+
     #[test]
     fn param_values_read_as_the_panel_shows_them() {
         assert_eq!(ParamKind::Velocity.value_label(100), "100");
+        assert_eq!(ParamKind::Velocity.value_label(1), "1");
+        assert_eq!(ParamKind::Velocity.value_label(0), "Silent");
         assert_eq!(ParamKind::Pan.value_label(i32::from(Step::PAN_CENTRE)), "C");
         assert_eq!(ParamKind::Pitch.value_label(5), "+5");
         assert_eq!(ParamKind::Pitch.value_label(-3), "-3");

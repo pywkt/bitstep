@@ -20,7 +20,7 @@ use crate::undo::History;
 ///
 /// ```text
 /// bit  0       on          (1 = active)
-/// bits 1–7     velocity    1..=127
+/// bits 1–7     velocity    0..=127, 0 = silent (see [`Step::is_silent`])
 /// bits 8–14    pan         0..=126, 63 = centre
 /// bits 15–17   ratchet     stored n-1 → effective 1..=8
 /// bits 18–24   probability 0..=100 (%)
@@ -38,15 +38,28 @@ use crate::undo::History;
 ///
 /// The getters clamp into the documented range instead of trusting the bits.
 /// A step can come from a hostile state snapshot or from an edit by a future
-/// version, and the audio path must never see e.g. velocity 0 (which is a
-/// note-off on the wire) or ratchet 0 (which would make a zero-length
-/// subdivision). Round-tripping a value that was in range is unaffected.
+/// version, and the audio path must never see e.g. ratchet 0 (which would
+/// make a zero-length subdivision). Round-tripping a value that was in range
+/// is unaffected.
+///
+/// Velocity 0 is a value of its own, the **silent step**: on the wire a
+/// velocity of 0 means note-off, so the sequencer sends it as the quietest
+/// real note (velocity 1) with its per-note volume turned all the way down.
+/// The note still retriggers its pad, which cuts off a sound set to choke
+/// itself, and adds nothing audible of its own. Before silent steps existed
+/// every write path clamped velocity to 1 or more, so an edited step with 0
+/// in the field can only have been made silent on purpose.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Step(pub u32);
 
 impl Step {
-    /// Lowest MIDI velocity that still sounds; 0 means note-off on the wire.
-    pub const VELOCITY_MIN: u8 = 1;
+    /// The lowest stored velocity: [`Step::VELOCITY_SILENT`].
+    pub const VELOCITY_MIN: u8 = Self::VELOCITY_SILENT;
+    /// The velocity of a silent step, which plays a note nobody hears.
+    pub const VELOCITY_SILENT: u8 = 0;
+    /// The lowest velocity that is played as itself; also what a silent step
+    /// is sent as, since 0 means note-off on the wire.
+    pub const VELOCITY_LOWEST_SOUNDING: u8 = 1;
     pub const VELOCITY_MAX: u8 = 127;
     pub const PAN_MIN: u8 = 0;
     /// Kept even so that [`Step::PAN_CENTRE`] is exactly halfway, which makes
@@ -121,6 +134,14 @@ impl Step {
         self.0 & Self::ON_MASK != 0
     }
 
+    /// Whether the step plays silently (velocity 0): its note still
+    /// retriggers the pad, but at no volume. Off and never-edited steps also
+    /// hold velocity 0 and play nothing at all, which is the on bit's
+    /// business, not this one's.
+    pub const fn is_silent(self) -> bool {
+        self.velocity() == Self::VELOCITY_SILENT
+    }
+
     pub const fn velocity(self) -> u8 {
         let raw = ((self.0 & Self::VELOCITY_MASK) >> Self::VELOCITY_SHIFT) as u8;
         clamp_u8(raw, Self::VELOCITY_MIN, Self::VELOCITY_MAX)
@@ -152,6 +173,11 @@ impl Step {
 
     /// Whether the step has never been switched on (or was cleared): every
     /// field that says how a note sounds is zero. Pitch doesn't count.
+    ///
+    /// Since velocity 0 became a real value, one edited step reads as
+    /// untouched too: an *off* silent step that is also hard left, has no
+    /// ratchet and a 0% chance. Turning it back on gives the defaults rather
+    /// than those values, which is harmless: at 0% it would never play.
     pub const fn is_untouched(self) -> bool {
         self.0 & Self::NOTE_MASK == 0
     }
@@ -2196,8 +2222,9 @@ mod tests {
     /// next field — both the GUI and a hostile snapshot go through them.
     #[test]
     fn setters_clamp_out_of_range_values() {
-        // velocity 0 is a note-off on the wire, so the floor is 1.
-        assert_eq!(Step::pack(true, 0, 63, 1, 100).velocity(), 1);
+        // Velocity 0 is the silent step, a value of its own.
+        assert_eq!(Step::pack(true, 0, 63, 1, 100).velocity(), 0);
+        assert!(Step::pack(true, 0, 63, 1, 100).is_silent());
         assert_eq!(Step::pack(true, 128, 63, 1, 100).velocity(), 127);
         assert_eq!(Step::pack(true, u8::MAX, 63, 1, 100).velocity(), 127);
 
@@ -2213,7 +2240,7 @@ mod tests {
         assert_eq!(Step::pack(true, 100, 63, 1, u8::MAX).probability(), 100);
 
         let base = Step::default_on();
-        assert_eq!(base.with_velocity(0).velocity(), 1);
+        assert_eq!(base.with_velocity(0).velocity(), 0);
         assert_eq!(base.with_velocity(u8::MAX).velocity(), 127);
         assert_eq!(base.with_pan(u8::MAX).pan(), 126);
         assert_eq!(base.with_ratchet(0).ratchet(), 1);
@@ -2288,6 +2315,27 @@ mod tests {
         assert_eq!(raw_pan_127.pan(), 126);
         let raw_prob_127 = Step(Step::pack(true, 100, 63, 1, 0).bits() | (127 << 18));
         assert_eq!(raw_prob_127.probability(), 100);
+    }
+
+    /// A silent step is velocity 0 and nothing else: every other field
+    /// stays, it is still an edited step, and any velocity above 0 undoes it.
+    #[test]
+    fn velocity_0_makes_a_silent_step_that_keeps_its_other_fields() {
+        let step = Step::default_on().with_pan(20).with_ratchet(3).with_pitch(-5);
+        let silent = step.with_velocity(Step::VELOCITY_SILENT);
+        assert!(silent.is_silent());
+        assert!(silent.is_on());
+        assert!(!silent.is_untouched());
+        assert_eq!(
+            (silent.pan(), silent.ratchet(), silent.probability(), silent.pitch()),
+            (20, 3, 100, -5)
+        );
+        // Turned off and on again, it is still silent.
+        assert!(silent.with_on(false).turned_on().is_silent());
+        let back = silent.with_velocity(Step::VELOCITY_LOWEST_SOUNDING);
+        assert!(!back.is_silent());
+        assert_eq!(back.velocity(), 1);
+        assert!(!Step::default_on().is_silent());
     }
 
     #[test]

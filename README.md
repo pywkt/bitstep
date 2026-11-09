@@ -9,7 +9,8 @@ and program beats on a grid, like Bitwig's Stepwise, but with:
 - **Its own length and rate per lane** (1/1 to 1/64, triplet and dotted), for
   polymeters and polyrhythms.
 - **Per-step settings:** velocity, pan, pitch (±24 semitones), ratchets
-  (up to 8 repeats) and chance.
+  (up to 8 repeats) and chance. Velocity 0 is a silent step, which retriggers
+  a pad without being heard, to cut off a sound that chokes itself.
 - **A parameter panel** to draw a whole lane's velocity, pan, pitch, chance or
   ratchet with the mouse (Shift for straight lines).
 - **A pitch mode** for drawing pitch curves right on the grid.

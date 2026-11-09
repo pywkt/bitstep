@@ -480,16 +480,36 @@ pub fn playhead_step_fill(lane: Color32, audible: bool) -> Color32 {
 
 /// How much of a cell's height an on step's fill occupies, from its velocity.
 ///
-/// Monotonic over the whole MIDI range and never zero: velocity
-/// [`Step::VELOCITY_MIN`] draws [`MIN_FILL_FRACTION`] of the cell and
-/// [`Step::VELOCITY_MAX`] fills it. Out-of-range input is clamped rather than
-/// trusted — a step can carry anything a snapshot put in it.
+/// Monotonic over the whole range: velocity
+/// [`Step::VELOCITY_LOWEST_SOUNDING`] draws [`MIN_FILL_FRACTION`] of the cell
+/// and [`Step::VELOCITY_MAX`] fills it. A silent step (velocity 0) has no
+/// fill at all; it is drawn as [`silent_step_stroke`] instead. Out-of-range
+/// input is clamped rather than trusted — a step can carry anything a
+/// snapshot put in it.
 pub fn fill_fraction(velocity: u8) -> f32 {
-    let velocity = velocity.clamp(Step::VELOCITY_MIN, Step::VELOCITY_MAX);
-    let span = (Step::VELOCITY_MAX - Step::VELOCITY_MIN) as f32;
-    let position = (velocity - Step::VELOCITY_MIN) as f32 / span;
+    if velocity == Step::VELOCITY_SILENT {
+        return 0.0;
+    }
+    let lowest = Step::VELOCITY_LOWEST_SOUNDING;
+    let velocity = velocity.clamp(lowest, Step::VELOCITY_MAX);
+    let span = (Step::VELOCITY_MAX - lowest) as f32;
+    let position = (velocity - lowest) as f32 / span;
     MIN_FILL_FRACTION + (1.0 - MIN_FILL_FRACTION) * position
 }
+
+/// The outline and slash a silent step is drawn with: the full lane colour
+/// (where an off step's outline is dimmed), so it reads as a step that is on
+/// but plays nothing. Brightened under the playhead like an on step's fill.
+pub fn silent_step_stroke(lane: Color32, audible: bool, lit: bool) -> Stroke {
+    let colour = if lit { playhead_step_fill(lane, audible) } else { on_step_fill(lane, audible) };
+    Stroke::new(SILENT_STROKE_WIDTH, colour)
+}
+
+/// How thick a silent step's outline and slash are.
+pub const SILENT_STROKE_WIDTH: f32 = 1.5;
+
+/// How far the slash across a silent step stays from the cell's corners.
+pub const SILENT_SLASH_INSET: f32 = 5.0;
 
 // ---- egui's own styling ----
 
@@ -621,19 +641,18 @@ mod tests {
     }
 
     /// Velocity → fill height: the ends are pinned, the middle rises, and
-    /// nothing outside 1..=127 escapes the range.
+    /// nothing outside 1..=127 escapes the range. A silent step has no fill.
     #[test]
     fn fill_fraction_spans_the_cell_monotonically() {
-        assert_eq!(fill_fraction(Step::VELOCITY_MIN), MIN_FILL_FRACTION);
+        assert_eq!(fill_fraction(Step::VELOCITY_LOWEST_SOUNDING), MIN_FILL_FRACTION);
         assert_eq!(fill_fraction(Step::VELOCITY_MAX), 1.0);
+        assert_eq!(fill_fraction(Step::VELOCITY_SILENT), 0.0);
 
-        // Out of range below and above, including the 0 a packed step can
-        // never hold but a raw `Step(0).velocity()` would have clamped.
-        assert_eq!(fill_fraction(0), fill_fraction(Step::VELOCITY_MIN));
+        // Out of range above.
         assert_eq!(fill_fraction(255), fill_fraction(Step::VELOCITY_MAX));
 
         let mut previous = 0.0;
-        for velocity in 0..=255u8 {
+        for velocity in 1..=255u8 {
             let fraction = fill_fraction(velocity);
             assert!(fraction >= previous, "velocity {velocity} went backwards");
             assert!(
@@ -645,7 +664,7 @@ mod tests {
 
         // Strictly rising where it matters, or the grid could not show an
         // edit of one velocity step.
-        for velocity in Step::VELOCITY_MIN..Step::VELOCITY_MAX {
+        for velocity in Step::VELOCITY_LOWEST_SOUNDING..Step::VELOCITY_MAX {
             assert!(
                 fill_fraction(velocity + 1) > fill_fraction(velocity),
                 "velocity {velocity} and {} draw the same",

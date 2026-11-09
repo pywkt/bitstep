@@ -225,7 +225,7 @@ fn note_events(timed: TimedEvent) -> ([PluginNoteEvent<Bitstep>; MAX_EVENTS_PER_
     let key = Key::Number(event.key());
 
     match event {
-        SeqEvent::NoteOn { velocity, pan, volume_db, .. } => {
+        SeqEvent::NoteOn { velocity, pan, volume_db, silent, .. } => {
             let note = NoteEvent::NoteOn { timing, voice_id, channel, key, velocity };
             let mut events = [note; MAX_EVENTS_PER_NOTE];
             let mut count = 1;
@@ -249,9 +249,11 @@ fn note_events(timed: TimedEvent) -> ([PluginNoteEvent<Bitstep>; MAX_EVENTS_PER_
                 events[count] = NoteEvent::PolyTuning { timing, voice_id, channel, key, tuning };
                 count += 1;
             }
-            // The lane's volume, likewise only when it is not 0 dB.
-            if volume_db != 0 {
-                let gain = db_to_gain(volume_db);
+            // The lane's volume, likewise only when it is not 0 dB. A silent
+            // step overrides it: the note is there to retrigger the pad (and
+            // cut off a sound that chokes itself), not to be heard.
+            if silent || volume_db != 0 {
+                let gain = if silent { SILENT_GAIN } else { db_to_gain(volume_db) };
                 events[count] = NoteEvent::PolyVolume { timing, voice_id, channel, key, gain };
                 count += 1;
             }
@@ -263,6 +265,11 @@ fn note_events(timed: TimedEvent) -> ([PluginNoteEvent<Bitstep>; MAX_EVENTS_PER_
         }
     }
 }
+
+/// The per-note volume a silent step is sent with: −120 dB, far below
+/// anything audible. Not 0, because CLAP's volume expression is only defined
+/// above 0 (`0 < gain <= 4`).
+const SILENT_GAIN: f32 = 1e-6;
 
 /// A lane volume in dB as the linear gain the CLAP volume expression takes
 /// (1.0 = unchanged; +12 dB is just under its ceiling of 4).
@@ -747,6 +754,30 @@ mod tests {
         // Note, pan, tuning and volume all fit.
         let (_, count) = note_events(TimedEvent::new(0, plain.with_volume(3).with_pitch(1)));
         assert_eq!(count, if cfg!(feature = "pan-expression") { 4 } else { 3 });
+    }
+
+    /// A silent step goes out as a real note (velocity 1, never 0, which
+    /// would be a note-off) with its volume at −120 dB, whatever the lane's
+    /// volume is, so it retriggers the pad without being heard.
+    #[test]
+    fn a_silent_note_on_goes_out_at_velocity_1_and_no_volume() {
+        let silent = SeqEvent::note_on(0.0, 0, 38, 0, Step::VELOCITY_SILENT, Step::PAN_CENTRE, 7);
+        for event in [silent, silent.with_volume(12), silent.with_volume(-36)] {
+            let (events, count) = note_events(TimedEvent::new(3, event));
+            let NoteEvent::NoteOn { velocity, .. } = events[0] else {
+                panic!("the note goes first: {events:?}");
+            };
+            assert_eq!(velocity, 1.0 / 127.0);
+            let gains: Vec<f32> = events[..count]
+                .iter()
+                .filter_map(|event| match *event {
+                    NoteEvent::PolyVolume { gain, .. } => Some(gain),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(gains, [SILENT_GAIN], "one volume, the silent one");
+        }
+        assert!(SILENT_GAIN > 0.0 && 20.0 * SILENT_GAIN.log10() < -119.0);
     }
 
     /// A sample pad's note is retuned to the sample root on top of its

@@ -672,7 +672,10 @@ mod tests {
         let low = too_low.to_step();
         let high = too_high.to_step();
 
-        assert_eq!((low.velocity(), low.pan(), low.ratchet(), low.probability()), (1, 0, 1, 0));
+        // Velocity 0 is a silent step, which no older save can hold: they
+        // stored every edited step's velocity as 1 or more.
+        assert_eq!((low.velocity(), low.pan(), low.ratchet(), low.probability()), (0, 0, 1, 0));
+        assert!(low.is_silent());
         assert_eq!(
             (high.velocity(), high.pan(), high.ratchet(), high.probability()),
             (Step::VELOCITY_MAX, Step::PAN_MAX, Step::RATCHET_MAX, Step::PROBABILITY_MAX)
@@ -914,6 +917,21 @@ mod tests {
         // after a reload.
         let reloaded = StepSnapshot::from_step(Step::OFF.with_pitch(5)).to_step();
         assert_eq!(reloaded.turned_on().velocity(), 100);
+    }
+
+    /// A silent step (velocity 0) comes back silent, on or off, through the
+    /// saved JSON too, where its 0 velocity is left out like any zero field.
+    #[test]
+    fn a_silent_step_round_trips() {
+        let silent = Step::default_on().with_velocity(Step::VELOCITY_SILENT);
+        for step in [silent, silent.with_on(false), silent.with_pitch(-3).with_ratchet(2)] {
+            let snapshot = StepSnapshot::from_step(step);
+            assert_eq!(snapshot.velocity, 0);
+            let json = serde_json::to_string(&snapshot).expect("a step serialises");
+            let parsed: StepSnapshot = serde_json::from_str(&json).expect("and parses back");
+            assert_eq!(parsed.to_step(), step, "{step:?} via {json}");
+            assert!(parsed.to_step().is_silent());
+        }
     }
 
     #[test]

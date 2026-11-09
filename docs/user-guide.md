@@ -69,13 +69,15 @@ plugin-window icon on bitstep's device in Bitwig to close it and open it again.
 | Turn a step off | Click an on step and release without moving. |
 | Turn a run of steps on | Click an off step and drag sideways along the row. |
 | Turn a run of steps off | Click an on step and drag sideways along the row. |
-| Change a step's velocity | Click an on step and drag **up** (louder) or **down** (softer). |
+| Change a step's velocity | Click an on step and drag **up** (louder) or **down** (softer). All the way down makes it a [silent step](#silent-steps). |
 | Edit velocity, pan, pitch, ratchet and chance | **Right-click** an on step. |
 | Edit them across a whole lane | Use the [parameter panel](#parameter-panel). |
 | Draw pitch | Switch to [pitch mode](#pitch), or use the parameter panel. |
 
 Velocity is shown by how full the cell is: a quiet step is a thin sliver and a
-full-velocity step fills the cell. New steps start at velocity 100.
+full-velocity step fills the cell. New steps start at velocity 100. A
+[silent step](#silent-steps) is drawn as an empty cell outlined in its lane's
+colour, with a slash through it.
 
 Turning a step off keeps its settings. When you turn it back on, it returns
 with the velocity, pan, ratchet and chance it had before.
@@ -84,8 +86,9 @@ with the velocity, pan, ratchet and chance it had before.
 
 Right-click an on step to open its settings:
 
-- **Velocity:** 1–127. The same value a vertical drag on the cell sets, for
-  when you want an exact number.
+- **Velocity:** 0–127. The same value a vertical drag on the cell sets, for
+  when you want an exact number. 0 shows as **Silent** (see
+  [Silent steps](#silent-steps)); you can also type `s`.
 - **Pan:** from L100 through C (centre) to R100. You can also type `C`, `L50`
   or `R50`. Pan is sent to the instrument as a per-note pan, so it only does
   something if the instrument listens to per-note pan.
@@ -104,6 +107,24 @@ dot in its corner, and a step with a pitch has a thin bar on its left edge,
 above the middle for higher and below it for lower.
 
 Each note sounds for half of its step, or half of each repeat when ratcheted.
+
+### Silent steps
+
+A step at velocity **0** is a silent step. It still sends a note, so the pad
+is triggered again, but at no volume, so you don't hear the new hit.
+
+Use it to cut a sound off at a chosen step. Set the pad to choke itself in
+the Drum Machine (see [Cutting a sound off](#cutting-a-sound-off-choke)), then
+put a silent step where the sound should stop: the silent hit chokes the one
+still ringing.
+
+To make one, drag an on step all the way down, draw at the very bottom of the
+**Velocity** panel, or set **Velocity** to 0 in the step's settings. Drag it
+back up to make it play again. It's saved like any other step.
+
+A silent step needs the instrument to respond to per-note volume, as
+[lane volume](#lane-volume) does. Drum Machine pads do. An instrument that
+ignores it plays a silent step as a very quiet note (velocity 1).
 
 ## Pitch
 
@@ -175,7 +196,8 @@ chance, ratchet) at once.
 | Reset a step | **Right-click** its bar (velocity 100, pan centre, pitch 0, chance 100%, ratchet 1). |
 
 Pan and pitch bars grow up or down from a centre line; the others grow up from
-the bottom. Pointing at a bar shows its exact value under the buttons.
+the bottom. The very bottom of the **Velocity** panel is a
+[silent step](#silent-steps). Pointing at a bar shows its exact value under the buttons.
 
 You can draw on any step, including ones that are off: their bars are drawn
 dimmer, and drawing never turns steps on or off. Whatever you draw on an off
@@ -260,11 +282,15 @@ make a sound cut itself off when it plays again, or have a closed hi-hat cut
 an open one, set it up in the Drum Machine: right-click a pad and set its
 **Choke** options.
 
+With a pad that chokes itself, a [silent step](#silent-steps) cuts the sound
+off without playing a new one, so you choose where each hit ends.
+
 ### Lanes that play the same note
 
 Several lanes can play the same note, for example a kick lane and a copy of it
 with a different pattern. If two of them hit at exactly the same moment, the
-note plays once, at the velocity of the upper lane. If one lane hits while
+note plays once, at the velocity of the upper lane (if one of them is a
+[silent step](#silent-steps), the one that sounds wins). If one lane hits while
 the note from another is still sounding, the old note stops and the new one
 starts.
 
@@ -558,9 +584,10 @@ window size, view, follow setting and scroll position are not saved.
   middle C as C4, bitstep's names will read one octave lower than Bitwig's.
 - **Pan, pitch and lane volume depend on the instrument.** If an instrument
   ignores per-note pan, pitch or volume, those settings have no effect.
-- **The quietest velocity is 1, and it still plays.** A note can't have a
-  velocity of 0 (in MIDI that means "note off"). How quiet velocity 1 sounds
-  is up to the instrument: if quiet steps are still too loud, raise the
-  instrument's velocity sensitivity, lower the lane's volume, or turn the step
-  off or its chance down instead.
+- **Velocity 0 is a silent step, not a very quiet one.** A note can't be sent
+  with velocity 0 (in MIDI that means "note off"), so a
+  [silent step](#silent-steps) is sent as velocity 1 with its volume turned
+  all the way down. The quietest step you hear is velocity 1, and how quiet
+  that is depends on the instrument: if quiet steps are still too loud, raise
+  the instrument's velocity sensitivity or lower the lane's volume.
 - **Linux only** for now.
