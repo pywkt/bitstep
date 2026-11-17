@@ -293,6 +293,13 @@ pub const ARRANGE_IDLE_FACTOR: f32 = 0.55;
 /// The lines inside a stretched block where its pattern starts again.
 pub const ARRANGE_REPEAT_LINE: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 90);
 
+/// How thick the accent outline round a selected song block is.
+pub const ARRANGE_SELECTED_WIDTH: f32 = 2.0;
+
+/// The wash inside a selection box being drawn: [`ACCENT`] at 20%
+/// (premultiplied).
+pub const SELECTION_FILL: Color32 = Color32::from_rgba_premultiplied(17, 31, 43, 51);
+
 /// The colour of pattern `pattern`'s blocks: the lane palette in turn, so
 /// neighbouring rows are told apart at a glance.
 pub fn pattern_colour(pattern: usize) -> Color32 {

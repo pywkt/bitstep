@@ -38,7 +38,7 @@ pub mod theme;
 use crate::BitstepParams;
 use crate::engine::BlockCtx;
 use crate::model::{
-    Lane, LaneData, MAX_LANES, NUM_PATTERNS, Playhead, SeqData, SeqModel, Step,
+    Lane, LaneData, MAX_LANES, NUM_PATTERNS, Playhead, SeqData, SeqModel, SongBlock, Step,
 };
 use crate::sequencer::{Modifier, NoteValue, Prng, Rate, lane_is_audible};
 use crate::state;
@@ -278,11 +278,12 @@ pub struct BitstepEditor {
     /// in between.
     paged_for: Option<usize>,
     /// Which view the window shows: the steps of one pattern, or the song
-    /// grid. GUI-only, and the grid only in song mode: turning song mode on
-    /// shows the grid, off goes back to the steps ([`Self::follow_song_mode`]).
+    /// grid. GUI-only, and open in or out of song mode (the Grid button or
+    /// Tab flips it); turning song mode on also shows the grid
+    /// ([`Self::follow_song_mode`]).
     view: View,
-    /// Song mode as the GUI last saw it, so a change from anywhere (the
-    /// toggle, a project load) switches the view once.
+    /// Song mode as the GUI last saw it, so turning it on from anywhere (the
+    /// toggle, a project load) shows the grid once.
     song_on: bool,
     /// How far the arranger is scrolled, in points: its own offset, so
     /// switching views keeps each where it was.
@@ -290,6 +291,10 @@ pub struct BitstepEditor {
     /// A block being moved or resized in the arranger, while the button is
     /// down ([`arrange::ArrangeGesture`]).
     arrange_gesture: Option<arrange::ArrangeGesture>,
+    /// The song grid's selected blocks, which a drag moves and Delete
+    /// deletes together. GUI-only; blocks the song no longer holds (an undo,
+    /// a project load) drop out of it each frame.
+    arrange_selection: Vec<SongBlock>,
     /// The block the last press in the arranger placed, while presses keep
     /// landing on it: a double-click on an empty bar must place, not open.
     arrange_placed: Option<crate::model::SongBlock>,
@@ -732,6 +737,7 @@ impl BitstepEditor {
             song_on: false,
             arrange_scroll: Vec2::ZERO,
             arrange_gesture: None,
+            arrange_selection: Vec::new(),
             arrange_placed: None,
             rng: Prng::new(clock_seed()),
             scroll: Vec2::ZERO,
@@ -750,7 +756,7 @@ impl BitstepEditor {
     /// The window split for the view on show: the steps view with its
     /// parameter panel (when open), the arranger with its ruler.
     fn layout(&self, full: Rect) -> EditorLayout {
-        let layout = match self.view {
+        match self.view {
             View::Steps => {
                 let panel = if self.panel_open { theme::PARAM_PANEL_HEIGHT } else { 0.0 };
                 EditorLayout::from_theme(full).with_panel(panel)
@@ -759,18 +765,21 @@ impl BitstepEditor {
                 EditorLayout::new(full, theme::TOP_BAR_HEIGHT, theme::ARRANGE_HEADER_WIDTH)
                     .with_ruler(theme::ARRANGE_RULER_HEIGHT)
             }
-        };
-        layout.with_view_toggle(self.song_on)
+        }
     }
 
-    /// Keeps the view in step with song mode: when it turns on the grid is
-    /// shown, when it turns off the steps are (the grid is for song mode
-    /// only). Nothing changes while it stays the same, so the view toggle
-    /// can pick the steps in song mode.
+    /// Shows the grid when song mode turns on, from anywhere (the Song
+    /// button, a project saved with it on): the song is what is about to
+    /// play. Turning it off leaves the view alone — the grid is a view of
+    /// its own (changed 2026-11-17 at the user's request; it used to be
+    /// song mode only). Nothing changes while song mode stays the same, so
+    /// the view toggle is free to pick either view.
     fn follow_song_mode(&mut self, on: bool) {
         if on != self.song_on {
             self.song_on = on;
-            self.show_view(if on { View::Arrange } else { View::Steps });
+            if on {
+                self.show_view(View::Arrange);
+            }
         }
     }
 
@@ -1485,6 +1494,10 @@ impl BitstepEditor {
         if delta == Vec2::ZERO || !delta.is_finite() {
             return;
         }
+        // Sideways runs the other way to egui's default (the user's choice,
+        // 2026-11-17): a delta that would move the content left moves the
+        // view left instead. Up/down is egui's.
+        let delta = Vec2::new(-delta.x, delta.y);
         // Each view keeps its own offset; the arranger clamps its own the
         // next frame, as `settle_scroll` does the strip's.
         match self.view {
@@ -2378,8 +2391,9 @@ impl BitstepEditor {
             || self.arrange_gesture.is_some()
     }
 
-    /// Tab switches song mode on and off, as the Song button does
-    /// ([`keys::is_song_toggle`]). `on` is whether song mode is on now.
+    /// Tab flips between the song grid and the steps, as the Grid button
+    /// does ([`keys::is_view_toggle`]), in or out of song mode. It used to
+    /// switch song mode itself; the user asked for the view (2026-11-17).
     ///
     /// Left alone while a name is being typed, or a menu or the step
     /// popover is open, so Tab still does what it does there. Otherwise
@@ -2388,7 +2402,7 @@ impl BitstepEditor {
     /// before the frame starts — is cancelled, so no button is left
     /// focused for Enter to press. Held down, it switches once; pressed
     /// mid-gesture, it is dropped, as undo is.
-    fn handle_song_key(&mut self, ui: &egui::Ui, on: bool) {
+    fn handle_view_key(&mut self, ui: &egui::Ui) {
         if ui.ctx().text_edit_focused()
             || Popup::is_any_open(ui.ctx())
             || self.popover.is_some()
@@ -2402,7 +2416,7 @@ impl BitstepEditor {
                 let egui::Event::Key { key, pressed, repeat, modifiers, .. } = event else {
                     return true;
                 };
-                if !keys::is_song_toggle(*key, *modifiers) {
+                if !keys::is_view_toggle(*key, *modifiers) {
                     return true;
                 }
                 seen = true;
@@ -2416,8 +2430,15 @@ impl BitstepEditor {
             ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
         }
         if presses % 2 == 1 && !self.busy(ui) {
-            self.model.set_song_on(!on);
-            self.follow_song_mode(!on);
+            self.toggle_view();
+        }
+    }
+
+    /// Flips between the song grid and the steps: the Grid button and Tab.
+    fn toggle_view(&mut self) {
+        match self.view {
+            View::Steps => self.show_view(View::Arrange),
+            View::Arrange => self.show_view(View::Steps),
         }
     }
 
@@ -2501,7 +2522,7 @@ impl BitstepEditor {
             }
             toggle.on_hover_text(
                 "Song mode: play the patterns placed on the song grid, \
-                 following Bitwig's timeline (Tab)",
+                 following Bitwig's timeline",
             );
         }
 
@@ -2510,12 +2531,12 @@ impl BitstepEditor {
             let shown = self.view == View::Arrange;
             let toggle = ui.put(slot, Button::new(ARRANGE_LABEL).selected(shown));
             if toggle.clicked() {
-                self.show_view(if shown { View::Steps } else { View::Arrange });
+                self.toggle_view();
             }
             toggle.on_hover_text(match shown {
                 true => "Showing the song grid. Click to edit the selected pattern's steps \
-                         (or double-click a block to edit its pattern).",
-                false => "Back to the song grid",
+                         (or double-click a block to edit its pattern). (Tab)",
+                false => "Show the song grid (Tab)",
             });
         }
 
@@ -3554,6 +3575,8 @@ impl NiceEguiApp for BitstepEditor {
         // Before any widget looks at this frame's keys, and undo before the
         // forwarding, which would hand Ctrl+Z to the host.
         self.handle_history(ui);
+        // Before the forwarding too, which would hand Ctrl+A to the host.
+        self.handle_arrange_keys(ui);
         self.forward_host_keys(ui, frame);
 
         // One `get()` per frame, as on the audio thread — the shape must not
@@ -3562,8 +3585,8 @@ impl NiceEguiApp for BitstepEditor {
         let pattern = self.shown_pattern();
         self.follow_song_mode(data.song.is_on());
         // After the view has caught up with the song, and before the layout,
-        // which has a Grid button only in song mode.
-        self.handle_song_key(ui, data.song.is_on());
+        // which depends on the view.
+        self.handle_view_key(ui);
         let layout = self.layout(ui.max_rect());
         match self.view {
             View::Steps => self.ui_steps(ui, &layout, &data, pattern),
@@ -3925,8 +3948,9 @@ mod tests {
         // nice-plug-egui hands `NiceEguiApp::ui`.
         let mut output = ctx.run_ui(input, |ui| {
             app.handle_history(ui);
+            app.handle_arrange_keys(ui);
             app.follow_song_mode(data.song.is_on());
-            app.handle_song_key(ui, data.song.is_on());
+            app.handle_view_key(ui);
             let layout = test_layout(app, ui.max_rect());
             match app.view {
                 View::Steps => {
@@ -4907,8 +4931,9 @@ mod tests {
         click_at(&mut app, &ctx, toggle);
         assert!(app.follow, "and back on");
 
-        // Nothing is playing, so the wheel has the offset to itself. A wheel
-        // that moves the content left scrolls the strip right; how far is
+        // Nothing is playing, so the wheel has the offset to itself. Sideways
+        // is reversed from egui's default: a wheel that would move the
+        // content right scrolls the strip right; how far is
         // egui's (it smooths a notch over several frames), so this checks the
         // direction and that the offset stays legal.
         app.follow = false;
@@ -4926,7 +4951,7 @@ mod tests {
             run_frame(
                 &mut app,
                 &ctx,
-                vec![egui::Event::PointerMoved(over_grid), wheel(egui::vec2(-40.0, 0.0))],
+                vec![egui::Event::PointerMoved(over_grid), wheel(egui::vec2(40.0, 0.0))],
             );
         }
         // The wheel is spent on the offset the *next* frame draws through, so
@@ -4944,7 +4969,7 @@ mod tests {
             run_frame(
                 &mut app,
                 &ctx,
-                vec![egui::Event::PointerMoved(over_grid), wheel(egui::vec2(40.0, 0.0))],
+                vec![egui::Event::PointerMoved(over_grid), wheel(egui::vec2(-40.0, 0.0))],
             );
         }
         let view = app.settle_scroll(&layout, &model.shared(), 0);
@@ -5628,10 +5653,9 @@ mod tests {
         crate::model::SongBlock { pattern, start, bars }
     }
 
-    /// The Song toggle switches song mode and shows the song grid with it
-    /// (and the steps again when it goes off); the Grid toggle, there in
-    /// song mode only, flips the view on its own, without touching what
-    /// plays.
+    /// The Grid toggle is always there and flips the view on its own,
+    /// without touching what plays. The Song toggle switches song mode and
+    /// shows the grid when it turns on; turning it off leaves the view alone.
     #[test]
     fn song_mode_and_the_grid_toggle_switch_the_view() {
         let model = Arc::new(SeqModel::new(state::default_data()));
@@ -5640,31 +5664,37 @@ mod tests {
         let ctx = egui::Context::default();
         theme::apply(&ctx);
         let off = test_layout(&app, test_window());
-        assert!(!off.arrange_button().is_positive(), "no grid toggle out of song mode");
+        assert!(off.arrange_button().is_positive(), "the grid toggle out of song mode too");
+
+        // The grid out of song mode: a view, nothing more.
+        click_at(&mut app, &ctx, off.arrange_button().center());
+        assert_eq!(app.view, View::Arrange);
+        assert!(!model.shared().song.is_on(), "the grid does not switch song mode");
+        let layout = test_layout(&app, test_window());
+        assert!(layout.ruler().height() > 0.0);
+        click_at(&mut app, &ctx, layout.arrange_button().center());
+        assert_eq!(app.view, View::Steps);
 
         click_at(&mut app, &ctx, off.song_button().center());
         assert!(model.shared().song.is_on());
         assert_eq!(app.view, View::Arrange, "song mode opens the grid");
-        assert!(test_layout(&app, test_window()).ruler().height() > 0.0);
         let layout = test_layout(&app, test_window());
-        assert!(layout.arrange_button().is_positive());
-
         click_at(&mut app, &ctx, layout.arrange_button().center());
         assert_eq!(app.view, View::Steps, "the steps, with the song still on");
         assert!(model.shared().song.is_on());
-        click_at(&mut app, &ctx, layout.arrange_button().center());
+        click_at(&mut app, &ctx, off.arrange_button().center());
         assert_eq!(app.view, View::Arrange);
 
         click_at(&mut app, &ctx, layout.song_button().center());
         assert!(!model.shared().song.is_on());
-        assert_eq!(app.view, View::Steps, "song mode off goes back to the steps");
-        assert!(!test_layout(&app, test_window()).arrange_button().is_positive());
+        assert_eq!(app.view, View::Arrange, "song mode off stays on the grid");
     }
 
-    /// Tab switches song mode as the Song button does, takes no widget's
-    /// focus with it, and leaves Shift+Tab and a held repeat alone.
+    /// Tab flips the view as the Grid button does, in or out of song mode,
+    /// never switches song mode, takes no widget's focus with it, and leaves
+    /// Shift+Tab and a held repeat alone.
     #[test]
-    fn tab_switches_song_mode() {
+    fn tab_flips_between_the_grid_and_the_steps() {
         let model = Arc::new(SeqModel::new(state::default_data()));
         let params = Arc::new(BitstepParams::new(Arc::clone(&model)));
         let mut app = BitstepEditor::new(params, Arc::clone(&model), Arc::new(Playhead::new()));
@@ -5674,8 +5704,8 @@ mod tests {
         run_frame(&mut app, &ctx, Vec::new());
 
         press_key(&mut app, &ctx, egui::Key::Tab, none);
-        assert!(model.shared().song.is_on());
-        assert_eq!(app.view, View::Arrange, "song mode opens the grid");
+        assert_eq!(app.view, View::Arrange, "Tab opens the grid");
+        assert!(!model.shared().song.is_on(), "without switching song mode on");
         assert_eq!(ctx.memory(|memory| memory.focused()), None, "no widget took the focus");
 
         // egui marks a press of a key that is still down as a repeat.
@@ -5687,19 +5717,29 @@ mod tests {
             modifiers: none,
         };
         run_frame(&mut app, &ctx, vec![tab(true)]);
-        assert!(!model.shared().song.is_on());
-        assert_eq!(app.view, View::Steps, "song mode off goes back to the steps");
+        assert_eq!(app.view, View::Steps, "and goes back to the steps");
         assert_eq!(ctx.memory(|memory| memory.focused()), None);
         run_frame(&mut app, &ctx, vec![tab(true)]);
         run_frame(&mut app, &ctx, vec![tab(true), tab(false)]);
-        assert!(!model.shared().song.is_on(), "a held Tab switches once");
+        assert_eq!(app.view, View::Steps, "a held Tab flips once");
+
+        // In song mode it flips the view and leaves the song playing.
+        model.set_song_on(true);
+        run_frame(&mut app, &ctx, Vec::new());
+        assert_eq!(app.view, View::Arrange);
+        press_key(&mut app, &ctx, egui::Key::Tab, none);
+        assert_eq!(app.view, View::Steps);
+        assert!(model.shared().song.is_on(), "Tab never switches song mode off");
+        press_key(&mut app, &ctx, egui::Key::Tab, none);
+        assert_eq!(app.view, View::Arrange);
+        assert!(model.shared().song.is_on());
 
         press_key(&mut app, &ctx, egui::Key::Tab, egui::Modifiers::SHIFT);
-        assert!(!model.shared().song.is_on(), "Shift+Tab is not the shortcut");
+        assert_eq!(app.view, View::Arrange, "Shift+Tab is not the shortcut");
     }
 
-    /// Song mode switched from outside the toggle — a project loaded with it
-    /// on, then one with it off — moves the view the same way.
+    /// Song mode switched on from outside the toggle — a project loaded with
+    /// it on — shows the grid; switched off, the view stays where it is.
     #[test]
     fn the_view_follows_song_mode_set_from_anywhere() {
         let model = Arc::new(SeqModel::new(state::default_data()));
@@ -5718,10 +5758,12 @@ mod tests {
         run_frame(&mut app, &ctx, Vec::new());
         assert_eq!(app.view, View::Steps);
 
-        app.show_view(View::Arrange);
         model.set_song_on(false);
         run_frame(&mut app, &ctx, Vec::new());
-        assert_eq!(app.view, View::Steps, "no grid out of song mode");
+        assert_eq!(app.view, View::Steps);
+        app.show_view(View::Arrange);
+        run_frame(&mut app, &ctx, Vec::new());
+        assert_eq!(app.view, View::Arrange, "the grid stays open out of song mode");
     }
 
     /// The arranger's pattern column is much narrower than a lane header,
@@ -5946,6 +5988,108 @@ mod tests {
         run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(body), right(true)]);
         run_frame(&mut app, &ctx, vec![right(false)]);
         assert_eq!(blocks(), [song_block(4, 0, 1)]);
+    }
+
+    /// [`drag_between`] with `modifiers` held down (Shift, Ctrl).
+    fn drag_held(
+        app: &mut BitstepEditor,
+        ctx: &egui::Context,
+        from: Pos2,
+        to: Pos2,
+        modifiers: egui::Modifiers,
+    ) {
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers,
+        };
+        run_frame_held(app, ctx, vec![egui::Event::PointerMoved(from)], modifiers);
+        let press = vec![egui::Event::PointerMoved(from), button(from, true)];
+        run_frame_held(app, ctx, press, modifiers);
+        run_frame_held(app, ctx, vec![egui::Event::PointerMoved(to)], modifiers);
+        run_frame_held(app, ctx, vec![button(to, false)], modifiers);
+    }
+
+    /// Several blocks at once: Shift+click picks them, a drag on one moves
+    /// them all (across rows too) as one undo step, a Shift+drag box adds
+    /// what it touches, Escape clears, Ctrl+A takes every block, a
+    /// right-click on a selected block deletes the selection, and Delete
+    /// does too.
+    #[test]
+    fn selected_blocks_move_and_delete_together() {
+        let (model, mut app, ctx) = arranger();
+        let start = [song_block(0, 0, 2), song_block(1, 0, 1), song_block(2, 4, 1)];
+        model.set_song_blocks([start.as_slice(), &[song_block(5, 8, 2)]].concat());
+        let view = arrange_view(&app);
+        let blocks = || model.shared().song.blocks().to_vec();
+        let shift = egui::Modifiers::SHIFT;
+        let ctrl = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
+        run_frame(&mut app, &ctx, Vec::new());
+        model.commit_edits();
+
+        click_held(&mut app, &ctx, view.cell_rect(0, 1).center(), shift);
+        pause(&mut app, &ctx);
+        click_held(&mut app, &ctx, view.cell_rect(1, 0).center(), shift);
+        assert_eq!(app.arrange_selection, [song_block(0, 0, 2), song_block(1, 0, 1)]);
+        assert_eq!(blocks().len(), 4, "Shift+click selects, it places nothing");
+
+        // Grabbed by pattern 1's block, one row down and three bars on:
+        // both move, and pattern 2's lands just clear of pattern 3's.
+        pause(&mut app, &ctx);
+        drag_between(&mut app, &ctx, view.cell_rect(0, 0).center(), view.cell_rect(1, 3).center());
+        assert_eq!(
+            blocks(),
+            [song_block(1, 3, 2), song_block(2, 3, 1), song_block(2, 4, 1), song_block(5, 8, 2)]
+        );
+        assert_eq!(app.arrange_selection, [song_block(1, 3, 2), song_block(2, 3, 1)]);
+        pause(&mut app, &ctx);
+        assert!(model.undo(), "the group move is one step");
+        assert_eq!(blocks()[..3], start);
+        assert!(model.redo());
+
+        // Escape clears; a Shift+drag box from an empty bar adds what it
+        // touches (rows 2-5 around bars 4-8).
+        press_key(&mut app, &ctx, egui::Key::Escape, egui::Modifiers::NONE);
+        run_frame(&mut app, &ctx, Vec::new());
+        assert!(app.arrange_selection.is_empty());
+        let (from, to) = (view.cell_rect(3, 5).center(), view.cell_rect(5, 8).center());
+        drag_held(&mut app, &ctx, from, to, shift);
+        assert_eq!(app.arrange_selection, [song_block(5, 8, 2)], "only what the box touched");
+        assert_eq!(blocks().len(), 4, "the box placed nothing");
+
+        // A plain click on a block outside the selection selects it alone.
+        pause(&mut app, &ctx);
+        click_at(&mut app, &ctx, view.cell_rect(2, 4).center());
+        assert_eq!(app.arrange_selection, [song_block(2, 4, 1)]);
+
+        // Ctrl+A, then a right-click on a selected block: all gone, in one
+        // undo step.
+        press_key(&mut app, &ctx, egui::Key::A, ctrl);
+        assert_eq!(app.arrange_selection.len(), 4);
+        pause(&mut app, &ctx);
+        let body = view.cell_rect(5, 8).center();
+        let right = |pressed| egui::Event::PointerButton {
+            pos: body,
+            button: PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(body), right(true)]);
+        run_frame(&mut app, &ctx, vec![right(false)]);
+        assert!(blocks().is_empty());
+        assert!(app.arrange_selection.is_empty());
+        pause(&mut app, &ctx);
+        assert!(model.undo());
+        assert_eq!(blocks().len(), 4, "one undo brings them all back");
+
+        // Delete deletes the selection, and nothing without one.
+        run_frame(&mut app, &ctx, Vec::new());
+        press_key(&mut app, &ctx, egui::Key::Delete, egui::Modifiers::NONE);
+        assert_eq!(blocks().len(), 4, "nothing selected, nothing deleted");
+        click_held(&mut app, &ctx, view.cell_rect(2, 4).center(), shift);
+        press_key(&mut app, &ctx, egui::Key::Delete, egui::Modifiers::NONE);
+        assert_eq!(blocks().len(), 3);
     }
 
     /// A double-click on a block opens its pattern in the steps view; a

@@ -1445,6 +1445,66 @@ impl SeqModel {
         .is_some()
     }
 
+    /// Moves every block in `blocks` together, `rows` patterns down (up when
+    /// negative) and `bars` bars later (earlier when negative), keeping each
+    /// one's length — the song grid's group move, as one shape edit and so
+    /// one undo step. `false` (nothing moved) if any of them is not in the
+    /// song as given, would leave the grid, or would overlap a block that is
+    /// not moving. Blocks moving together keep their places relative to each
+    /// other, so they cannot run into one another.
+    pub fn move_blocks(&self, blocks: &[SongBlock], rows: i32, bars: i64) -> bool {
+        self.song_edit(|song| {
+            if blocks.is_empty() || !blocks.iter().all(|block| song.blocks().contains(block)) {
+                return None;
+            }
+            if (rows, bars) == (0, 0) {
+                return Some((None, ()));
+            }
+            let mut moved = Vec::with_capacity(blocks.len());
+            for block in blocks {
+                let pattern = i64::from(block.pattern) + i64::from(rows);
+                let start = i64::from(block.start) + bars;
+                let end = start + i64::from(block.bars);
+                let fits = (0..NUM_PATTERNS as i64).contains(&pattern)
+                    && start >= 0
+                    && end <= i64::from(MAX_SONG_BARS);
+                if !fits {
+                    return None;
+                }
+                moved.push(SongBlock { pattern: pattern as u8, start: start as u32, ..*block });
+            }
+            let staying: Vec<SongBlock> =
+                song.blocks().iter().copied().filter(|block| !blocks.contains(block)).collect();
+            let clashes = moved.iter().any(|block| {
+                staying.iter().any(|other| {
+                    other.pattern == block.pattern && other.overlaps(block.start, block.end())
+                })
+            });
+            if clashes {
+                return None;
+            }
+            let mut all = staying;
+            all.extend(moved);
+            Some((Some(all), ()))
+        })
+        .is_some()
+    }
+
+    /// Deletes every block in `blocks` that is in the song, as one shape
+    /// edit. Returns how many went.
+    pub fn remove_blocks(&self, blocks: &[SongBlock]) -> usize {
+        self.song_edit(|song| {
+            let kept: Vec<SongBlock> =
+                song.blocks().iter().copied().filter(|block| !blocks.contains(block)).collect();
+            let removed = song.len() - kept.len();
+            if removed == 0 {
+                return None;
+            }
+            Some((Some(kept), removed))
+        })
+        .unwrap_or(0)
+    }
+
     /// Replaces every block of the song with `blocks` (repaired as
     /// [`Song::from_blocks`] repairs them), keeping song mode and looping
     /// as they are.
@@ -3527,6 +3587,45 @@ mod tests {
         model.set_song_blocks(vec![block(7, 1, 2), block(7, 2, 2)]);
         assert_eq!(blocks(), [block(7, 1, 2)], "repaired");
         assert!(model.shared().song.is_on(), "kept on");
+    }
+
+    /// A group of blocks moves together as one edit, or not at all: off the
+    /// grid or onto a block that stays put refuses the whole move, and the
+    /// blocks moving cannot get in each other's way.
+    #[test]
+    fn several_blocks_move_and_delete_together() {
+        let model = SeqModel::empty();
+        let block = |pattern, start, bars| SongBlock { pattern, start, bars };
+        let blocks = || model.shared().song.blocks().to_vec();
+        model.set_song_blocks(vec![block(0, 0, 2), block(0, 2, 2), block(1, 0, 4), block(2, 8, 1)]);
+
+        // Pattern 1's two blocks and pattern 2's, four bars later: the
+        // second of pattern 1's lands where its neighbour was, which is
+        // fine because that one is moving too.
+        let group = [block(0, 0, 2), block(0, 2, 2), block(1, 0, 4)];
+        assert!(model.move_blocks(&group, 0, 2));
+        assert_eq!(blocks(), [block(0, 2, 2), block(1, 2, 4), block(0, 4, 2), block(2, 8, 1)]);
+        let group = [block(0, 2, 2), block(0, 4, 2), block(1, 2, 4)];
+
+        let undo_edits = model.edits.load(Relaxed);
+        assert!(!model.move_blocks(&group, 0, -3), "bar 1 is the earliest");
+        assert!(!model.move_blocks(&group, -1, 0), "pattern 1 is the top row");
+        assert!(!model.move_blocks(&group, 1, 4), "pattern 3's block is in the way");
+        assert!(!model.move_blocks(&group, 0, i64::from(MAX_SONG_BARS)), "off the end");
+        assert!(!model.move_blocks(&[block(5, 0, 1)], 0, 1), "not in the song");
+        assert!(!model.move_blocks(&[], 0, 1), "nothing to move");
+        assert_eq!(model.shared().song.len(), 4, "every refusal left the song alone");
+        assert!(model.edits.load(Relaxed) > undo_edits, "each one took the writer");
+        assert!(model.move_blocks(&group, 0, 0), "nowhere is a move");
+
+        // Down a row: pattern 1's blocks become pattern 2's and pattern 2's
+        // become pattern 3's, clear of pattern 3's own block at bar 9.
+        assert!(model.move_blocks(&group, 1, -2));
+        assert_eq!(blocks(), [block(1, 0, 2), block(2, 0, 4), block(1, 2, 2), block(2, 8, 1)]);
+
+        assert_eq!(model.remove_blocks(&[block(1, 0, 2), block(2, 8, 1), block(9, 9, 9)]), 2);
+        assert_eq!(blocks(), [block(2, 0, 4), block(1, 2, 2)]);
+        assert_eq!(model.remove_blocks(&[block(9, 9, 9)]), 0, "none of them there");
     }
 
     /// Only exactly what a new lane starts with counts as pristine.

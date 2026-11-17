@@ -38,7 +38,7 @@ beat of the bar.
 ```
 
 - **Top bar:** the pattern buttons with page arrows either side, the
-  **Steps / Pitch** mode switch, **Song** and, in song mode, **Grid** (see
+  **Steps / Pitch** mode switch, **Song** and **Grid** (see
   [Song mode](#song-mode)), **Undo / Redo** (see [Undo](#undo)), a status
   line, **Params** (shows or hides the parameter panel), **+ Lane**, and
   **Follow**.
@@ -401,12 +401,15 @@ place a pattern by clicking in its row, and anything placed in the same bars
 on different rows plays together. Nothing is recorded, so when you change a
 pattern, every part of the song that uses it changes too.
 
-1. Click **Song** in the top bar, or press **Tab**. Song mode turns on, the
-   song grid takes the place of the steps, and a **Grid** button appears next
-   to **Song**.
+1. Click **Song** in the top bar. Song mode turns on and the song grid takes
+   the place of the steps.
 2. Click in a pattern's row at the bar where it should start. The pattern is
    placed there as a block, as long as the pattern itself (see below).
 3. Press play in Bitwig. The song starts at bar 1 of Bitwig's arranger.
+
+**Grid** (or **Tab**) switches between the song grid and the steps at any
+time, in or out of song mode, so you can arrange a song before turning song
+mode on. It never changes what plays.
 
 ```
  [Loop] 12 bars │ 1       5       9       13
@@ -429,6 +432,19 @@ pattern, every part of the song that uses it changes too.
   inside the block mark where). A block shorter than its pattern cuts it off.
 - **Delete:** right-click a block.
 - **Escape** while dragging puts the block back where it was.
+- **Select several blocks:** click a block to select it, then **Shift+click**
+  (or Ctrl+click) others to add them, or Shift+click a selected one to take it
+  out again. **Shift+drag** from an empty bar draws a box that selects every
+  block it touches, and **Ctrl+A** selects every block in the song. Selected
+  blocks have a blue outline. **Escape** (when nothing is being dragged)
+  clears the selection.
+- **Move several blocks:** drag any selected block and the whole selection
+  moves with it, left and right and up and down, keeping its shape. It stops
+  at bar 1 and at the top and bottom rows, and won't drop onto a block that
+  isn't selected. For example, to make room at the start of a song, press
+  **Ctrl+A** and drag everything to the right.
+- **Delete several blocks:** right-click any selected block, or press
+  **Delete**, and the whole selection goes.
 - **Select a pattern:** click its name on the left. The row is highlighted,
   and it's the pattern you see if you click **Grid** to switch to the steps.
 - **Name a pattern:** double-click its name on the left and type, for example
@@ -471,11 +487,10 @@ What else to know:
   are sounding turn blue. With **Follow** on, the grid scrolls to keep the
   line in view. Scroll the grid with the mouse wheel (rows) and Shift + wheel
   (bars).
-- **Grid switches between the song grid and the steps** while song mode is
-  on, without changing what plays: click it to edit the selected pattern's
-  steps, and again to come back. It's only there in song mode. Turning song
-  mode off goes back to the steps, and the pattern buttons play one pattern
-  at a time again.
+- **Grid switches between the song grid and the steps** without changing what
+  plays: click it (or press **Tab**) to edit the selected pattern's steps, and
+  again to come back. Out of song mode the grid is still there to arrange on,
+  but it doesn't play: the pattern buttons pick the one pattern that plays.
 - **Editing while it plays:** in the steps view, the pattern buttons only
   choose which pattern you edit. The playhead shows in the steps only while
   the pattern on screen is sounding in the song. A pattern button's number is
@@ -486,15 +501,15 @@ What else to know:
   open with that order laid out on the grid, one block after another from
   bar 1. A silent bar (`0`) at the very end of an old order is dropped, since
   the song now ends with its last block.
-- Click **Song** again, or press **Tab**, to go back to playing one pattern
-  at a time.
+- Click **Song** again to go back to playing one pattern at a time. The view
+  stays where it is.
 
 ## Scrolling and follow
 
 - **Mouse wheel:** scrolls lanes (or, in the song grid, patterns) up and
   down, when there are more than fit.
-- **Shift + wheel** (or a horizontal scroll): scrolls steps (or bars) left
-  and right.
+- **Shift + wheel** (or a sideways swipe on a touchpad): scrolls steps (or
+  bars) left and right.
 - **Follow** (on by default): keeps the playhead in view while playing.
   Turn it off if you want to scroll freely while the transport runs.
 
@@ -507,8 +522,9 @@ The current step is highlighted as it plays.
 through your edits in bitstep:
 
 - One drag is one step: a whole paint stroke, a length drag, a drawn curve
-  in the parameter panel or moving or resizing a song block is undone in one
-  go, and so is typing a lane or pattern name.
+  in the parameter panel or moving or resizing song blocks (one or several)
+  is undone in one go, and so is typing a lane or pattern name. Deleting
+  several selected blocks is one step too.
 - Everything you edit in bitstep's window can be undone: steps and their
   settings, lane settings, adding, deleting, duplicating and moving lanes,
   clear/invert/randomise/nudge/fills, pattern copies and the song grid.
@@ -524,13 +540,15 @@ undo doesn't reach changes made in Bitwig.
 ## Keyboard shortcuts
 
 While bitstep's window is in front, **Ctrl+Z** and **Ctrl+Shift+Z** / **Ctrl+Y**
-are bitstep's [undo and redo](#undo), and **Tab** turns
-[song mode](#song-mode) on and off (not while a menu or a step's settings are
-open). **Space** (play/stop), **F1–F12** and
+are bitstep's [undo and redo](#undo), and **Tab** switches between the song
+grid and the steps (not while a menu or a step's settings are open). On the
+song grid, **Ctrl+A** selects every block and **Delete** deletes the selected
+ones (see [Song mode](#song-mode)). **Space** (play/stop), **F1–F12** and
 other shortcuts held with **Ctrl** (save and so on) are passed on to Bitwig,
 so you don't have to click back into Bitwig to start the transport. To use
 Bitwig's undo, click into Bitwig first. **Escape** cancels a drag, closes a
-name you're typing without saving it, or goes back to one selected lane.
+name you're typing without saving it, goes back to one selected lane, or
+clears the song grid's block selection.
 Other keys stay with bitstep, and
 nothing is passed on while you're typing a lane name (there, Ctrl+Z undoes
 your typing).

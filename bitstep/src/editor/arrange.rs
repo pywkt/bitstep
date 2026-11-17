@@ -7,6 +7,13 @@
 //! another pattern's row), a drag of its right edge resizes it, a right-click
 //! deletes it, and a double-click opens its pattern in the steps view.
 //!
+//! Blocks can be selected to move or delete several at once: a click on a
+//! block selects it, Shift (or Ctrl) + click adds or removes one, Shift (or
+//! Ctrl) + drag on empty space draws a selection box, Ctrl+A selects every
+//! block and Escape clears the selection. A drag on a selected block moves
+//! the whole selection (sideways and across rows); a right-click on one, or
+//! Delete, deletes them all.
+//!
 //! Like the step strip it is one hand-painted widget; everything computable
 //! about it is in [`super::arrange_math`]. Every edit is a shape edit through
 //! [`crate::model::SeqModel`], so it is in the next block the audio thread
@@ -19,12 +26,12 @@ use egui::{
 use egui::text::{LayoutJob, TextWrapping};
 
 use super::arrange_math::{
-    ArrangeHit, ArrangeView, BlockMove, BlockResize, repeat_bars, ruler_label,
+    ArrangeHit, ArrangeView, BlockResize, GroupMove, SelectBox, repeat_bars, ruler_label,
 };
 use super::grid_math::EditorLayout;
 use super::{
-    BitstepEditor, NameEdit, NameEditEnd, NameTarget, name_field, pattern_is_empty, save_name,
-    step_press, theme,
+    BitstepEditor, NameEdit, NameEditEnd, NameTarget, View, keys, name_field, pattern_is_empty,
+    save_name, step_press, theme,
 };
 use crate::model::{NUM_PATTERNS, PatternBars, Playhead, SeqData, SongBlock};
 
@@ -38,15 +45,19 @@ const ROW_HEADER_ID: &str = "bitstep:arrange-row";
 /// How wide the loop/end switch in the ruler's corner is.
 const LOOP_WIDTH: f32 = 52.0;
 
-/// A block gesture in the arranger, while the button is down. Each step of
-/// it is written through the model as it happens; `at` is where the block
-/// is now, so the next step knows which block to move on.
+/// A gesture in the arranger, while the button is down. Each step of a
+/// move or resize is written through the model as it happens; `at` is where
+/// the blocks are now, so the next step knows what to move on from.
 pub(super) enum ArrangeGesture {
-    /// Moving a block.
-    Move { drag: BlockMove, at: SongBlock },
+    /// Moving the selection (one block or several), `at` (rows, bars) from
+    /// where the press found it.
+    Move { drag: GroupMove, at: (i32, i64) },
     /// Resizing a block by its right edge. `placed` is set when this press
     /// placed the block, so Escape takes it away again.
     Resize { drag: BlockResize, at: SongBlock, placed: bool },
+    /// Drawing a selection box. `base` is the selection the press started
+    /// from: the box adds to it.
+    Select { select: SelectBox, base: Vec<SongBlock> },
 }
 
 impl BitstepEditor {
@@ -64,6 +75,10 @@ impl BitstepEditor {
         let lengths = PatternBars::all(data, bar_beats);
         let viewport = layout.steps();
         let columns = ArrangeView::columns(data.song.total_bars(), viewport.width());
+        // A block undone, deleted elsewhere or replaced by a project load is
+        // no longer selected; a drag keeps the selection current itself.
+        let blocks = data.song.blocks();
+        self.arrange_selection.retain(|block| blocks.contains(block));
 
         // Where the song is, in bars from its start; only while song mode
         // is playing.
@@ -83,19 +98,23 @@ impl BitstepEditor {
         // takes — and the hover outline shows where it will go meanwhile.
         let hover = self.interact_arrange(ui, &view, data, &lengths);
         let painter = ui.painter_at(viewport);
-        let editing = self.arrange_gesture.as_ref().map(|gesture| match gesture {
-            ArrangeGesture::Move { at, .. } | ArrangeGesture::Resize { at, .. } => *at,
-        });
-        let marks = Marks { shown, hover, editing, playing };
+        let (editing, select_box) = match &self.arrange_gesture {
+            Some(ArrangeGesture::Resize { at, .. }) => (Some(*at), None),
+            Some(ArrangeGesture::Select { select, .. }) => (None, Some(select.rect(&view))),
+            _ => (None, None),
+        };
+        let selected = &self.arrange_selection;
+        let marks = Marks { shown, hover, editing, selected, select_box, playing };
         paint_arrange(&painter, &view, data, &lengths, &self.playhead, marks);
         self.ui_ruler(ui, layout, &view, data, playing);
         self.ui_row_headers(ui, layout, &view, data, &lengths, shown);
     }
 
-    /// Pointer handling for the grid: a press places, moves or resizes, a
-    /// right-click deletes, a double-click opens the pattern, and Escape
-    /// puts a running drag back. Returns what a click would land on, for
-    /// the hover outline.
+    /// Pointer handling for the grid: a press places, selects, moves or
+    /// resizes, a right-click deletes, a double-click opens the pattern, and
+    /// Escape puts a running drag back (or, with none, clears the
+    /// selection). Returns what a click would land on, for the hover
+    /// outline.
     ///
     /// [`Sense::drag`] and the raw press events, as the step strip does and
     /// for its reasons: a quick tap must place a block, and a gesture must
@@ -127,32 +146,44 @@ impl BitstepEditor {
             return None;
         }
         if response.hovered()
-            && let Some((pos, button, _)) = ui.input(step_press)
+            && let Some((pos, button, modifiers)) = ui.input(step_press)
         {
             match (button, view.hit(pos, blocks)) {
                 (
                     PointerButton::Secondary,
                     Some(ArrangeHit::Block { block, .. } | ArrangeHit::Edge { block }),
                 ) => {
-                    self.model.remove_block(block.pattern(), block.start);
+                    // On a selected block, the whole selection goes.
+                    if self.arrange_selection.contains(&block) {
+                        self.model.remove_blocks(&self.arrange_selection);
+                        self.arrange_selection.clear();
+                    } else {
+                        self.model.remove_block(block.pattern(), block.start);
+                    }
                     self.arrange_gesture = None;
                 }
-                (PointerButton::Primary, Some(hit)) => self.begin_arrange(view, hit, pos, lengths),
+                (PointerButton::Primary, Some(hit)) => {
+                    // Ctrl as well as Shift, as Ctrl+click picks lanes.
+                    let adding = modifiers.shift || modifiers.command;
+                    self.begin_arrange(view, hit, pos, lengths, adding);
+                }
                 _ => {}
             }
         }
 
-        if self.arrange_gesture.is_some() && ui.input(|input| input.key_pressed(egui::Key::Escape))
-        {
-            self.cancel_arrange();
+        if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            match self.arrange_gesture.is_some() {
+                true => self.cancel_arrange(),
+                false => self.arrange_selection.clear(),
+            }
         }
         if response.dragged_by(PointerButton::Primary) {
             if let Some(pos) = response.interact_pointer_pos() {
-                self.continue_arrange(view, pos);
+                self.continue_arrange(view, pos, blocks);
             }
         } else {
-            // Every way a drag ends leaves `dragged` false: the block is
-            // already where it was let go.
+            // Every way a drag ends leaves `dragged` false: the blocks are
+            // already where they were let go.
             self.arrange_gesture = None;
         }
 
@@ -160,6 +191,7 @@ impl BitstepEditor {
         let cursor = match (&self.arrange_gesture, hit) {
             (Some(ArrangeGesture::Move { .. }), _) => Some(CursorIcon::Grabbing),
             (Some(ArrangeGesture::Resize { .. }), _) => Some(CursorIcon::ResizeHorizontal),
+            (Some(ArrangeGesture::Select { .. }), _) => Some(CursorIcon::Crosshair),
             (None, Some(ArrangeHit::Edge { .. })) => Some(CursorIcon::ResizeHorizontal),
             (None, Some(ArrangeHit::Block { .. })) => Some(CursorIcon::Grab),
             _ => None,
@@ -170,12 +202,14 @@ impl BitstepEditor {
             ui.ctx().set_cursor_icon(cursor);
         }
         let hint = match hit {
-            Some(ArrangeHit::Empty { row, .. }) => {
-                format!("Click to place pattern {} here", row + 1)
-            }
+            Some(ArrangeHit::Empty { row, .. }) => format!(
+                "Click to place pattern {} here. Shift+drag to select several blocks.",
+                row + 1
+            ),
             Some(ArrangeHit::Block { block, .. } | ArrangeHit::Edge { block }) => format!(
                 "Pattern {}, bars {}-{}. Drag to move, drag the right edge to resize, \
-                 right-click to delete, double-click to edit the pattern.",
+                 right-click to delete, double-click to edit the pattern. \
+                 Shift+click to add it to the selection.",
                 block.pattern + 1,
                 block.start + 1,
                 block.end()
@@ -189,15 +223,21 @@ impl BitstepEditor {
         if self.arrange_gesture.is_some() { None } else { hit }
     }
 
-    /// A press landed on the grid: place a block on an empty bar (and go on
-    /// to resize it, so a press-and-drag draws a block of any length), or
-    /// pick up a block's body or its edge.
+    /// A press landed on the grid.
+    ///
+    /// Plain: place a block on an empty bar (and go on to resize it, so a
+    /// press-and-drag draws a block of any length), pick up a block's edge,
+    /// or pick up a block — the whole selection when it is one of them,
+    /// otherwise it alone, which becomes the selection. With `adding`
+    /// (Shift or Ctrl held): a block joins or leaves the selection, and an
+    /// empty bar starts a selection box.
     fn begin_arrange(
         &mut self,
         view: &ArrangeView,
         hit: ArrangeHit,
         pos: Pos2,
         lengths: &PatternBars,
+        adding: bool,
     ) {
         // The block the last press placed, for as long as presses keep
         // landing on it (see the double-click in `interact_arrange`).
@@ -208,8 +248,21 @@ impl BitstepEditor {
         if placed_hit != self.arrange_placed {
             self.arrange_placed = None;
         }
+        let selection = &mut self.arrange_selection;
         self.arrange_gesture = match hit {
+            ArrangeHit::Empty { .. } if adding => {
+                let base = selection.clone();
+                Some(ArrangeGesture::Select { select: SelectBox::begin(view, pos), base })
+            }
+            ArrangeHit::Block { block, .. } | ArrangeHit::Edge { block } if adding => {
+                match selection.iter().position(|&selected| selected == block) {
+                    Some(index) => _ = selection.remove(index),
+                    None => selection.push(block),
+                }
+                None
+            }
             ArrangeHit::Empty { row, bar } => {
+                selection.clear();
                 let Some(placed) = self.model.add_block(row, bar, lengths.of(row)) else {
                     return;
                 };
@@ -218,26 +271,32 @@ impl BitstepEditor {
                 Some(ArrangeGesture::Resize { drag, at: placed, placed: true })
             }
             ArrangeHit::Block { block, bar } => {
-                Some(ArrangeGesture::Move { drag: BlockMove::begin(block, bar), at: block })
+                if !selection.contains(&block) {
+                    *selection = vec![block];
+                }
+                let drag = GroupMove::begin(selection.clone(), block, bar);
+                Some(ArrangeGesture::Move { drag, at: (0, 0) })
             }
             ArrangeHit::Edge { block } => {
+                *selection = vec![block];
                 let drag = BlockResize::begin(view, block, pos);
                 Some(ArrangeGesture::Resize { drag, at: block, placed: false })
             }
         };
     }
 
-    /// The pointer moved with the button down: move or resize the block. A
-    /// move to where the block does not fit (over another block of that
-    /// pattern) is refused, and the block stays where it last fitted.
-    fn continue_arrange(&mut self, view: &ArrangeView, pos: Pos2) {
+    /// The pointer moved with the button down: move the selection, resize
+    /// the block, or stretch the selection box. A move to where the blocks
+    /// do not fit (over a block of the same pattern that is not moving) is
+    /// refused, and they stay where they last fitted.
+    fn continue_arrange(&mut self, view: &ArrangeView, pos: Pos2, blocks: &[SongBlock]) {
         match &mut self.arrange_gesture {
             Some(ArrangeGesture::Move { drag, at }) => {
-                let (row, start) = drag.target(view, pos);
-                if (row, start) != (at.pattern(), at.start)
-                    && self.model.move_block(at.pattern(), at.start, row, start)
-                {
-                    *at = SongBlock { pattern: row as u8, start, ..*at };
+                let want = drag.offset(view, pos);
+                let by = (want.0 - at.0, want.1 - at.1);
+                if want != *at && self.model.move_blocks(&drag.moved(*at), by.0, by.1) {
+                    *at = want;
+                    self.arrange_selection = drag.moved(want);
                 }
             }
             Some(ArrangeGesture::Resize { drag, at, .. }) => {
@@ -245,20 +304,38 @@ impl BitstepEditor {
                 if bars != at.bars
                     && let Some(got) = self.model.resize_block(at.pattern(), at.start, bars)
                 {
-                    at.bars = got;
+                    let resized = SongBlock { bars: got, ..*at };
+                    for selected in &mut self.arrange_selection {
+                        if selected == at {
+                            *selected = resized;
+                        }
+                    }
+                    *at = resized;
                 }
+            }
+            Some(ArrangeGesture::Select { select, base }) => {
+                select.drag_to(view, pos);
+                let mut selection = base.clone();
+                for block in select.blocks(view, blocks) {
+                    if !selection.contains(&block) {
+                        selection.push(block);
+                    }
+                }
+                self.arrange_selection = selection;
             }
             None => {}
         }
     }
 
-    /// Escape during a drag: the block goes back to where the press found
-    /// it, and a block the press placed is taken away again.
+    /// Escape during a drag: the blocks go back to where the press found
+    /// them, a block the press placed is taken away again, and a selection
+    /// box gives back the selection it started from.
     fn cancel_arrange(&mut self) {
         match self.arrange_gesture.take() {
             Some(ArrangeGesture::Move { drag, at }) => {
-                let from = drag.from;
-                self.model.move_block(at.pattern(), at.start, from.pattern(), from.start);
+                if self.model.move_blocks(&drag.moved(at), -at.0, -at.1) {
+                    self.arrange_selection = drag.from().to_vec();
+                }
             }
             Some(ArrangeGesture::Resize { at, placed: true, .. }) => {
                 self.model.remove_block(at.pattern(), at.start);
@@ -266,7 +343,49 @@ impl BitstepEditor {
             Some(ArrangeGesture::Resize { drag, at, placed: false }) => {
                 self.model.resize_block(at.pattern(), at.start, drag.from.bars);
             }
+            Some(ArrangeGesture::Select { base, .. }) => self.arrange_selection = base,
             None => {}
+        }
+    }
+
+    /// Ctrl+A selects every block and Delete (or Backspace) deletes the
+    /// selection — on the song grid only, and not while a name is being
+    /// typed or a menu is open. Both keys are taken out of the frame's input
+    /// so nothing else acts on them: Ctrl+A would otherwise be passed on to
+    /// the host. Pressed mid-gesture they are dropped, as undo is.
+    pub(super) fn handle_arrange_keys(&mut self, ui: &egui::Ui) {
+        if self.view != View::Arrange
+            || ui.ctx().text_edit_focused()
+            || egui::Popup::is_any_open(ui.ctx())
+        {
+            return;
+        }
+        let (mut select_all, mut delete) = (false, false);
+        ui.input_mut(|input| {
+            input.events.retain(|event| {
+                let egui::Event::Key { key, pressed, modifiers, .. } = event else {
+                    return true;
+                };
+                if keys::is_select_all(*key, *modifiers) {
+                    select_all |= *pressed;
+                    return false;
+                }
+                if matches!(key, egui::Key::Delete | egui::Key::Backspace) && !modifiers.any() {
+                    delete |= *pressed;
+                    return false;
+                }
+                true
+            });
+        });
+        if self.busy(ui) {
+            return;
+        }
+        if select_all {
+            self.arrange_selection = self.model.shared().song.blocks().to_vec();
+        }
+        if delete && !self.arrange_selection.is_empty() {
+            self.model.remove_blocks(&self.arrange_selection);
+            self.arrange_selection.clear();
         }
     }
 
@@ -477,13 +596,16 @@ pub(super) fn default_pattern_label(pattern: usize) -> String {
 }
 
 /// What the grid marks, besides the song itself: the pattern the steps view
-/// shows, what a click would land on, the block being dragged, and where
-/// the song is playing (in bars).
+/// shows, what a click would land on, the block being resized, the
+/// selected blocks, the selection box being drawn, and where the song is
+/// playing (in bars).
 #[derive(Clone, Copy)]
-struct Marks {
+struct Marks<'a> {
     shown: usize,
     hover: Option<ArrangeHit>,
     editing: Option<SongBlock>,
+    selected: &'a [SongBlock],
+    select_box: Option<Rect>,
     playing: Option<f32>,
 }
 
@@ -496,7 +618,7 @@ fn paint_arrange(
     data: &SeqData,
     lengths: &PatternBars,
     playhead: &Playhead,
-    marks: Marks,
+    marks: Marks<'_>,
 ) {
     let rows = view.visible_rows();
     let bars = view.visible_bars();
@@ -549,7 +671,10 @@ fn paint_arrange(
         if edge_lit {
             painter.rect_filled(view.edge_rect(block), theme::CELL_CORNER, theme::END_HANDLE_HOVER);
         }
-        if sounding || marks.editing == Some(block) {
+        if marks.selected.contains(&block) {
+            let stroke = egui::Stroke::new(theme::ARRANGE_SELECTED_WIDTH, theme::ACCENT);
+            painter.rect_stroke(rect, theme::CELL_CORNER, stroke, StrokeKind::Inside);
+        } else if sounding || marks.editing == Some(block) {
             let stroke = egui::Stroke::new(theme::HAIRLINE, theme::MARKER);
             painter.rect_stroke(rect, theme::CELL_CORNER, stroke, StrokeKind::Inside);
         }
@@ -569,6 +694,12 @@ fn paint_arrange(
     if let Some(block) = outlined {
         let rect = view.block_rect(block);
         painter.rect_stroke(rect, theme::CELL_CORNER, outline, StrokeKind::Inside);
+    }
+
+    if let Some(rect) = marks.select_box {
+        painter.rect_filled(rect, CornerRadius::ZERO, theme::SELECTION_FILL);
+        let stroke = egui::Stroke::new(theme::HAIRLINE, theme::ACCENT);
+        painter.rect_stroke(rect, CornerRadius::ZERO, stroke, StrokeKind::Inside);
     }
 
     if let Some(bar) = marks.playing {

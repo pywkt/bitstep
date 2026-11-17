@@ -103,6 +103,17 @@ impl ArrangeView {
         self.viewport.min.x + bar * theme::ARRANGE_BAR_PITCH - self.scroll.x
     }
 
+    /// Screen position `pos` in content coordinates: bar 0 of row 0 at the
+    /// origin, whatever the scroll.
+    pub fn content_pos(&self, pos: Pos2) -> Pos2 {
+        (pos - self.viewport.min + self.scroll).to_pos2()
+    }
+
+    /// The inverse of [`Self::content_pos`].
+    pub fn screen_pos(&self, content: Pos2) -> Pos2 {
+        content + self.viewport.min.to_vec2() - self.scroll
+    }
+
     /// The screen `y` of row `row`'s top edge.
     pub fn row_y(&self, row: usize) -> f32 {
         self.viewport.min.y + row as f32 * theme::ARRANGE_ROW_PITCH - self.scroll.y
@@ -233,6 +244,98 @@ impl BlockMove {
         let latest = MAX_SONG_BARS.saturating_sub(self.from.bars);
         let start = view.bar_at(pos.x).saturating_sub(self.grab).min(latest);
         (row, start)
+    }
+}
+
+/// Moving several blocks at once (the selection): they follow the pointer
+/// together, by whole bars and whole rows, keeping their places relative to
+/// each other and to the bar of the block that was grabbed. The group stops
+/// at the grid's edges as a whole, so dragging past bar 1 parks the earliest
+/// block on bar 1 rather than refusing the move.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupMove {
+    /// How the grabbed block alone would follow the pointer.
+    grab: BlockMove,
+    /// Every block moving, as they were when the press landed (the grabbed
+    /// one among them).
+    from: Vec<SongBlock>,
+}
+
+impl GroupMove {
+    /// A move of `blocks`, grabbed by `grabbed` (one of them) at bar `bar`.
+    pub fn begin(blocks: Vec<SongBlock>, grabbed: SongBlock, bar: u32) -> GroupMove {
+        GroupMove { grab: BlockMove::begin(grabbed, bar), from: blocks }
+    }
+
+    /// The blocks as they were when the press landed.
+    pub fn from(&self) -> &[SongBlock] {
+        &self.from
+    }
+
+    /// How far the group goes with the pointer at `pos`: rows down and bars
+    /// later, each clamped so every block stays on the grid.
+    pub fn offset(&self, view: &ArrangeView, pos: Pos2) -> (i32, i64) {
+        let (row, start) = self.grab.target(view, pos);
+        let grabbed = self.grab.from;
+        let rows = row as i64 - grabbed.pattern() as i64;
+        let bars = i64::from(start) - i64::from(grabbed.start);
+        let top = self.from.iter().map(|block| block.pattern()).min().unwrap_or(0) as i64;
+        let bottom = self.from.iter().map(|block| block.pattern()).max().unwrap_or(0) as i64;
+        let first = self.from.iter().map(|block| block.start).min().unwrap_or(0);
+        let last = self.from.iter().map(|block| block.end()).max().unwrap_or(0);
+        let rows = rows.clamp(-top, NUM_PATTERNS as i64 - 1 - bottom);
+        let bars = bars.clamp(-i64::from(first), i64::from(MAX_SONG_BARS.saturating_sub(last)));
+        (rows as i32, bars)
+    }
+
+    /// The blocks moved `offset` (rows, bars) from where they started.
+    /// Offsets come from [`Self::offset`], which keeps them on the grid.
+    pub fn moved(&self, offset: (i32, i64)) -> Vec<SongBlock> {
+        let (rows, bars) = offset;
+        self.from
+            .iter()
+            .map(|block| {
+                let top = NUM_PATTERNS as i64 - 1;
+                let pattern = (i64::from(block.pattern) + i64::from(rows)).clamp(0, top);
+                let start = (i64::from(block.start) + bars).clamp(0, i64::from(MAX_SONG_BARS));
+                SongBlock { pattern: pattern as u8, start: start as u32, ..*block }
+            })
+            .collect()
+    }
+}
+
+/// A selection box being drawn over the grid: from where the press landed
+/// to the pointer, in content coordinates, so a scroll while drawing keeps
+/// the box's far corner pinned to the grid.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelectBox {
+    /// Where the press landed, in content points (bar 0 of row 0 at 0, 0).
+    origin: Pos2,
+    /// Where the pointer is now, likewise.
+    corner: Pos2,
+}
+
+impl SelectBox {
+    /// A box started at screen position `pos`.
+    pub fn begin(view: &ArrangeView, pos: Pos2) -> SelectBox {
+        let origin = view.content_pos(pos);
+        SelectBox { origin, corner: origin }
+    }
+
+    /// The pointer moved to screen position `pos`.
+    pub fn drag_to(&mut self, view: &ArrangeView, pos: Pos2) {
+        self.corner = view.content_pos(pos);
+    }
+
+    /// The box on screen, for drawing.
+    pub fn rect(&self, view: &ArrangeView) -> Rect {
+        Rect::from_two_pos(view.screen_pos(self.origin), view.screen_pos(self.corner))
+    }
+
+    /// The blocks the box touches.
+    pub fn blocks(&self, view: &ArrangeView, blocks: &[SongBlock]) -> Vec<SongBlock> {
+        let rect = self.rect(view);
+        blocks.iter().copied().filter(|&block| view.block_rect(block).intersects(rect)).collect()
     }
 }
 
@@ -379,6 +482,50 @@ mod tests {
         assert_eq!(moving.target(&still, still.cell_rect(4, 7).center()), (4, 6));
         assert_eq!(moving.target(&still, still.cell_rect(0, 0).center()), (0, 0), "stops at bar 1");
         assert_eq!(moving.target(&still, pos2(1e9, 1e9)), (NUM_PATTERNS - 1, MAX_SONG_BARS - 3));
+    }
+
+    /// A group follows the grabbed block's bar, and stops as a whole at the
+    /// grid's edges: the earliest block parks on bar 1, the top one on the
+    /// first row, the bottom one on the last.
+    #[test]
+    fn a_moved_group_follows_the_grabbed_block_and_stops_at_the_edges() {
+        let still = view(Vec2::ZERO);
+        let group = vec![block(1, 2, 2), block(3, 5, 1)];
+        let moving = GroupMove::begin(group.clone(), block(3, 5, 1), 5);
+        assert_eq!(moving.from(), group.as_slice());
+        let at = |row, bar| still.cell_rect(row, bar).center();
+        assert_eq!(moving.offset(&still, at(3, 5)), (0, 0), "unmoved");
+        assert_eq!(moving.offset(&still, at(4, 8)), (1, 3));
+        assert_eq!(moving.moved((1, 3)), [block(2, 5, 2), block(4, 8, 1)]);
+        assert_eq!(moving.offset(&still, at(0, 0)), (-1, -2), "the group stops at row 1, bar 1");
+        assert_eq!(moving.moved((-1, -2)), [block(0, 0, 2), block(2, 3, 1)]);
+        let far = moving.offset(&still, pos2(1e9, 1e9));
+        assert_eq!(far, ((NUM_PATTERNS - 4) as i32, i64::from(MAX_SONG_BARS - 6)));
+        assert_eq!(moving.moved(far)[1].end(), MAX_SONG_BARS, "the last block ends at the edge");
+        assert_eq!(moving.moved(far)[1].pattern(), NUM_PATTERNS - 1);
+    }
+
+    /// The selection box picks every block it touches, and keeps its start
+    /// pinned to the grid when the view scrolls under it.
+    #[test]
+    fn a_selection_box_picks_the_blocks_it_touches() {
+        let still = view(Vec2::ZERO);
+        let blocks = [block(0, 0, 2), block(1, 3, 1), block(2, 1, 4), block(5, 0, 1)];
+        let mut select = SelectBox::begin(&still, still.cell_rect(0, 1).center());
+        assert_eq!(select.blocks(&still, &blocks), [block(0, 0, 2)], "a press inside one block");
+        select.drag_to(&still, still.cell_rect(2, 3).center());
+        let touched = [block(0, 0, 2), block(1, 3, 1), block(2, 1, 4)];
+        assert_eq!(select.blocks(&still, &blocks), touched);
+
+        // Scrolled one row down: the same pointer is now over row 3, and the
+        // box still starts on row 0, so it reaches row 3 but not row 5.
+        let scrolled = view(vec2(0.0, theme::ARRANGE_ROW_PITCH));
+        select.drag_to(&scrolled, still.cell_rect(2, 3).center());
+        let origin = still.content_pos(still.cell_rect(0, 1).center());
+        assert_eq!(select.rect(&scrolled).min, scrolled.screen_pos(origin));
+        assert_eq!(select.blocks(&scrolled, &blocks).len(), 3);
+        let p = pos2(123.0, 77.0);
+        assert_eq!(scrolled.screen_pos(scrolled.content_pos(p)), p, "the two are inverses");
     }
 
     #[test]

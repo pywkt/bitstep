@@ -15,8 +15,9 @@
 //! key meant for a popover cannot delete something in the host. So do undo
 //! and redo ([`history_key`]): with the editor focused they step through
 //! bitstep's own edits, as in any plugin with an undo of its own. So does
-//! Tab, which switches song mode on and off ([`is_song_toggle`]); Bitwig
-//! never sees it, so it cannot clash with a Bitwig shortcut.
+//! Tab, which flips between the song grid and the steps
+//! ([`is_view_toggle`]); Bitwig never sees it, so it cannot clash with a
+//! Bitwig shortcut.
 //!
 //! Bitwig shows a plugin's editor in a desktop window of its own, which it
 //! marks as belonging to its main window (`WM_TRANSIENT_FOR`). Window
@@ -62,9 +63,15 @@ pub fn history_key(key: Key, modifiers: Modifiers) -> Option<HistoryKey> {
     }
 }
 
-/// Whether `key` held with `modifiers` switches song mode: Tab on its own.
-/// Shift+Tab and the rest are left alone.
-pub fn is_song_toggle(key: Key, modifiers: Modifiers) -> bool {
+/// Whether `key` held with `modifiers` is Ctrl+A, which on the song grid
+/// selects every block (and is kept from the host there, like undo).
+pub fn is_select_all(key: Key, modifiers: Modifiers) -> bool {
+    key == Key::A && modifiers.command && !modifiers.shift && !modifiers.alt
+}
+
+/// Whether `key` held with `modifiers` flips between the song grid and the
+/// steps: Tab on its own. Shift+Tab and the rest are left alone.
+pub fn is_view_toggle(key: Key, modifiers: Modifiers) -> bool {
     key == Key::Tab && !modifiers.any()
 }
 
@@ -215,13 +222,24 @@ mod tests {
     }
 
     #[test]
-    fn plain_tab_alone_switches_song_mode() {
-        assert!(is_song_toggle(Key::Tab, NONE));
-        assert!(!is_song_toggle(Key::Tab, Modifiers::SHIFT));
-        assert!(!is_song_toggle(Key::Tab, Modifiers::CTRL | Modifiers::COMMAND));
-        assert!(!is_song_toggle(Key::Tab, Modifiers::ALT), "Alt+Tab is the desktop's");
-        assert!(!is_song_toggle(Key::S, NONE));
+    fn plain_tab_alone_flips_the_view() {
+        assert!(is_view_toggle(Key::Tab, NONE));
+        assert!(!is_view_toggle(Key::Tab, Modifiers::SHIFT));
+        assert!(!is_view_toggle(Key::Tab, Modifiers::CTRL | Modifiers::COMMAND));
+        assert!(!is_view_toggle(Key::Tab, Modifiers::ALT), "Alt+Tab is the desktop's");
+        assert!(!is_view_toggle(Key::S, NONE));
         assert_eq!(forwarded_keysym(Key::Tab, NONE), None, "never passed to the host");
+    }
+
+    #[test]
+    fn ctrl_a_alone_is_select_all() {
+        // On Linux a held Ctrl arrives as both `ctrl` and `command`.
+        let ctrl = Modifiers::CTRL | Modifiers::COMMAND;
+        assert!(is_select_all(Key::A, ctrl));
+        assert!(!is_select_all(Key::A, NONE), "plain A is typing");
+        assert!(!is_select_all(Key::A, ctrl | Modifiers::SHIFT));
+        assert!(!is_select_all(Key::A, ctrl | Modifiers::ALT));
+        assert!(!is_select_all(Key::S, ctrl), "save still goes to the host");
     }
 
     #[test]

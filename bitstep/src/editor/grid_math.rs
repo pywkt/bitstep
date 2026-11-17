@@ -963,9 +963,6 @@ pub struct EditorLayout {
     panel_header: Rect,
     /// The parameter panel's bars, under the step strip and scrolled with it.
     panel_strip: Rect,
-    /// Whether the top bar has the grid/steps view toggle (song mode only).
-    /// Off until [`Self::with_view_toggle`].
-    view_toggle: bool,
 }
 
 impl EditorLayout {
@@ -994,16 +991,7 @@ impl EditorLayout {
             steps: Rect::from_min_max(pos2(split_x, split_y), pos2(right, bottom)),
             panel_header: Rect::from_min_max(pos2(left, bottom), pos2(split_x, bottom)),
             panel_strip: Rect::from_min_max(pos2(split_x, bottom), pos2(right, bottom)),
-            view_toggle: false,
         }
-    }
-
-    /// The same split with the grid/steps view toggle in the top bar, right
-    /// after the song toggle, when `shown` (song mode is on). Without it the
-    /// undo/redo pair moves up into its place.
-    pub fn with_view_toggle(mut self, shown: bool) -> EditorLayout {
-        self.view_toggle = shown;
-        self
     }
 
     /// The same split with the arranger's ruler taking `height` points off
@@ -1295,8 +1283,7 @@ impl EditorLayout {
         Rect::from_min_max(pos2(left, room.min.y), pos2(right, room.max.y))
     }
 
-    /// The grid/steps view toggle: right after the song toggle, in song
-    /// mode only ([`Self::with_view_toggle`]). Empty when hidden or when
+    /// The grid/steps view toggle: right after the song toggle. Empty when
     /// there is no room.
     pub fn arrange_button(&self) -> Rect {
         let room = self.bar_status();
@@ -1305,24 +1292,21 @@ impl EditorLayout {
             + theme::SONG_WIDTH
             + theme::ITEM_SPACING;
         let right = (left + theme::ARRANGE_WIDTH).min(room.max.x);
-        if !self.view_toggle || right <= left {
+        if right <= left {
             return Rect::from_min_max(room.min, room.min);
         }
         Rect::from_min_max(pos2(left, room.min.y), pos2(right, room.max.y))
     }
 
     /// How much of [`Self::bar_status`] the buttons before the undo/redo
-    /// pair take, spacing included: the mode buttons, the song toggle and,
-    /// in song mode, the view toggle.
+    /// pair take, spacing included: the mode buttons, the song toggle and
+    /// the view toggle.
     fn toggles_width(&self) -> f32 {
-        let view = match self.view_toggle {
-            true => theme::ARRANGE_WIDTH + theme::ITEM_SPACING,
-            false => 0.0,
-        };
         MODE_BUTTONS as f32 * (theme::MODE_WIDTH + theme::ITEM_SPACING)
             + theme::SONG_WIDTH
             + theme::ITEM_SPACING
-            + view
+            + theme::ARRANGE_WIDTH
+            + theme::ITEM_SPACING
     }
 
     /// The undo (0) and redo (1) buttons: right after the song and view
@@ -3195,15 +3179,13 @@ mod tests {
     /// The arranger's ruler takes its height off the top of the headers and
     /// the strip, its corner sits over the headers' column and its strip over
     /// the steps (unpadded, so bars line up), and the whole row counts as top
-    /// bar. The song toggle, and in song mode the view toggle, sit between
-    /// the mode buttons and the status line.
+    /// bar. The song toggle and the view toggle sit between the mode buttons
+    /// and the status line, in or out of song mode.
     #[test]
     fn the_ruler_sits_under_the_top_bar() {
         let window = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 500.0));
         let plain = EditorLayout::from_theme(window).with_panel(theme::PARAM_PANEL_HEIGHT);
-        let layout = EditorLayout::from_theme(window)
-            .with_ruler(theme::ARRANGE_RULER_HEIGHT)
-            .with_view_toggle(true);
+        let layout = EditorLayout::from_theme(window).with_ruler(theme::ARRANGE_RULER_HEIGHT);
         let row = layout.ruler();
 
         assert_eq!(plain.ruler().height(), 0.0, "no ruler until asked for");
@@ -3225,12 +3207,9 @@ mod tests {
         assert!(arrange.min.x > song.max.x, "the arranger toggle after the song toggle");
         assert_eq!(arrange.width(), theme::ARRANGE_WIDTH);
         assert!(layout.status_line().min.x > arrange.max.x, "before the status line");
-
-        // Out of song mode there is no view toggle, and undo moves up.
-        let off = layout.with_view_toggle(false);
-        assert!(!off.arrange_button().is_positive(), "no view toggle");
-        assert!(off.history_button(0).min.x < layout.history_button(0).min.x);
-        assert!(off.history_button(0).min.x > song.max.x, "still after the song toggle");
+        assert!(layout.history_button(0).min.x > arrange.max.x, "undo after the view toggle");
+        // The steps view has the same top bar: the grid is a view of its own.
+        assert_eq!(plain.arrange_button(), arrange);
     }
 
     /// Button index ↔ `patsel` value, both ways: the parameter is one-based
@@ -4592,7 +4571,7 @@ mod tests {
     #[test]
     fn undo_and_redo_sit_between_the_view_toggle_and_the_status_line() {
         let window = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 520.0));
-        let layout = EditorLayout::from_theme(window).with_view_toggle(true);
+        let layout = EditorLayout::from_theme(window);
         let (undo, redo) = (layout.history_button(0), layout.history_button(1));
         assert!(undo.is_positive() && redo.is_positive());
         assert!(undo.min.x > layout.arrange_button().max.x, "after the view toggle");
