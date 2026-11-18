@@ -67,6 +67,15 @@ automatically. The plugin is built with
 [nice-plug](https://crates.io/crates/nice-plug) (a fork of NIH-plug) and
 [egui](https://github.com/emilk/egui).
 
+## More for Bitwig
+
+Other Bitwig projects by the same author:
+
+- [chopdrop](https://github.com/pywkt/chopdrop): a sample player laid out as lanes, with a chop editor, 16 outputs and time-stretching.
+- [stuttter](https://github.com/pywkt/stuttter): a stutter, repeat and tape-stop effect built from step blocks.
+- [Concord](https://github.com/pywkt/concord): play one key, hear a full chord, voiced and strummed.
+- [knobbox](https://github.com/pywkt/knobbox): a DIY USB MIDI controller whose knobs follow the selected device.
+
 ## License
 
 [ISC](LICENSE)
